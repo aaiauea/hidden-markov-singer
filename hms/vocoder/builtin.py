@@ -109,9 +109,15 @@ class BuiltinVocoder(Vocoder):
         sp = np.asarray(params.sp, dtype=np.float64)[:, :bins]
         ap = np.asarray(params.ap, dtype=np.float64)[:, :bins]
 
-        y_length = int((n_frames - 1) * hop + fft_size)
-        excitation = self._excitation(f0, ap, fs, hop, y_length)
-        y = self._apply_envelope(excitation, sp, fft_size, hop, y_length)
+        # Synthesise one window longer than the output so the last frame's
+        # overlap-add has somewhere to go, then trim to WORLD's length
+        # convention (`f0_length * frame_period * fs`).  Renderers must not
+        # change a phrase's duration just because the backend changed.
+        tail = int((n_frames - 1) * hop + fft_size)
+        y_length = int(n_frames * frame_period / 1000.0 * fs)
+        excitation = self._excitation(f0, ap, fs, hop, tail)
+        y = self._apply_envelope(excitation, sp, fft_size, hop, tail)
+        y = y[:max(y_length, 1)]
         # This backend builds its excitation from scratch, so its absolute
         # level is arbitrary: scale it once, via the shared policy, instead of
         # leaving callers to guess.  WORLD-backed backends return their

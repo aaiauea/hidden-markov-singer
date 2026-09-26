@@ -229,6 +229,31 @@ def test_builtin_handles_an_unvoiced_signal():
     assert np.isfinite(audio).all()
 
 
+def test_synthesised_length_follows_the_world_convention():
+    """Every backend must render a phrase to the same duration.
+
+    WORLD returns ``f0_length * frame_period * fs`` samples; the pure-numpy
+    fallback used to add a whole window of tail (`fft_size - hop` samples, ~88 ms
+    at 22.05 kHz), which made a rendered phrase longer purely because the
+    backend changed -- and shifted every frame when the render was re-analysed.
+    """
+    fs = 22050
+    frame_period = FRAME_PERIOD
+    n_frames = 60
+    expected = int(n_frames * frame_period / 1000.0 * fs)
+    f0 = np.full(n_frames, 200.0)
+    for vname in ("native", "builtin"):
+        if vname == "native" and not available_backends()["native"]:
+            continue
+        vocoder = get_vocoder(vname, fs=fs, frame_period=frame_period)
+        bins = vocoder.fft_size_for(fs) // 2 + 1
+        sequence = AcousticFrameSequence(
+            f0=f0, sp=np.full((n_frames, bins), 1e-3),
+            ap=np.full((n_frames, bins), 0.3), frame_period=frame_period,
+            fs=fs, fft_size=vocoder.fft_size_for(fs))
+        assert len(vocoder.synthesize(sequence)) == expected, vname
+
+
 def test_frame_geometry_helpers(example_wav_path):
     vocoder = native_vocoder()
     assert vocoder.n_bins == vocoder.fft_size // 2 + 1
