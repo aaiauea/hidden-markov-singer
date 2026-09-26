@@ -79,6 +79,23 @@ class Vibrato:
     attack_ms: float = 80.0
     waveform: str = "sine"        # "sine" | "triangle"
 
+    def __post_init__(self) -> None:
+        values = (self.rate_hz, self.depth_semitones, self.delay_ms,
+                  self.randomness, self.attack_ms)
+        try:
+            if not all(np.isfinite(value) for value in values):
+                raise ValueError("vibrato settings must be finite")
+        except TypeError as exc:
+            raise ValueError("vibrato settings must be numeric") from exc
+        if self.rate_hz <= 0:
+            raise ValueError("vibrato rate_hz must be positive")
+        if self.depth_semitones < 0 or self.delay_ms < 0 or self.attack_ms < 0:
+            raise ValueError("vibrato depth, delay and attack must be non-negative")
+        if not 0 <= self.randomness <= 1:
+            raise ValueError("vibrato randomness must be in [0, 1]")
+        if self.waveform not in ("sine", "triangle"):
+            raise ValueError("vibrato waveform must be 'sine' or 'triangle'")
+
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
 

@@ -71,6 +71,27 @@ def test_tied_covariance_uses_fewer_parameters():
     assert tied.n_free_params < free.n_free_params
 
 
+def test_invalid_covariance_types_and_parameter_shapes_are_rejected():
+    X = np.zeros((4, 2))
+    with pytest.raises(ValueError, match="covariance_type"):
+        DiagGMM.fit(X, covariance_type="full")
+    with pytest.raises(ValueError, match="covariance_type"):
+        DiagGMM(np.array([1.0]), np.zeros((1, 2)), np.ones((1, 2)),
+                covariance_type="spherical")
+    with pytest.raises(ValueError, match="identical shapes"):
+        DiagGMM(np.array([1.0]), np.zeros((1, 2)), np.ones((1, 1)))
+
+
+def test_invalid_sample_weights_are_not_silently_ignored():
+    X = np.ones((4, 2))
+    with pytest.raises(ValueError, match="positive sum"):
+        DiagGMM.fit(X, weights=np.zeros(4))
+    with pytest.raises(ValueError, match="shape"):
+        DiagGMM.fit(X, weights=np.ones(3))
+    with pytest.raises(ValueError, match="non-negative"):
+        DiagGMM.fit(X, weights=np.array([1.0, 1.0, -1.0, 1.0]))
+
+
 def test_variance_floor_protects_tiny_datasets():
     """Two identical frames must not produce an infinitely peaked Gaussian."""
     X = np.ones((2, 4))

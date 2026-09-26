@@ -3,10 +3,9 @@
 Two jobs:
 
 1. **Predict how long a phoneme should last** when the score does not say
-   (`predict`).  Per phoneme, a log-normal model of the total duration, with a
-   context term for "is this phoneme in a note with a neighbour of the same
-   type" -- deliberately tiny, because for singing the *score* usually carries
-   the timing and the model only has to fill in the gaps.
+   (`predict`).  This is a context-free, per-phoneme log-normal model of total
+   duration -- deliberately small, because for singing the *score* usually
+   carries the timing and the model only has to fill in the gaps.
 
 2. **Allocate a known total duration across HMM states** (`allocate`).  This is
    what makes the state sequence duration aware: for a phoneme held for N
@@ -56,6 +55,8 @@ class DurationModel:
 
     def __init__(self, stats: Optional[Dict[str, DurationStats]] = None,
                  variance_scale: float = 1.0) -> None:
+        if not np.isfinite(variance_scale) or variance_scale < 0:
+            raise ValueError("variance_scale must be finite and non-negative")
         self.stats: Dict[str, DurationStats] = stats or {}
         #: >1 adds timing variation to predicted durations (0 = deterministic).
         self.variance_scale = float(variance_scale)
@@ -128,10 +129,21 @@ class DurationModel:
         """
         proportions = np.asarray(list(proportions), dtype=np.float64)
         n = len(proportions)
+        try:
+            if not np.isfinite(total_frames):
+                raise ValueError("total_frames must be finite")
+            if int(total_frames) != total_frames:
+                raise ValueError("total_frames must be an integer")
+        except TypeError as exc:
+            raise ValueError("total_frames must be an integer") from exc
         total_frames = int(total_frames)
+        if not np.isfinite(proportions).all() or (proportions < 0).any():
+            raise ValueError("state proportions must be finite and non-negative")
         if n == 0:
             return np.zeros(0, dtype=np.int64)
-        if total_frames <= 0:
+        if total_frames < 0:
+            raise ValueError("total_frames must be non-negative")
+        if total_frames == 0:
             return np.zeros(n, dtype=np.int64)
         if total_frames < n:
             # fewer frames than states: give one frame each, drop the rest

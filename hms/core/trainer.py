@@ -10,9 +10,10 @@
         -> duration / pitch / voicing statistics  (duration.py, pitch.py)
         -> model directory                        (model.py)
 
-Nothing here is a neural network and nothing is a black box: the whole acoustic
-model is a few thousand numbers you can read out of ``model.yaml`` / ``hmm.npz``
-and reason about.
+Nothing here is a neural network and nothing is a black box: the acoustic
+model is a compact set of learned parameters (about twenty thousand in the
+default demo voice) that you can read out of ``model.yaml`` / ``hmm.npz`` and
+reason about.
 
 Data efficiency
 ---------------
@@ -90,9 +91,56 @@ class TrainingConfig:
     min_phoneme_frames: int = 20
 
     # -- duration / pitch -------------------------------------------------
+    duration_variance_scale: float = 1.0
     vibrato_enabled: bool = False
     vibrato_estimate_from_data: bool = True
     pitch_variation: float = 1.0
+
+    def __post_init__(self) -> None:
+        numeric_values = (self.n_iterations, self.min_phoneme_frames,
+                          self.var_floor_ratio, self.fs, self.frame_period,
+                          self.n_mcep, self.n_band, self.default_note,
+                          self.pitch_variation, self.duration_variance_scale)
+        try:
+            if not all(np.isfinite(value) for value in numeric_values):
+                raise ValueError("training configuration values must be finite")
+        except TypeError as exc:
+            raise ValueError("training configuration values must be numeric") from exc
+        if self.fft_size is not None:
+            try:
+                if not np.isfinite(self.fft_size):
+                    raise ValueError("fft_size must be finite")
+            except TypeError as exc:
+                raise ValueError("fft_size must be numeric") from exc
+        if self.covariance_type not in ("diag", "tied"):
+            raise ValueError("covariance_type must be 'diag' or 'tied'")
+        if self.training_method not in ("viterbi", "baum_welch"):
+            raise ValueError("training_method must be 'viterbi' or 'baum_welch'")
+        if self.time_unit not in ("seconds", "frames"):
+            raise ValueError("time_unit must be 'seconds' or 'frames'")
+        if self.f0_estimation not in ("dio", "harvest"):
+            raise ValueError("f0_estimation must be 'dio' or 'harvest'")
+        if self.vocoder not in ("auto", "native", "pyworld", "builtin"):
+            raise ValueError("vocoder must be auto, native, pyworld or builtin")
+        if self.n_iterations < 1:
+            raise ValueError("n_iterations must be at least 1")
+        if self.min_phoneme_frames < 1:
+            raise ValueError("min_phoneme_frames must be at least 1")
+        if self.var_floor_ratio < 0 or not np.isfinite(self.var_floor_ratio):
+            raise ValueError("var_floor_ratio must be finite and non-negative")
+        if self.fs <= 0 or not np.isfinite(self.frame_period) \
+                or self.frame_period <= 0:
+            raise ValueError("fs and frame_period must be positive")
+        if self.fft_size is not None and self.fft_size < 2:
+            raise ValueError("fft_size must be >= 2 when specified")
+        if self.n_mcep < 2 or self.n_band < 2:
+            raise ValueError("n_mcep must be >= 2 and n_band must be >= 2")
+        if not np.isfinite(self.default_note):
+            raise ValueError("default_note must be finite")
+        if not np.isfinite(self.pitch_variation) or self.pitch_variation < 0:
+            raise ValueError("pitch_variation must be finite and non-negative")
+        if self.duration_variance_scale < 0:
+            raise ValueError("duration_variance_scale must be non-negative")
 
     @classmethod
     def from_dict(cls, data: Dict) -> "TrainingConfig":
@@ -338,87 +386,72 @@ class Trainer:
             self.log(f"  {phone:8s} {n_states} states x "
                      f"{definition.n_components} comp, {n_frames} frames, "
                      f"{hmm.n_free_params} params")
-        if not hmms:
-            raise RuntimeError("no phoneme had enough data to train an HMM")
         return hmms
 
-    @staticmethod
-    def _resample_rows(matrix: np.ndarray, target: int) -> np.ndarray:
-        """Stretch or shrink the first axis of an array by index interpolation."""
-        matrix = np.asarray(matrix)
-        n = matrix.shape[0] if matrix.ndim else 1
-        if n == target:
-            return matrix.copy()
-        if n == 1:
-            return np.repeat(matrix, target, axis=0)
-        index = np.round(np.linspace(0, n - 1, target)).astype(int)
-        return matrix[index]
-
-    def build_backoff(self, hmms: Dict[str, LeftToRightHMM]
+    def build_backoff(self, features: Dict[str, List[np.ndarray]],
+                      voiced: Dict[str, List[np.ndarray]]
                       ) -> Dict[str, LeftToRightHMM]:
-        """One pooled model per phoneme class, for symbols with no model.
+        """Train one class backoff HMM from pooled phoneme frame sequences.
 
-        Pooling is deliberately crude -- states are aligned by relative
-        position, components by index, then averaged -- because this model only
-        has to produce a *plausible* sound for a phoneme that was never trained
-        (the alternative is a crash or silence).  It costs no extra training.
+        The GMMs are fitted directly to the class's training frames. This keeps
+        component meanings grounded in the pooled data and makes every frame,
+        rather than every phoneme model, contribute to the estimates. Rare
+        phones skipped by :meth:`train_hmms` are deliberately included here.
         """
-        from hms.core.gmm import DiagGMM
-        from hms.core.hmm import HMMState, StateDurationStats
-
-        pooled: Dict[str, List[LeftToRightHMM]] = {}
-        for phone, hmm in hmms.items():
+        pooled_features: Dict[str, List[np.ndarray]] = {}
+        pooled_voiced: Dict[str, List[np.ndarray]] = {}
+        for phone in sorted(features):
             definition = self.phoneme_set.resolve(phone)
-            klass = definition.type if definition else "unvoiced_consonant"
-            pooled.setdefault(klass, []).append(hmm)
+            if definition is None:
+                continue
+            sequences = features[phone]
+            phone_voiced = voiced.get(phone)
+            if phone_voiced is not None and len(phone_voiced) != len(sequences):
+                raise ValueError(f"phoneme {phone!r} has {len(sequences)} feature "
+                                 f"sequences but {len(phone_voiced)} voicing sequences")
+            for index, sequence in enumerate(sequences):
+                sequence = np.asarray(sequence, dtype=np.float64)
+                pooled_features.setdefault(definition.type, []).append(sequence)
+                if phone_voiced is None:
+                    pooled_voiced.setdefault(definition.type, []).append(
+                        np.zeros(len(sequence), dtype=bool))
+                else:
+                    flags = np.asarray(phone_voiced[index], dtype=bool).reshape(-1)
+                    if len(flags) != len(sequence):
+                        raise ValueError(f"phoneme {phone!r} feature and voicing "
+                                         "sequence lengths differ")
+                    pooled_voiced.setdefault(definition.type, []).append(flags)
 
         backoff: Dict[str, LeftToRightHMM] = {}
-        for klass, members in sorted(pooled.items()):
-            reference = members[0]
-            n_states = max(1, int(round(np.mean([m.n_states for m in members]))))
-            n_components = max(1, int(round(np.mean(
-                [m.states[0].gmm.n_components for m in members]))))
-            template = LeftToRightHMM(
-                n_states=n_states, covariance_type=reference.covariance_type)
-            arrays = [m.to_arrays() for m in members]
-
-            for state in range(n_states):
-                weights, means, variances = [], [], []
-                self_loops, duration_mean, duration_var, voiced = [], [], [], []
-                for member, array in zip(members, arrays):
-                    state_index = min(
-                        int(round(state / max(n_states - 1, 1)
-                                  * (member.n_states - 1))), member.n_states - 1)
-                    component_index = np.round(np.linspace(
-                        0, array["weights"].shape[1] - 1, n_components)).astype(int)
-                    weights.append(array["weights"][state_index][component_index])
-                    means.append(array["means"][state_index][component_index])
-                    variances.append(array["variances"][state_index][component_index])
-                    self_loops.append(array["self_loops"][state_index])
-                    duration_mean.append(array["duration_mean"][state_index])
-                    duration_var.append(array["duration_variance"][state_index])
-                    voiced.append(array["voiced_prob"][state_index])
-
-                weight = np.mean(weights, axis=0)
-                weight = np.maximum(weight, 1e-4)
-                weight /= weight.sum()
-                template.states[state] = HMMState(
-                    gmm=DiagGMM(weight, np.mean(means, axis=0),
-                                np.mean(variances, axis=0),
-                                reference.covariance_type),
-                    duration=StateDurationStats(float(np.mean(duration_mean)),
-                                                float(np.mean(duration_var)), 0),
-                    voiced_prob=float(np.mean(voiced)))
-                template.self_loops[state] = float(np.mean(self_loops))
-            template.dim = reference.dim
-            backoff[klass] = template
+        for class_index, (klass, sequences) in enumerate(
+                sorted(pooled_features.items())):
+            total_frames = sum(len(sequence) for sequence in sequences)
+            defaults = self.phoneme_set.defaults.get(klass, {})
+            requested_states = int(defaults.get("n_states", 1))
+            n_components = int(defaults.get("n_components", 1))
+            n_states = min(requested_states, max(1, total_frames // 2))
+            hmm = LeftToRightHMM(
+                n_states=n_states, allow_skip=self.config.allow_skip,
+                covariance_type=self.config.covariance_type)
+            hmm.train(
+                sequences, n_components=n_components,
+                covariance_type=self.config.covariance_type,
+                n_iterations=self.config.n_iterations,
+                var_floor_ratio=self.config.var_floor_ratio,
+                seed=self.config.seed + 10_000 * class_index,
+                method=self.config.training_method,
+                voiced=pooled_voiced[klass])
+            backoff[klass] = hmm
+            self.log(f"  backoff {klass:20s} {n_states} states x "
+                     f"{hmm.states[0].gmm.n_components} comp, "
+                     f"{total_frames} pooled frames")
         return backoff
 
     # -- stage 4: duration and pitch ---------------------------------------
 
     def build_duration_model(self, durations: Dict[str, List[float]]
                              ) -> DurationModel:
-        model = DurationModel()
+        model = DurationModel(variance_scale=self.config.duration_variance_scale)
         model.fit({phone: values for phone, values in durations.items()})
         return model
 
@@ -495,7 +528,8 @@ class Trainer:
             raise ValueError("training needs a label file")
 
         self.log("1/5  reading corpus")
-        score = labels_module.load(config.label_file, time_unit=config.time_unit)
+        score = labels_module.load(config.label_file, time_unit=config.time_unit,
+                                   frame_period=config.frame_period)
         for diagnostic in score.diagnostics:
             self.log(f"  ! {diagnostic}")
         corpus = Corpus(score, Path(config.wav_dir or "."),
@@ -525,9 +559,14 @@ class Trainer:
 
         self.log("4/5  training HMMs")
         hmms = self.train_hmms(phoneme_features, phoneme_voiced)
-        backoff = self.build_backoff(hmms)
+        backoff = self.build_backoff(phoneme_features, phoneme_voiced)
+        if not hmms and not backoff:
+            raise RuntimeError("no known phoneme data was available for dedicated "
+                               "or class backoff training")
+        total_params = sum(h.n_free_params for h in hmms.values()) \
+            + sum(h.n_free_params for h in backoff.values())
         self.log(f"  {len(hmms)} HMMs, {len(backoff)} backoff model(s), "
-                 f"{sum(h.n_free_params for h in hmms.values()):,} free params")
+                 f"{total_params:,} total free params")
 
         self.log("5/5  duration, pitch and voicing models")
         duration_model = self.build_duration_model(durations)

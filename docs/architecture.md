@@ -13,23 +13,23 @@ hms.vocoder.*                       WORLD (native | pyworld | builtin)
       │                             f0 (Hz), sp (power), ap (aperiodicity)
       │  hms.core.features          FeatureSpec.encode / decode
       ▼
-compact feature vectors            [0] F0 vs. the sung note, [1:] mcep + ap bands
+compact feature vectors            [0] note-relative F0, [1:] mcep + ap bands
       │  hms.core.trainer           normalise, collect per phoneme, train HMMs
       ▼
 hms.core.hmm + hms.core.gmm        left-to-right HMM, diagonal GMMs
       │
-      ├── hms.core.duration         per phoneme log-normal durations + allocation
-      ├── hms.core.pitch            note-relative pitch statistics + vibrato
+      ├── hms.core.duration         per-phoneme log-normal durations + allocation
+      ├── hms.core.pitch            optional state-mean pitch statistics + vibrato
       ▼
 hms.core.model                     HMSModel.save / load  (model.yaml + npz)
 ```
 
-Synthesis runs the same picture backwards:
+Synthesis keeps target musical F0 distinct from optional learned prosody:
 
 ```
-score ─► hms.core.synthesizer.plan ─► (phoneme, state) per frame
-      ─► per-state GMM statistics ─► hms.core.generation.mlpg ─► trajectories
-      ─► note + deviation + vibrato ─► F0;  voicing mask ─► hms.vocoder.synthesize
+score notes ─► target F0 ─────────────────────────────────────────────┐
+score phones ─► hms.core.synthesizer.plan ─► HMM/GMM ─► MLPG ─► sp/ap ├─► WORLD
+                                      └─ optional F0 deviation / vibrato ─► F0 ┘
 ```
 
 ## Why HMM/GMM in 2020s terms
@@ -79,7 +79,7 @@ per frame plus dynamic (delta) features. `FeatureSpec` owns the geometry and the
 
 | slot | content | dim (default) |
 |---|---|---|
-| 0 | log-F0 in semitones **relative to the sung note** | 1 |
+| 0 | note-relative log-F0 in semitones (an optional learned-deviation feature; target F0 still comes from the score) | 1 |
 | 1 … n_mcep | mel-cepstrum c0…c29 of the WORLD spectral envelope, sampled on 2·n_mcep mel bands | 30 |
 | next n_band | mel-spaced aperiodicity bands | 5 |
 
@@ -164,23 +164,33 @@ Two jobs:
 
 ## 5. Pitch (`hms/core/pitch.py`)
 
-The rule is **note first, statistics second**:
+The rule is **target musical F0 first; learned prosody is optional**:
 
-*Training*: `relative[t] = 12·log2(f0[t] / note_hz[t])`, with unvoiced gaps
-linearly interpolated (they carry no pitch information; leaving raw zeros there
-would teach the model nonsense). The acoustic HMM therefore learns *this
-singer's habits around a note* — scoops, drift, how a phrase is approached —
-independently of which note is sung.
+*Target F0*: the score supplies the MIDI note for each frame. In the default
+`f0_source: score` mode, that note is used directly as target F0 (subject to the
+phoneme voicing mask and configured F0 range). A trained pitch model is not
+required for this path.
 
-*Synthesis*: `f0 = note + MLPG trajectory of feature 0 + optional vibrato`,
-followed by clamping into the analysed range so that transposing a score beyond
-the training range degrades audibly but does not silently drop the melody.
+*Optional acoustic deviation*: training can encode
+`relative[t] = 12·log2(f0[t] / note_hz[t])`, with unvoiced gaps interpolated for
+finite acoustic features. The acoustic HMM can then learn this singer's
+note-relative movement. `f0_source: acoustic` adds the MLPG trajectory of this
+feature to the score target; `f0_source: state_means` instead uses the separate
+per-phoneme/state pitch statistics stored in `PitchModel`. These are optional
+ways to add deviations, not autopitch sources or prerequisites. Under-threshold
+phones have no separate state-mean pitch statistics; that optional mode safely
+uses zero deviation for them rather than inventing mandatory pitch prediction.
 
-Vibrato is an explicit component (`Vibrato`: rate, depth, delay, attack,
-randomness, waveform) rather than part of the HMM, because MLPG smooths away
-exactly the fast oscillation that makes vibrato sound alive. Its defaults can be
-*measured* from the training data (`estimate_vibrato` finds the dominant 3–9 Hz
-component of the longest sustained note).
+*Optional vibrato*: `Vibrato` is an explicit component (rate, depth, delay,
+attack, randomness, waveform) rather than part of the HMM, because MLPG smooths
+away exactly the fast oscillation that makes vibrato sound alive. Its defaults
+can be *measured* from the training data (`estimate_vibrato` finds the dominant
+3–9 Hz component of the longest sustained note). Vibrato is disabled by
+default and can be added independently of the target note.
+
+All sources are followed by clamping into the analysed F0 range so that
+transposing a score beyond the training range degrades audibly but does not
+silently drop the melody.
 
 ## 6. Parameter generation (`hms/core/generation.py`)
 
@@ -216,10 +226,13 @@ read label file → analyse every utterance (WORLD) → per-frame phoneme/note l
 → HMSModel (spec, hmms, backoff, normalisation, stats, metadata)
 ```
 
-`min_phoneme_frames` (default 20) is the guard rail: a phoneme that appears less
-than that goes to the backoff model instead of being fitted with an unreliable
-Gaussian, and `hms inspect-model` reports the parameter budget so you can see
-the effect.
+`min_phoneme_frames` (default 20) is the guard rail: a phoneme below it does
+not get a dedicated HMM. Class backoff HMMs are trained directly from the raw
+feature sequences of *all* known phones in that class, including under-threshold
+phones; each frame contributes once, so a common phone naturally contributes
+more than a rare one. Backoff GMM components are never formed by averaging
+component indices from separately trained phone models. The parameter report
+shows dedicated and backoff budgets separately.
 
 ## 8. Synthesis pipeline (`hms/core/synthesizer.py`)
 
@@ -229,9 +242,9 @@ the effect.
 2. `frame_statistics` — per-state GMM means/variances stacked into per-frame
    statistics (dominant component by default, or the mixture marginal).
 3. `mlpg` — the trajectory.
-4. `denormalize` → static features; voicing from the state/phone statistics;
-   F0 from note + trajectory + vibrato; clamp; decode features to
-   `(f0, sp, ap)`.
+4. `denormalize` → static features; voicing from HMM/phoneme statistics;
+   target F0 from score notes, with optional acoustic/state-mean deviation and
+   optional vibrato; clamp; decode features to `(f0, sp, ap)`.
 5. `vocoder.synthesize` → waveform (written by `wavio.write_wav`, 16-bit by
    default).
 

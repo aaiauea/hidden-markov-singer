@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from hms.core.gmm import DEFAULT_VAR_FLOOR, EPS, DiagGMM
+from hms.core.gmm import (COVARIANCE_TYPES, DEFAULT_VAR_FLOOR, EPS, DiagGMM)
 
 #: Self-loop probability before any data has been seen.
 DEFAULT_SELF_LOOP = 0.5
@@ -91,6 +91,9 @@ class LeftToRightHMM:
                  covariance_type: str = "diag") -> None:
         if n_states < 1:
             raise ValueError("an HMM needs at least one state")
+        if covariance_type not in COVARIANCE_TYPES:
+            raise ValueError(f"covariance_type must be one of {COVARIANCE_TYPES}, "
+                             f"got {covariance_type!r}")
         self.n_states = int(n_states)
         self.allow_skip = bool(allow_skip)
         self.covariance_type = covariance_type

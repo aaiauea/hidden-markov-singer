@@ -32,6 +32,15 @@ def voiced_deviations(result):
     return 12.0 * np.log2(f0[voiced] / expected)
 
 
+def test_synthesis_config_rejects_unknown_modes_and_invalid_scales():
+    with pytest.raises(ValueError, match="f0_source"):
+        SynthesisConfig(f0_source="autopitch")
+    with pytest.raises(ValueError, match="variance_scale"):
+        SynthesisConfig(variance_scale=0.0)
+    with pytest.raises(ValueError, match="tempo"):
+        SynthesisConfig(tempo=0.0)
+
+
 def test_synthesis_duration_follows_the_score(trained_model, score):
     result = render(trained_model, score)
     assert result.duration == pytest.approx(score.total_duration, rel=0.02)
@@ -139,6 +148,32 @@ def test_vibrato_adds_a_modulation_that_is_not_in_the_model(trained_model,
     assert roughness(wide) > roughness(flat)
 
 
+def test_vibrato_overrides_do_not_mutate_the_saved_pitch_settings(
+        trained_model, short_score):
+    before = trained_model.pitch_model.vibrato.to_dict()
+    render(trained_model, short_score, vibrato=True, vibrato_depth=1.2,
+           vibrato_rate=6.2)
+    assert trained_model.pitch_model.vibrato.to_dict() == before
+
+
+def test_score_driven_synthesis_needs_no_learned_pitch_statistics(
+        trained_model, short_score):
+    """The base F0 path is exactly the supplied note with an empty pitch model."""
+    import copy
+    from hms.core.pitch import PitchModel
+
+    model = copy.deepcopy(trained_model)
+    model.pitch_model = PitchModel()  # no learned state pitch / voicing priors
+    config = SynthesisConfig(vibrato=False, seed=0)
+    assert config.f0_source == "score"
+    result = Synthesizer(model, config).synthesize(short_score)
+    voiced = result.params.f0 > 0
+    assert voiced.any()
+    expected = labels_module.midi_to_hz(result.notes[voiced])
+    assert np.allclose(result.params.f0[voiced], expected, rtol=1e-10)
+    assert model.pitch_model.stats == {}
+
+
 def test_state_means_pitch_source_runs_without_the_acoustic_model(
         trained_model, short_score):
     result = render(trained_model, short_score, f0_source="state_means")
@@ -146,6 +181,45 @@ def test_state_means_pitch_source_runs_without_the_acoustic_model(
     assert voiced.any()
     deviations = voiced_deviations(result)
     assert np.median(np.abs(deviations)) < 2.0
+
+
+def test_vibrato_segment_ids_are_unique_across_utterances(trained_model):
+    from hms.core.labels import Score, Segment, Utterance
+    from hms.core.pitch import PitchModel, Vibrato
+
+    score = Score([
+        Utterance("first", [Segment("a", 0.0, 0.5, note=60.0)]),
+        Utterance("second", [Segment("a", 0.0, 0.5, note=60.0)]),
+    ])
+    synthesizer = Synthesizer(trained_model, SynthesisConfig(vibrato=False))
+    phones, _states, segment_ids, _notes, _frames, _diagnostics = \
+        synthesizer.plan(score)
+    segment_ids = np.asarray(segment_ids)
+    unique_ids, counts = np.unique(segment_ids, return_counts=True)
+    assert len(unique_ids) == 2
+    assert counts[0] == counts[1] == 100
+
+    vibrato = Vibrato(enabled=True, rate_hz=5.0, depth_semitones=0.5,
+                      delay_ms=0.0, attack_ms=1.0, randomness=0.0)
+    pitch_model = PitchModel(vibrato=vibrato)
+    contour = pitch_model._vibrato_for_frames(
+        segment_ids, np.ones(len(phones), dtype=bool), 5.0, rng=None)
+    first = contour[segment_ids == unique_ids[0]]
+    second = contour[segment_ids == unique_ids[1]]
+    assert np.allclose(first, second), "vibrato phase should restart per utterance segment"
+
+
+def test_phoneme_shorter_than_state_count_is_safe_to_synthesize(trained_model):
+    from hms.core.labels import Score, Segment, Utterance
+
+    score = Score([Utterance("one_frame", [
+        Segment("a", 0.0, 0.005, note=60.0),
+    ])])
+    result = render(trained_model, score)
+    assert len(result.phones) == 1
+    assert result.state_ids.tolist() == [0]
+    assert len(result.params.f0) == 1
+    assert np.isfinite(result.audio).all()
 
 
 def test_silence_pitch_statistics_do_not_transpose_the_sung_notes(

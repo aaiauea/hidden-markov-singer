@@ -13,29 +13,33 @@ maximum-likelihood parameter generation (MLPG) over static + delta features.
 
 ```
 score (phones, notes, times) ──► duration/state plan ──► HMM state sequence
-                                                             │
-                            per-state GMM statistics ──► MLPG trajectory
-                                                             │
-        note + learned deviation + optional vibrato ──► F0 ───┤
-                                                             ▼
-                                        WORLD (f0, sp, ap) ──► waveform
+                                  │                          │
+                                  │                          └─► GMM statistics ─► MLPG ─► sp/ap
+                                  │                                                       │
+                                  └─► target musical F0 ────────────────────────────────┤
+                                      optional learned deviation / vibrato ─► F0 ────────┤
+                                                                                         ▼
+                                                        WORLD (f0, sp, ap) ──► waveform
 ```
 
 ## Design principles
 
 * **No neural networks.** HMM/GMM + WORLD, nothing else.
 * **Small data first.** The demo voice trains on **32 seconds** of audio to
-  16,033 free parameters (≈2.5 parameters per training frame). Per phoneme
+  about **19,500 total free parameters** (≈3.0 per training frame, including
+  class backoffs). Per phoneme
   budgets, tied covariances, variance floors, parameter sharing and class
   backoff models are all there to keep that possible.
 * **Compact, statistically modelable features.** Mel-cepstrum spectral envelope
   (from WORLD's `sp`, sampled on a mel grid twice the model order so formants
-  are not rounded onto the grid knots), mel-band aperiodicity (from `ap`),
-  note-relative log-F0, plus deltas. No hand-written formant tables anywhere in
-  the engine.
-* **The score drives the pitch.** Training stores F0 *relative to the sung
-  note*; synthesis adds the requested note back. The model never replays the
-  training speaker's absolute pitch.
+  are not rounded onto the grid knots), mel-band aperiodicity (from `ap`), and
+  a note-relative F0 feature for the optional learned-deviation mode, plus
+  deltas. No hand-written formant tables anywhere in the engine.
+* **Score F0 is the base path.** Ordinary synthesis uses the requested MIDI
+  notes directly as target F0 and does not need learned pitch statistics.
+  Note-relative F0 deviations from the acoustic HMM, separate state-mean pitch
+  statistics, and explicit vibrato remain optional prosody extensions; absolute
+  training-speaker F0 is never replayed.
 * **Every component is replaceable.** Vocoder backends, phoneme inventory,
   feature set, model files and the CLI are all thin layers over plain data.
 * **Readable models.** A trained voice is a `model.yaml` you can inspect plus
@@ -71,7 +75,7 @@ and sings it back:
 ```bash
 hms demo --out hms-demo
 # 1/5 reading corpus ... 5/5 duration, pitch and voicing models
-#   model written to hms-demo/model (16,033 free parameters)
+#   model written to hms-demo/model (19,500 total free parameters)
 # 3/3 synthesising the corpus back
 #   wrote hms-demo/demo.wav
 ```
@@ -186,7 +190,8 @@ model/
 ## Tests
 
 ```bash
-python -m pytest            # 164 tests, ~20 s (156 + 8 skips without WORLD)
+HMS_NO_AUTO_BUILD=1 python -m pytest
+# 187 tests: 179 passed, 8 optional skips without WORLD
 ```
 
 The suite covers the numerical core (banded Cholesky, MLPG against a dense
