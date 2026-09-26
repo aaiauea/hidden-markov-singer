@@ -528,7 +528,8 @@ def build_parser() -> argparse.ArgumentParser:
     synth.add_argument("--utterance", default=None,
                        help="render only this utterance id")
     synth.add_argument("--variance-scale", type=float, default=None,
-                       help="MLPG variance relaxation (>1 = smoother)")
+                       help="scale on the delta variances: >1 follows the "
+                            "frame means more literally (livelier), <1 smooths")
     synth.add_argument("--pitch-variation", type=float, default=None,
                        help="scale of the learned deviation from the note")
     synth.add_argument("--f0-source", default=None,

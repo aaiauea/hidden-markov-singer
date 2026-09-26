@@ -94,6 +94,32 @@ def test_load_model_helper_and_errors(trained_model, tmp_path):
         HMSModel.load(tmp_path / "definitely-not-a-model")
 
 
+def test_incompatible_model_format_is_refused_not_guessed(
+        trained_model, tmp_path):
+    """A model written by a different feature definition must not load.
+
+    Format 2 changed how the spectral envelope is sampled, so a format-1 file's
+    cepstral coefficients mean something different -- loading one silently
+    would render the wrong timbre rather than fail.  The version check must
+    reject both directions (older and newer) before any array is used.
+    """
+    directory = tmp_path / "model"
+    trained_model.save(directory)
+    text = (directory / "model.yaml").read_text(encoding="utf-8")
+    assert f"format_version: {MODEL_FORMAT_VERSION}" in text
+
+    for wrong in (1, MODEL_FORMAT_VERSION + 1):
+        broken = tmp_path / f"model_v{wrong}"
+        broken.mkdir()
+        (broken / "model.yaml").write_text(
+            text.replace(f"format_version: {MODEL_FORMAT_VERSION}",
+                         f"format_version: {wrong}"), encoding="utf-8")
+        (broken / "hmm.npz").write_bytes((directory / "hmm.npz").read_bytes())
+        with pytest.raises(ValueError) as excinfo:
+            HMSModel.load(broken)
+        assert str(wrong) in str(excinfo.value)
+
+
 def test_model_yaml_is_human_readable(trained_model, tmp_path):
     directory = tmp_path / "model"
     trained_model.save(directory)

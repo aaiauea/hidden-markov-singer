@@ -109,14 +109,18 @@ class BuiltinVocoder(Vocoder):
         sp = np.asarray(params.sp, dtype=np.float64)[:, :bins]
         ap = np.asarray(params.ap, dtype=np.float64)[:, :bins]
 
-        # Synthesise one window longer than the output so the last frame's
-        # overlap-add has somewhere to go, then trim to WORLD's length
-        # convention (`f0_length * frame_period * fs`).  Renderers must not
-        # change a phrase's duration just because the backend changed.
-        tail = int((n_frames - 1) * hop + fft_size)
+        # Render at least WORLD's `f0_length * frame_period * fs` samples and
+        # trim to exactly that, so a phrase's duration never depends on the
+        # backend.  The overlap-add needs one window of tail past the last
+        # frame, but that is *not* always longer than the requested length:
+        # at 44.1 kHz a 5 ms hop rounds to 220 samples while WORLD's formula
+        # advances by 220.5, so the frame-grid length overtakes the windowed
+        # one (the exact case that made a 32 s render 0.03 s short).
         y_length = int(n_frames * frame_period / 1000.0 * fs)
-        excitation = self._excitation(f0, ap, fs, hop, tail)
-        y = self._apply_envelope(excitation, sp, fft_size, hop, tail)
+        tail = int((n_frames - 1) * hop + fft_size)
+        render_length = max(tail, y_length)
+        excitation = self._excitation(f0, ap, fs, hop, render_length)
+        y = self._apply_envelope(excitation, sp, fft_size, hop, render_length)
         y = y[:max(y_length, 1)]
         # This backend builds its excitation from scratch, so its absolute
         # level is arbitrary: scale it once, via the shared policy, instead of

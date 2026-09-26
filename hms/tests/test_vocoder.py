@@ -229,29 +229,44 @@ def test_builtin_handles_an_unvoiced_signal():
     assert np.isfinite(audio).all()
 
 
-def test_synthesised_length_follows_the_world_convention():
+@pytest.mark.parametrize("fs,n_frames", [
+    (22050, 60),        # short: the windowed length is the longer one
+    (44100, 60),
+    (44100, 6500),      # 32 s at 44.1 kHz: the *frame grid* is the longer one
+    (22050, 8000),      # 40 s at 22.05 kHz: same crossover
+])
+def test_synthesised_length_follows_the_world_convention(fs, n_frames):
     """Every backend must render a phrase to the same duration.
 
-    WORLD returns ``f0_length * frame_period * fs`` samples; the pure-numpy
+    WORLD returns ``f0_length * frame_period * fs`` samples, and the pure-numpy
     fallback used to add a whole window of tail (`fft_size - hop` samples, ~88 ms
-    at 22.05 kHz), which made a rendered phrase longer purely because the
-    backend changed -- and shifted every frame when the render was re-analysed.
+    at 22.05 kHz) -- a duration that changed with the backend, and that shifted
+    every frame when the render was re-analysed.
+
+    Reverse-rendering one window past the last frame is necessary for the
+    overlap-add, but that is not always longer than the requested length: at
+    44.1 kHz a 5 ms hop rounds to 220 samples while WORLD advances by 220.5, so
+    past ~4 s of audio the frame-grid length wins and a backend that only
+    rendered the windowed length came up short.  Both regimes are covered here.
     """
-    fs = 22050
     frame_period = FRAME_PERIOD
-    n_frames = 60
     expected = int(n_frames * frame_period / 1000.0 * fs)
+    hop = max(1, int(round(fs * frame_period / 1000.0)))
     f0 = np.full(n_frames, 200.0)
     for vname in ("native", "builtin"):
         if vname == "native" and not available_backends()["native"]:
             continue
         vocoder = get_vocoder(vname, fs=fs, frame_period=frame_period)
-        bins = vocoder.fft_size_for(fs) // 2 + 1
+        fft_size = vocoder.fft_size_for(fs)
+        bins = fft_size // 2 + 1
         sequence = AcousticFrameSequence(
             f0=f0, sp=np.full((n_frames, bins), 1e-3),
             ap=np.full((n_frames, bins), 0.3), frame_period=frame_period,
-            fs=fs, fft_size=vocoder.fft_size_for(fs))
-        assert len(vocoder.synthesize(sequence)) == expected, vname
+            fs=fs, fft_size=fft_size)
+        rendered = vocoder.synthesize(sequence)
+        assert len(rendered) == expected, (
+            f"{vname}: rendered {len(rendered)} samples, expected {expected} "
+            f"(windowed length would be {(n_frames - 1) * hop + fft_size})")
 
 
 def test_frame_geometry_helpers(example_wav_path):
