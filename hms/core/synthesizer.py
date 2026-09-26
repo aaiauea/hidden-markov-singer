@@ -256,7 +256,13 @@ class Synthesizer:
                     series[index] = means[state]
             relative = np.convolve(series, np.ones(5) / 5.0, mode="same") \
                 if len(series) >= 5 else series
-            if len(relative):
+            # Re-centre on the frames that actually carry pitch.  A silence (or
+            # otherwise unvoiced) state's pitch statistic is interpolated rather
+            # than sung and can be far from the note; including those frames in
+            # the mean would transpose every note in the utterance.
+            if voiced.any():
+                relative = relative - relative[voiced].mean()
+            elif len(relative):
                 relative = relative - relative.mean()
         else:
             relative = static[:, 0] * float(config.pitch_variation)

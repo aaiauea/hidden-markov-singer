@@ -148,6 +148,37 @@ def test_state_means_pitch_source_runs_without_the_acoustic_model(
     assert np.median(np.abs(deviations)) < 2.0
 
 
+def test_silence_pitch_statistics_do_not_transpose_the_sung_notes(
+        trained_model, short_score):
+    """Only frames that carry pitch may anchor the state-means contour.
+
+    The contour is re-centred so its mean deviation is zero, but a silence
+    state's pitch statistic is interpolated rather than sung and can sit far
+    from the note.  Counting those frames in the mean used to shift every sung
+    note in the utterance (a model whose ``sil`` mean is +9.7 semitones
+    rendered the melody a major third flat).
+    """
+    import copy
+
+    baseline = render(trained_model, short_score, f0_source="state_means")
+    assert np.median(np.abs(voiced_deviations(baseline))) < 1.0
+
+    altered = copy.deepcopy(trained_model)
+    silence_stats = altered.pitch_model.stats.get("sil")
+    assert silence_stats, "the demo model should have a silence pitch state"
+    for state in silence_stats:
+        state.mean += 12.0
+
+    # the melody must still land on the requested notes after perturbing a
+    # statistic that belongs to frames which carry no pitch at all
+    result = render(altered, short_score, f0_source="state_means")
+    assert (result.params.f0 > 0).any()
+    moved = np.median(np.abs(voiced_deviations(result)))
+    assert moved < 1.0, (
+        f"the melody sits {moved:.2f} semitones off the requested notes when a "
+        f"silence state's pitch mean changes")
+
+
 def test_duration_model_mode_ignores_the_score_timing(trained_model):
     """A score that holds a note far longer than the model ever saw must be
     rendered at the *model's* duration when duration_mode='model'."""
