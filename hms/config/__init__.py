@@ -67,6 +67,7 @@ def training_config_from_parameters(parameters: Mapping[str, Any]
                                     ) -> TrainingConfig:
     acoustic = dict(parameters.get("acoustic") or {})
     training = dict(parameters.get("training") or {})
+    duration = dict(parameters.get("duration") or {})
     pitch = dict(parameters.get("pitch") or {})
 
     values: Dict[str, Any] = {}
@@ -78,6 +79,8 @@ def training_config_from_parameters(parameters: Mapping[str, Any]
         name = _ALIASES.get(key, key)
         if name in TrainingConfig.__dataclass_fields__ and value is not None:  # type: ignore[attr-defined]
             values[name] = value
+    if duration.get("variance_scale") is not None:
+        values["duration_variance_scale"] = duration["variance_scale"]
     if "vibrato" in pitch:
         values["vibrato_enabled"] = bool(
             (pitch["vibrato"] or {}).get("enabled", False))

@@ -110,6 +110,13 @@ def test_vibrato_triangle_waveform_stays_bounded():
     assert np.abs(contour).max() <= 0.4 + 1e-9
 
 
+def test_invalid_vibrato_configuration_is_rejected():
+    with pytest.raises(ValueError, match="waveform"):
+        Vibrato(waveform="saw")
+    with pytest.raises(ValueError, match="randomness"):
+        Vibrato(randomness=1.5)
+
+
 def test_estimate_vibrato_measures_rate_and_depth():
     f0, voiced = vibrato_track(rate_hz=5.0, depth=0.5, length=1000)
     estimate = estimate_vibrato(f0, voiced, 22050.0, 5.0)
@@ -267,6 +274,15 @@ def test_allocate_is_monotone_in_the_proportions():
     large = DurationModel.allocate(200, [1.0, 2.0, 3.0])
     assert np.all(large >= small)
     assert abs(large.sum() - 200) == 0
+
+
+def test_allocate_rejects_invalid_state_proportions():
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        DurationModel.allocate(10, [1.0, -0.1])
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        DurationModel.allocate(10, [1.0, np.nan])
+    with pytest.raises(ValueError, match="non-negative"):
+        DurationModel.allocate(-1, [1.0])
 
 
 def test_duration_and_stats_roundtrip():

@@ -34,6 +34,9 @@ MIN_WEIGHT = 1e-4
 #: Default variance floor as a fraction of the global data variance.
 DEFAULT_VAR_FLOOR = 1e-3
 
+#: Covariance representations supported by this implementation.
+COVARIANCE_TYPES = ("diag", "tied")
+
 
 def kmeans_plus_plus(X: np.ndarray, k: int, rng: np.random.Generator
                      ) -> np.ndarray:
@@ -95,9 +98,37 @@ class DiagGMM:
     # -- construction ------------------------------------------------------
 
     def __post_init__(self) -> None:
+        if self.covariance_type not in COVARIANCE_TYPES:
+            raise ValueError(f"covariance_type must be one of {COVARIANCE_TYPES}, "
+                             f"got {self.covariance_type!r}")
+
         self.weights = np.asarray(self.weights, dtype=np.float64).reshape(-1)
-        self.means = np.atleast_2d(np.asarray(self.means, dtype=np.float64))
-        self.variances = np.atleast_2d(np.asarray(self.variances, dtype=np.float64))
+        self.means = np.asarray(self.means, dtype=np.float64)
+        self.variances = np.asarray(self.variances, dtype=np.float64)
+        if self.means.ndim == 1:
+            self.means = self.means[None, :]
+        if self.variances.ndim == 1:
+            self.variances = self.variances[None, :]
+        if self.means.ndim != 2 or self.variances.ndim != 2:
+            raise ValueError("GMM means and variances must be two-dimensional")
+        if self.means.shape != self.variances.shape:
+            raise ValueError("GMM means and variances must have identical shapes")
+        if self.means.shape[0] != len(self.weights):
+            raise ValueError("GMM weights must have one value per component")
+        if self.means.shape[0] == 0 or self.means.shape[1] == 0:
+            raise ValueError("GMM must have at least one component and feature")
+        if not (np.isfinite(self.weights).all()
+                and np.isfinite(self.means).all()
+                and np.isfinite(self.variances).all()):
+            raise ValueError("GMM parameters must be finite")
+        if (self.weights < 0).any() or self.weights.sum() <= 0:
+            raise ValueError("GMM weights must be non-negative with positive sum")
+        if (self.variances <= 0).any():
+            raise ValueError("GMM variances must be positive")
+        if self.covariance_type == "tied" and not np.allclose(
+                self.variances, self.variances[0]):
+            raise ValueError("tied-covariance GMM components must share variances")
+        self.weights = self.weights / self.weights.sum()
 
     @property
     def n_components(self) -> int:
@@ -136,15 +167,32 @@ class DiagGMM:
           * ``var_floor_ratio`` keeps variances away from zero, relative to the
             variance of the data actually seen -- important on tiny corpora.
         """
-        X = np.atleast_2d(np.asarray(X, dtype=np.float64))
+        if covariance_type not in COVARIANCE_TYPES:
+            raise ValueError(f"covariance_type must be one of {COVARIANCE_TYPES}, "
+                             f"got {covariance_type!r}")
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X[None, :]
+        if X.ndim != 2 or X.shape[0] == 0 or X.shape[1] == 0:
+            raise ValueError("GMM training data must have shape (frames, features) "
+                             "with both dimensions non-empty")
+        if not np.isfinite(X).all():
+            raise ValueError("GMM training data must contain only finite values")
         n, dim = X.shape
+        if not np.isfinite(var_floor_ratio) or var_floor_ratio < 0:
+            raise ValueError("var_floor_ratio must be finite and non-negative")
         n_components = int(max(1, min(n_components, max(1, n))))
         rng = np.random.default_rng(seed)
         if weights is None:
-            weights = np.ones(n)
-        weights = np.asarray(weights, dtype=np.float64)
-        if weights.sum() <= 0:
-            weights = np.ones(n)
+            weights = np.ones(n, dtype=np.float64)
+        else:
+            weights = np.asarray(weights, dtype=np.float64)
+            if weights.ndim != 1 or weights.shape[0] != n:
+                raise ValueError(f"weights must have shape ({n},), got {weights.shape}")
+            if not np.isfinite(weights).all() or (weights < 0).any():
+                raise ValueError("weights must be finite and non-negative")
+            if weights.sum() <= 0:
+                raise ValueError("weights must have a positive sum")
         w = weights / weights.sum()
 
         global_mean = w @ X

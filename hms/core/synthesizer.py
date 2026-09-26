@@ -3,16 +3,17 @@
     score (phonemes + notes + durations)
         -> per-phoneme state allocation from the requested durations
         -> per-frame model statistics (mean, variance) per state
-        -> MLPG trajectory generation
-        -> note-conditioned F0 (+ learned deviation + optional vibrato)
-        -> voicing mask from the learned state voicing probabilities
+        -> MLPG acoustic trajectory generation
+        -> score target F0 (+ optional learned deviation / vibrato)
+        -> voicing mask from the HMM state probabilities
         -> WORLD parameters -> waveform
 
 Each stage is independently replaceable:
 
 * `hms.core.duration.DurationModel.allocate` decides the state sequence;
 * `hms.core.generation.mlpg` turns state statistics into a trajectory;
-* `hms.core.pitch.PitchModel` turns the trajectory + score notes into F0;
+* `hms.core.pitch.PitchModel` provides optional learned deviations and vibrato;
+  the score alone supplies target F0 in the default mode;
 * `hms.vocoder` turns (f0, sp, ap) into samples.
 
 Options that matter in practice (all in `SynthesisConfig`):
@@ -23,14 +24,16 @@ Options that matter in practice (all in `SynthesisConfig`):
     livelier); <1 strengthens them and flattens/smooths the trajectory.  1.0
     reproduces the model.
 ``pitch_variation``
-    0 makes F0 exactly the note plus the model's mean deviation
-    (deterministic, useful for testing and for "straight" singing); 1 uses the
-    learned variation as-is.  Values >1 exaggerate it.
+    Scales the optional learned deviation in ``acoustic`` and ``state_means``
+    modes; 0 suppresses that deviation and values >1 exaggerate it. It has no
+    effect in the default ``score`` mode.
 ``f0_source``
-    ``acoustic`` (default) takes F0 from the generated trajectory -- i.e. the
-    HMM's own model of this singer's pitch habits; ``state_means`` rebuilds the
-    contour from the per-(phoneme, state) pitch statistics instead, which is
-    blunter but more predictable for tiny models.
+    ``score`` (default) uses the requested musical note directly as target F0;
+    no learned pitch statistics are needed. ``acoustic`` optionally adds the
+    note-relative F0 trajectory learned jointly by the acoustic HMM, while
+    ``state_means`` uses the separate per-(phoneme, state) pitch statistics.
+    Both learned-deviation modes remain optional extensions to score-driven
+    synthesis.
 ``duration_mode``
     ``score`` honours the score's segment boundaries (normal use);
     ``model`` asks the duration model to predict them, for scores that only
@@ -57,7 +60,7 @@ class SynthesisConfig:
 
     variance_scale: float = 1.0
     pitch_variation: float = 1.0
-    f0_source: str = "acoustic"        # "acoustic" | "state_means"
+    f0_source: str = "score"           # "score" | "acoustic" | "state_means"
     duration_mode: str = "score"       # "score" | "model"
     tempo: float = 1.0
     vibrato: Optional[bool] = None     # None -> whatever the model says
@@ -70,6 +73,35 @@ class SynthesisConfig:
     vocoder: Optional[str] = None      # override the backend
     #: inter-phoneme smoothing of the generated F0, in frames (0 = off)
     pitch_smoothing: int = 0
+
+    def __post_init__(self) -> None:
+        if self.f0_source not in ("score", "acoustic", "state_means"):
+            raise ValueError("f0_source must be 'score', 'acoustic' or 'state_means'")
+        if self.duration_mode not in ("score", "model"):
+            raise ValueError("duration_mode must be 'score' or 'model'")
+        if self.mixture not in ("dominant", "marginal"):
+            raise ValueError("mixture must be 'dominant' or 'marginal'")
+        if self.vocoder not in (None, "auto", "native", "pyworld", "builtin"):
+            raise ValueError("vocoder must be auto, native, pyworld or builtin")
+        numeric = [self.variance_scale, self.pitch_variation, self.tempo,
+                   self.transpose]
+        numeric.extend(v for v in (self.vibrato_depth, self.vibrato_rate)
+                       if v is not None)
+        try:
+            if not all(np.isfinite(value) for value in numeric):
+                raise ValueError("synthesis settings must be finite")
+        except TypeError as exc:
+            raise ValueError("synthesis settings must be numeric") from exc
+        if self.variance_scale <= 0 or self.tempo <= 0:
+            raise ValueError("variance_scale and tempo must be positive")
+        if self.pitch_variation < 0:
+            raise ValueError("pitch_variation must be non-negative")
+        if self.vibrato_depth is not None and self.vibrato_depth < 0:
+            raise ValueError("vibrato_depth must be non-negative")
+        if self.vibrato_rate is not None and self.vibrato_rate <= 0:
+            raise ValueError("vibrato_rate must be positive")
+        if self.pitch_smoothing < 0:
+            raise ValueError("pitch_smoothing must be non-negative")
 
 
 @dataclass
@@ -129,6 +161,8 @@ class Synthesizer:
         notes: List[float] = []
         segment_frames: List[int] = []
         diagnostics: List[str] = []
+        next_segment_id = 0
+        duration_rng = np.random.default_rng(config.seed)
 
         for utterance in score:
             if config.duration_mode == "model" or utterance.end <= utterance.start:
@@ -136,7 +170,7 @@ class Synthesizer:
                 phones = [s.phone for s in utterance.segments] or ["sil"]
                 predicted = self.model.duration_model.predict(
                     phones, spec.frame_period, tempo=config.tempo,
-                    rng=np.random.default_rng(config.seed), speak=False)
+                    rng=duration_rng, speak=True)
                 segments = [(phone, int(max(round(frames), 1)),
                              segment.note)
                             for phone, frames, segment
@@ -154,7 +188,7 @@ class Synthesizer:
                     segments.append((phone, max(1, hi - lo), note))
                     previous_end = hi
 
-            for index, (phone, frames, note) in enumerate(segments):
+            for phone, frames, note in segments:
                 hmm = self.model.get_or_backoff(phone)
                 if self.model.get_hmm(phone) is None:
                     diagnostics.append(
@@ -164,10 +198,11 @@ class Synthesizer:
                 for state, count in enumerate(counts):
                     frame_phones.extend([phone] * int(count))
                     state_ids.extend([state] * int(count))
-                    segment_ids.extend([index] * int(count))
+                    segment_ids.extend([next_segment_id] * int(count))
                     notes.extend([default_note if note is None else float(note)]
                                  * int(count))
                 segment_frames.append(int(sum(counts)))
+                next_segment_id += 1
 
         note_per_frame = np.asarray(notes, dtype=np.float64)
         if self.config.transpose:
@@ -234,20 +269,26 @@ class Synthesizer:
         """Absolute F0 in semitones (NaN where unvoiced).
 
         F0 = score note
-             + learned deviation from the model (MLPG trajectory of feature 0)
+             + optional learned deviation (acoustic or state_means source)
              + optional vibrato (explicit component, if enabled)
 
-        The note is the anchor: the training speaker's absolute pitch is never
-        copied, only the statistics of how they move *around* a note.
+        The default ``score`` source uses the score note with zero deviation.
+        Learned pitch behavior is opt-in; absolute training-speaker F0 is never
+        copied.
         """
         spec = self.model.spec
         config = self.config
         note_semitones = 12.0 * np.log2(
             labels_module.midi_to_hz(note_per_frame) / spec.f0_ref_hz)
 
-        if config.f0_source == "state_means":
-            # rebuild the contour from per-(phoneme, state) pitch statistics,
-            # then smooth it across state boundaries
+        if config.f0_source == "score":
+            # Base score-driven synthesis: the supplied note is the complete
+            # target F0; no learned pitch statistics or HMM F0 trajectory are
+            # consulted. Optional vibrato can still be added below.
+            relative = np.zeros(len(static), dtype=np.float64)
+        elif config.f0_source == "state_means":
+            # Optional pitch-model mode: use per-(phoneme, state) statistics,
+            # then smooth them across state boundaries.
             series = np.zeros(len(static), dtype=np.float64)
             for index, phone in enumerate(phones):
                 means = self.model.pitch_model.state_means(phone)
@@ -256,30 +297,30 @@ class Synthesizer:
                     series[index] = means[state]
             relative = np.convolve(series, np.ones(5) / 5.0, mode="same") \
                 if len(series) >= 5 else series
-            # Re-centre on the frames that actually carry pitch.  A silence (or
-            # otherwise unvoiced) state's pitch statistic is interpolated rather
-            # than sung and can be far from the note; including those frames in
-            # the mean would transpose every note in the utterance.
+            # Re-centre on voiced frames only: silence statistics are not sung.
             if voiced.any():
                 relative = relative - relative[voiced].mean()
             elif len(relative):
                 relative = relative - relative.mean()
-        else:
+            relative *= float(config.pitch_variation)
+        else:  # acoustic: optional note-relative trajectory from the HMM
             relative = static[:, 0] * float(config.pitch_variation)
 
-        vibrato_backup = self.model.pitch_model.vibrato.enabled
+        # Make synthesis-time vibrato overrides local to this render instead of
+        # mutating the saved voice (depth/rate used to leak into later renders).
+        from hms.core.pitch import PitchModel, Vibrato
+        vibrato = Vibrato.from_dict(self.model.pitch_model.vibrato.to_dict())
         if config.vibrato is not None:
-            self.model.pitch_model.vibrato.enabled = bool(config.vibrato)
+            vibrato.enabled = bool(config.vibrato)
         if config.vibrato_depth is not None:
-            self.model.pitch_model.vibrato.depth_semitones = \
-                float(config.vibrato_depth)
+            vibrato.depth_semitones = float(config.vibrato_depth)
         if config.vibrato_rate is not None:
-            self.model.pitch_model.vibrato.rate_hz = float(config.vibrato_rate)
+            vibrato.rate_hz = float(config.vibrato_rate)
+        pitch_model = PitchModel(vibrato=vibrato)
 
-        f0 = self.model.pitch_model.generate(
+        f0 = pitch_model.generate(
             note_semitones, voiced, rng=rng, note_ids=np.asarray(segment_ids),
             frame_period=spec.frame_period, relative_trajectory=relative)
-        self.model.pitch_model.vibrato.enabled = vibrato_backup
 
         if config.pitch_smoothing > 0:
             f0 = self._smooth_nan(f0, int(config.pitch_smoothing))

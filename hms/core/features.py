@@ -28,11 +28,12 @@ Feature layout (default spec, dim = static_dim = 1 + n_mcep + n_band)
 
 Design notes
 ------------
-*Log-F0 is note-relative at training time.*  The trainer subtracts the note
-actually sung on each frame, so the acoustic model learns *how this singer moves
-around the note* (onset scoops, drift, vibrato) instead of memorising absolute
-pitch.  At synthesis the target note supplies the base and the model adds the
-learned deviation.  See `hms.core.pitch`.
+*Log-F0 is note-relative at training time.* The trainer subtracts the note
+actually sung on each frame, so the acoustic model can learn *how this singer
+moves around the note* (onset scoops, drift) instead of memorising absolute
+pitch. This is an optional learned-deviation source at synthesis; the default
+score-driven path uses the requested note directly as target F0. See
+`hms.core.pitch` and `SynthesisConfig.f0_source`.
 
 *Mel-cepstrum instead of raw log-spectrum.*  The HMM needs per-dimension
 random variables it can put a Gaussian on.  Raw log-spectrum bins are 513
@@ -368,6 +369,34 @@ class FeatureSpec:
     def __post_init__(self) -> None:
         if self.n_mcep < 2:
             raise ValueError("n_mcep must be >= 2 (c0 plus at least one shape coeff)")
+        if self.n_band < 2:
+            raise ValueError("n_band must be >= 2 for aperiodicity interpolation")
+        try:
+            numeric = (self.fs, self.frame_period, self.fft_size, self.f0_ref_hz,
+                       self.f0_floor, self.f0_ceil, self.voiced_threshold,
+                       self.mcep_f_min)
+            if not all(np.isfinite(value) for value in numeric):
+                raise ValueError("feature geometry and pitch values must be finite")
+        except TypeError as exc:
+            raise ValueError("feature geometry and pitch values must be numeric") from exc
+        if self.fs <= 0 or self.fft_size < 2:
+            raise ValueError("fs must be positive and fft_size must be >= 2")
+        if self.frame_period <= 0:
+            raise ValueError("frame_period must be positive")
+        if self.f0_ref_hz <= 0 or self.f0_floor <= 0 \
+                or self.f0_ceil <= self.f0_floor:
+            raise ValueError("F0 values must satisfy 0 < f0_floor < f0_ceil "
+                             "and f0_ref_hz > 0")
+        if self.voiced_threshold < 0:
+            raise ValueError("voiced_threshold must be non-negative")
+        if self.mcep_f_min < 0 or self.mcep_f_min >= self.fs / 2:
+            raise ValueError("mcep_f_min must be within [0, Nyquist)")
+        if self.pitch_bins_per_semitone < 1:
+            raise ValueError("pitch_bins_per_semitone must be positive")
+        if self.delta_window < 1:
+            raise ValueError("delta_window must be at least 1")
+        if self.f0_estimation not in ("dio", "harvest"):
+            raise ValueError("f0_estimation must be 'dio' or 'harvest'")
 
     # -- serialisation -----------------------------------------------------
 
@@ -399,8 +428,16 @@ class FeatureSpec:
         f0 = np.asarray(f0, dtype=np.float64).reshape(-1)
         sp = np.atleast_2d(np.asarray(sp, dtype=np.float64))
         ap = np.atleast_2d(np.asarray(ap, dtype=np.float64))
+        if sp.shape[0] != len(f0) or ap.shape[0] != len(f0):
+            raise ValueError("f0, sp and ap must have the same frame count")
         if len(f0) == 0:
             return np.zeros((0, self.static_dim), dtype=np.float64)
+        if not np.isfinite(f0).all() or not np.isfinite(sp).all() \
+                or not np.isfinite(ap).all():
+            raise ValueError("f0, sp and ap must contain only finite values")
+        if (f0 < 0).any() or (sp < 0).any() or (ap < 0).any() or (ap > 1).any():
+            raise ValueError("F0 and spectral values must be non-negative; "
+                             "aperiodicity must be in [0, 1]")
 
         voiced = f0 >= self.voiced_threshold
         logf0 = np.where(voiced, hz_to_semitone(np.maximum(f0, 1e-6),
@@ -430,8 +467,17 @@ class FeatureSpec:
             when voicing matters.
         """
         static = np.atleast_2d(np.asarray(static, dtype=np.float64))
-        f0_semi = (static[:, 0] if f0_semitones is None
-                   else np.asarray(f0_semitones, dtype=np.float64))
+        if static.ndim != 2 or static.shape[1] != self.static_dim:
+            raise ValueError(f"static features must have shape (frames, "
+                             f"{self.static_dim}), got {static.shape}")
+        if not np.isfinite(static).all():
+            raise ValueError("static features must contain only finite values")
+        if f0_semitones is None:
+            f0_semi = static[:, 0]
+        else:
+            f0_semi = np.asarray(f0_semitones, dtype=np.float64)
+            if f0_semi.ndim != 1 or len(f0_semi) != len(static):
+                raise ValueError("f0_semitones must have one value per frame")
         f0 = semitone_to_hz(f0_semi, self.f0_ref_hz)
         unvoiced = (~np.isfinite(f0)) | (f0 < self.f0_floor) | (f0 > self.f0_ceil)
         f0 = np.where(unvoiced, 0.0, f0)

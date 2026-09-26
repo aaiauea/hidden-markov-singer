@@ -116,6 +116,23 @@ def test_extract_train_inspect_synth(tmp_path, demo_dataset, capsys):
     assert header[:5] == ["frame", "time_s", "phone", "state", "note"]
 
 
+def test_synth_cli_honours_frame_based_score_times(
+        tmp_path, trained_model, capsys):
+    model_dir = tmp_path / "model"
+    trained_model.save(model_dir)
+    parameters = tmp_path / "parameters.yaml"
+    parameters.write_text("training:\n  time_unit: frames\n", encoding="utf-8")
+    score = tmp_path / "frames.tsv"
+    score.write_text("demo\t0\t20\ta\t60\n", encoding="utf-8")
+    out_wav = tmp_path / "frames.wav"
+
+    assert main(["synth", "--model", str(model_dir), "--score", str(score),
+                 "--out", str(out_wav), "--config", str(parameters),
+                 "--vocoder", "builtin"]) == 0
+    assert wavio.audio_info(out_wav)["duration"] == pytest.approx(0.1, abs=0.01)
+    assert "rendered 1 utterance(s)" in capsys.readouterr().out
+
+
 def test_synth_unknown_utterance_is_reported(tmp_path, demo_dataset, capsys):
     labels = write_subset_labels(demo_dataset, tmp_path / "labels.tsv")
     model_dir = tmp_path / "model"

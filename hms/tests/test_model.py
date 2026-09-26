@@ -85,6 +85,25 @@ def test_save_load_roundtrip(trained_model, tmp_path):
     assert loaded.pitch_model.voiced_prior == model.pitch_model.voiced_prior
 
 
+def test_tied_backoff_covariance_type_survives_serialisation(
+        trained_model, tmp_path):
+    import copy
+
+    model = copy.deepcopy(trained_model)
+    for hmm in model.backoff.values():
+        hmm.covariance_type = "tied"
+        for state in hmm.states:
+            state.gmm.covariance_type = "tied"
+            shared = state.gmm.variances.mean(axis=0)
+            state.gmm.variances[:] = shared
+    directory = tmp_path / "tied-backoff"
+    model.save(directory)
+    loaded = HMSModel.load(directory)
+    assert loaded.backoff
+    assert all(hmm.covariance_type == "tied"
+               for hmm in loaded.backoff.values())
+
+
 def test_load_model_helper_and_errors(trained_model, tmp_path):
     directory = tmp_path / "model"
     trained_model.save(directory)

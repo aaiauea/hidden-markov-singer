@@ -64,6 +64,38 @@ def test_parser_reports_problems_instead_of_crashing():
     assert [s.phone for s in score["phrase"].segments] == ["a"]
 
 
+def test_frame_time_unit_converts_to_seconds_using_the_analysis_period():
+    score = labels_module.parse("u\t0\t20\ta\t60\n",
+                                time_unit="frames", frame_period=5.0)
+    segment = score["u"].segments[0]
+    assert segment.start == pytest.approx(0.0)
+    assert segment.end == pytest.approx(0.1)
+    spans = labels_module.segment_boundaries(score["u"], frame_period=5.0)
+    assert spans == [("a", 0, 20, 60.0)]
+
+
+def test_nonfinite_times_and_malformed_notes_are_diagnostics():
+    text = "\n".join([
+        "u 0.0 0.1 a not-a-note",
+        "u nan 0.2 a 60",
+        "u 0.0 inf a 60",
+        "u 0.0 0.1 a inf",
+        "u 0.0 0.1 a 128",
+    ])
+    score = labels_module.parse(text)
+    assert len(score) == 0
+    assert len(score.diagnostics) == 5
+    assert any("bad MIDI note" in item for item in score.diagnostics)
+    assert any("finite" in item for item in score.diagnostics)
+    assert any("[0, 127]" in item for item in score.diagnostics)
+
+
+def test_invalid_frame_period_is_rejected_for_frame_labels():
+    with pytest.raises(ValueError, match="frame_period"):
+        labels_module.parse("u 0 10 a 60\n", time_unit="frames",
+                            frame_period=0.0)
+
+
 def test_context_columns_are_captured():
     score = labels_module.parse("u 0.0 0.5 a 60 stress=1 word=la\n")
     assert score["u"].segments[0].context == {"stress": "1", "word": "la"}
@@ -177,3 +209,9 @@ def test_new_phonemes_can_be_added_without_touching_the_engine(phoneme_set):
 def test_broken_inventory_is_rejected():
     with pytest.raises(ValueError):
         PhonemeSet.from_dict({"phonemes": {}})
+    with pytest.raises(ValueError, match="unknown type"):
+        PhonemeSet.from_dict({"phonemes": {"a": {"type": "vocalic"}}})
+    with pytest.raises(ValueError, match="must be positive"):
+        PhonemeSet.from_dict({"phonemes": {
+            "a": {"type": "vowel", "n_states": 0},
+        }})

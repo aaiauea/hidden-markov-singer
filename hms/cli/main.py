@@ -143,7 +143,8 @@ def cmd_extract(args) -> int:
     spec.fs = config.fs
     spec.fft_size = config.fft_size or vocoder.fft_size_for(config.fs)
 
-    score = labels_module.load(args.labels, time_unit=config.time_unit)
+    score = labels_module.load(args.labels, time_unit=config.time_unit,
+                               frame_period=config.frame_period)
     corpus = Corpus(score, Path(args.wav_dir), config.audio_extensions)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -218,7 +219,8 @@ def cmd_train(args) -> int:
         _log("")
         _log("training-set likelihood (higher is better):")
         score = labels_module.load(config.label_file,
-                                   time_unit=config.time_unit)
+                                   time_unit=config.time_unit,
+                                   frame_period=config.frame_period)
         corpus = Corpus(score, Path(config.wav_dir or "."),
                         config.audio_extensions)
         utter = trainer.analyse_corpus(corpus)
@@ -264,7 +266,9 @@ def cmd_synth(args) -> int:
         if value is not None:
             setattr(config, key, value)
 
-    score = labels_module.load(args.score, time_unit="seconds")
+    time_unit = (parameters.get("training") or {}).get("time_unit", "seconds")
+    score = labels_module.load(args.score, time_unit=time_unit,
+                               frame_period=model.spec.frame_period)
     for diagnostic in score.diagnostics:
         _log(f"  ! {diagnostic}")
     if args.utterance:
@@ -389,6 +393,9 @@ def cmd_demo(args) -> int:
     config.label_file = info["labels"]
     config.wav_dir = info["wav_dir"]
     config.fs = args.fs
+    # The demo corpus generator writes timestamps in seconds regardless of the
+    # user's corpus-label time_unit setting.
+    config.time_unit = "seconds"
     if args.iterations is not None:
         config.n_iterations = args.iterations
     if args.vocoder:
@@ -533,7 +540,9 @@ def build_parser() -> argparse.ArgumentParser:
     synth.add_argument("--pitch-variation", type=float, default=None,
                        help="scale of the learned deviation from the note")
     synth.add_argument("--f0-source", default=None,
-                       choices=["acoustic", "state_means"])
+                       choices=["score", "acoustic", "state_means"],
+                       help="score F0 (default), optional acoustic deviation, "
+                            "or separate pitch-model state means")
     synth.add_argument("--duration-mode", default=None,
                        choices=["score", "model"],
                        help="use the score's durations or predict them")

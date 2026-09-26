@@ -1,8 +1,9 @@
 # HMS parameters
 # =============
-# Every tunable of the system in one readable file.  The trainer reads the
-# `training` and `acoustic` sections, synthesis reads `synthesis`.  Any value
-# here can also be overridden on the command line.
+# Every tunable of the system in one readable file. The trainer reads the
+# `training`, `acoustic`, `duration`, and pitch-estimation settings; synthesis
+# reads `synthesis` and `pitch`. Any value here can also be overridden on the
+# command line.
 #
 # The defaults are tuned for a *small* single-speaker corpus (a few minutes of
 # sung audio, one voice).  Where a knob trades data against quality, the comment
@@ -55,7 +56,8 @@ synthesis:
   # reproduces the model exactly.
   variance_scale: 1.0
   pitch_variation: 1.0      # scale of the learned deviation from the note
-  f0_source: acoustic       # acoustic | state_means
+  # Target F0 comes from score notes by default; learned pitch deviations are optional.
+  f0_source: score          # score | acoustic | state_means
   duration_mode: score      # score | model
   mixture: dominant         # dominant | marginal
   pitch_smoothing: 0        # frames of moving average on F0 (0 = off)

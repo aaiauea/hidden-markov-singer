@@ -222,6 +222,19 @@ def test_invalid_spectral_shape_is_rejected():
     spec = FeatureSpec(fs=22050, fft_size=1024, n_mcep=12)
     with pytest.raises(ValueError):
         spec.encode(np.ones(3), np.ones((3, 100)), np.ones((3, 513)))
+    with pytest.raises(ValueError, match="same frame count"):
+        spec.encode(np.ones(3), np.ones((2, 513)), np.ones((3, 513)))
+    with pytest.raises(ValueError, match="shape"):
+        spec.decode(np.zeros((2, spec.static_dim - 1)))
+
+
+def test_invalid_feature_geometry_is_rejected_early():
+    with pytest.raises(ValueError, match="n_band"):
+        FeatureSpec(n_band=1)
+    with pytest.raises(ValueError, match="F0 values"):
+        FeatureSpec(f0_floor=800.0, f0_ceil=70.0)
+    with pytest.raises(ValueError, match="delta_window"):
+        FeatureSpec(delta_window=0)
 
 
 def test_stream_helpers_are_inverse():

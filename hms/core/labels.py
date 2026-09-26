@@ -9,9 +9,9 @@ One format serves both roles, which keeps the toolchain small::
     ...
 
 * ``onset``/``offset`` are in seconds by default (``time_unit: seconds`` in
-  `parameters.yaml`); ``time_unit: frames`` interprets them as analysis frames,
-  which is exact and convenient when labels were derived from the same frame
-  grid.
+  `parameters.yaml`); ``time_unit: frames`` interprets them as analysis frames
+  and converts them using the configured ``frame_period``. This is exact and
+  convenient when labels were derived from the same frame grid.
 * ``phone`` is a phoneme symbol from `phonemes.yaml`.
 * ``note`` is a MIDI note number, or ``-`` (or empty) for "no pitch": silence
   and unvoiced-only segments.  A note may be repeated across several
@@ -169,10 +169,22 @@ class Score:
         Path(path).write_text("\n".join(self.to_lines()) + "\n", encoding="utf-8")
 
 
-def parse(text: str, time_unit: str = "seconds") -> Score:
-    """Parse label text into a :class:`Score`."""
+def parse(text: str, time_unit: str = "seconds",
+          frame_period: float = 5.0) -> Score:
+    """Parse labels into a :class:`Score`, storing all times in seconds.
+
+    When ``time_unit='frames'``, frame indices are converted using the
+    analysis ``frame_period`` (milliseconds) so downstream alignment has one
+    canonical time unit.
+    """
     if time_unit not in ("seconds", "frames"):
         raise ValueError("time_unit must be 'seconds' or 'frames'")
+    try:
+        if not np.isfinite(frame_period) or frame_period <= 0:
+            raise ValueError("frame_period must be finite and positive")
+    except TypeError as exc:
+        raise ValueError("frame_period must be numeric") from exc
+    time_scale = frame_period / 1000.0 if time_unit == "frames" else 1.0
     utterances: List[Utterance] = []
     by_name: Dict[str, Utterance] = {}
     diagnostics: List[str] = []
@@ -186,20 +198,42 @@ def parse(text: str, time_unit: str = "seconds") -> Score:
             diagnostics.append(f"line {lineno}: expected at least 4 columns, "
                                f"got {len(parts)}")
             continue
-        name, onset, offset, phone = parts[0], parts[1], parts[2], parts[3]
+        name, onset, offset, phone = (parts[0].strip(), parts[1].strip(),
+                                      parts[2].strip(), parts[3].strip())
         note_raw = parts[4].strip().lower() if len(parts) > 4 else "-"
+        if not phone:
+            diagnostics.append(f"line {lineno}: empty phoneme symbol -- dropped")
+            continue
         try:
             start, end = float(onset), float(offset)
         except ValueError:
             diagnostics.append(f"line {lineno}: bad time columns {onset!r}, "
-                               f"{offset!r}")
+                               f"{offset!r} -- dropped")
+            continue
+        if not np.isfinite(start) or not np.isfinite(end):
+            diagnostics.append(f"line {lineno}: time columns must be finite "
+                               f"({onset!r}, {offset!r}) -- dropped")
             continue
         if end <= start:
             diagnostics.append(f"line {lineno}: non-positive duration "
                                f"({end - start:+.4f}) -- dropped")
             continue
+        start, end = start * time_scale, end * time_scale
+
         note: Optional[float]
-        note = None if note_raw in NO_NOTE else float(note_raw)
+        if note_raw in NO_NOTE:
+            note = None
+        else:
+            try:
+                note = float(note_raw)
+            except ValueError:
+                diagnostics.append(f"line {lineno}: bad MIDI note {note_raw!r} "
+                                   "-- dropped")
+                continue
+            if not np.isfinite(note) or not 0.0 <= note <= 127.0:
+                diagnostics.append(f"line {lineno}: MIDI note must be finite "
+                                   f"and in [0, 127], got {note_raw!r} -- dropped")
+                continue
 
         context: Dict[str, str] = {}
         for extra in parts[5:]:
@@ -227,8 +261,10 @@ def parse(text: str, time_unit: str = "seconds") -> Score:
     return Score(utterances, diagnostics)
 
 
-def load(path, time_unit: str = "seconds") -> Score:
-    return parse(Path(path).read_text(encoding="utf-8"), time_unit=time_unit)
+def load(path, time_unit: str = "seconds",
+         frame_period: float = 5.0) -> Score:
+    return parse(Path(path).read_text(encoding="utf-8"), time_unit=time_unit,
+                 frame_period=frame_period)
 
 
 def note_sequence(utterance: Utterance, frame_period: float,

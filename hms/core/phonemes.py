@@ -91,27 +91,50 @@ class PhonemeSet:
     def from_dict(cls, data: Dict[str, Any]) -> "PhonemeSet":
         defaults = {name: dict(FALLBACK_DEFAULTS.get(name, {}))
                     for name in CLASSES}
-        for name, values in (data.get("defaults") or {}).items():
-            defaults.setdefault(name, {})
+        configured_defaults = data.get("defaults") or {}
+        if not isinstance(configured_defaults, dict):
+            raise ValueError("phoneme defaults must be a mapping by class")
+        for name, values in configured_defaults.items():
+            if name not in CLASSES:
+                raise ValueError(f"unknown phoneme class in defaults: {name!r}")
+            if values is not None and not isinstance(values, dict):
+                raise ValueError(f"defaults for {name!r} must be a mapping")
             defaults[name].update(values or {})
 
         entries = data.get("phonemes") or {}
-        if not entries:
-            raise ValueError("phonemes.yaml defines no phonemes")
+        if not isinstance(entries, dict) or not entries:
+            raise ValueError("phonemes.yaml must define phonemes as a non-empty mapping")
         phonemes: Dict[str, PhonemeDef] = {}
-        for symbol, values in entries.items():
-            values = dict(values or {})
+        for symbol, raw_values in entries.items():
+            if not isinstance(symbol, str) or not symbol.strip():
+                raise ValueError(f"phoneme symbols must be non-empty strings, "
+                                 f"got {symbol!r}")
+            if raw_values is not None and not isinstance(raw_values, dict):
+                raise ValueError(f"definition for phoneme {symbol!r} must be a mapping")
+            values = dict(raw_values or {})
             klass = values.get("type", "unvoiced_consonant")
-            base = dict(defaults.get(klass, {}))
+            if klass not in CLASSES:
+                raise ValueError(f"phoneme {symbol!r} has unknown type {klass!r}; "
+                                 f"expected one of {CLASSES}")
+            base = dict(defaults[klass])
             merged = {**base, **values}
+            try:
+                n_states = int(merged.get("n_states", 2))
+                n_components = int(merged.get("n_components", 1))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"phoneme {symbol!r} state/component counts "
+                                 "must be integers") from exc
+            if n_states < 1 or n_components < 1:
+                raise ValueError(f"phoneme {symbol!r} n_states and n_components "
+                                 "must be positive")
             extra = {k: v for k, v in merged.items()
                      if k not in ("type", "n_states", "n_components", "voiced",
                                   "can_hold_note")}
             phonemes[symbol] = PhonemeDef(
                 symbol=symbol,
                 type=klass,
-                n_states=int(merged.get("n_states", 2)),
-                n_components=int(merged.get("n_components", 1)),
+                n_states=n_states,
+                n_components=n_components,
                 voiced=bool(merged.get("voiced", klass in ("vowel",
                                                            "voiced_consonant"))),
                 can_hold_note=bool(merged.get("can_hold_note",

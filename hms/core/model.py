@@ -162,16 +162,28 @@ class HMSModel:
                        f"available (classes: {sorted(self.backoff)})")
 
     @property
-    def n_free_params(self) -> int:
-        """Total free parameters of the acoustic model (data-efficiency gauge)."""
+    def phoneme_n_free_params(self) -> int:
+        """Free parameters in the dedicated per-phoneme HMMs."""
         return sum(h.n_free_params for h in self.hmms.values())
+
+    @property
+    def backoff_n_free_params(self) -> int:
+        """Free parameters in the pooled class backoff HMMs."""
+        return sum(h.n_free_params for h in self.backoff.values())
+
+    @property
+    def n_free_params(self) -> int:
+        """Total free parameters, including dedicated and backoff HMMs."""
+        return self.phoneme_n_free_params + self.backoff_n_free_params
 
     def parameter_report(self) -> List[str]:
         lines = [
             f"  phonemes modelled : {len(self.hmms)}",
             f"  feature dim       : {self.feature_dim} "
             f"({self.static_dim} static x {len(self.spec.stream_sizes)} streams)",
-            f"  HMM free params   : {self.n_free_params:,}",
+            f"  phoneme HMM params: {self.phoneme_n_free_params:,}",
+            f"  backoff HMM params: {self.backoff_n_free_params:,}",
+            f"  total HMM params  : {self.n_free_params:,}",
             f"  frames of training: {self.stats.frames:,} "
             f"({self.stats.duration_seconds:.1f} s)",
         ]
@@ -208,8 +220,12 @@ class HMSModel:
         for key, hmm in sorted(self.backoff.items()):
             for name, value in hmm.to_arrays().items():
                 backoff_arrays[f"{key}/{name}"] = value
-            backoff_index[key] = {"n_states": hmm.n_states,
-                                  "n_components": hmm.states[0].gmm.n_components}
+            backoff_index[key] = {
+                "n_states": hmm.n_states,
+                "n_components": hmm.states[0].gmm.n_components,
+                "covariance": hmm.covariance_type,
+                "allow_skip": bool(hmm.allow_skip),
+            }
         if backoff_arrays:
             np.savez_compressed(directory / _BACKOFF_NPZ, **backoff_arrays)
 
@@ -277,12 +293,14 @@ class HMSModel:
         if backoff_path.exists():
             with np.load(backoff_path) as handle:
                 backoff_arrays = {key: handle[key] for key in handle.files}
-            for key in (document.get("backoff_index") or {}):
+            for key, info in (document.get("backoff_index") or {}).items():
                 prefix = f"{key}/"
                 subset = {k[len(prefix):]: v for k, v in backoff_arrays.items()
                           if k.startswith(prefix)}
                 if subset:
-                    backoff[key] = LeftToRightHMM.from_arrays(subset)
+                    backoff[key] = LeftToRightHMM.from_arrays(
+                        subset, allow_skip=bool(info.get("allow_skip", False)),
+                        covariance_type=str(info.get("covariance", "diag")))
 
         normalization = document.get("normalization") or {}
         return cls(
