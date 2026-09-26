@@ -186,7 +186,7 @@ model/
 ## Tests
 
 ```bash
-python -m pytest            # ~155 tests, ~20 s
+python -m pytest            # 160 tests, ~20 s (152 + 8 skips without WORLD)
 ```
 
 The suite covers the numerical core (banded Cholesky, MLPG against a dense
