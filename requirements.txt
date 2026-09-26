@@ -1,0 +1,6 @@
+# HMS runtime dependencies (deliberately tiny: no torch, no librosa, no scipy).
+numpy>=1.20
+PyYAML>=5.4
+
+# tests
+pytest>=7.0

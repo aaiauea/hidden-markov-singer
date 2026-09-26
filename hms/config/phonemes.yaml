@@ -1,0 +1,83 @@
+# HMS phoneme inventory
+# =====================
+# The engine has no built-in phoneme list: this file *is* the inventory, and it
+# is also where the per-phoneme modelling budget lives.  Adding a phoneme means
+# adding an entry here -- nothing in the code changes, and a symbol that is
+# missing but appears in a score falls back to the pooled model for its class.
+#
+# Required per phoneme: `type`, one of
+#   vowel | voiced_consonant | unvoiced_consonant | silence
+# Everything else is optional and defaults from the class below.
+#
+# The default inventory is a small, singable set (a demo-scale inventory with
+# the open vowels and the consonants that actually carry a melody).  Extend it
+# with the rest of your language, or trim it to the phones your corpus has:
+#   fewer phonemes  -> more data per phoneme -> better model, faster training.
+
+defaults:
+  vowel:
+    n_states: 5          # attack | steady | steady | steady | transition
+    n_components: 2      # mixtures pay off for vowels (they vary most)
+    voiced: true
+    can_hold_note: true
+  voiced_consonant:
+    n_states: 3          # onset | steady | release
+    n_components: 1
+    voiced: true
+  unvoiced_consonant:
+    n_states: 2          # noise onset | release
+    n_components: 1
+    voiced: false
+  silence:
+    n_states: 1
+    n_components: 1
+    voiced: false
+
+# The "silence" symbol; other spellings can be listed under `aliases`.
+silence: sil
+
+phonemes:
+  # -- silences --------------------------------------------------------------
+  sil: {type: silence}
+
+  # -- vowels ----------------------------------------------------------------
+  a: {type: vowel}
+  e: {type: vowel}
+  i: {type: vowel}
+  o: {type: vowel}
+  u: {type: vowel}
+
+  # -- voiced consonants -----------------------------------------------------
+  m: {type: voiced_consonant}
+  n: {type: voiced_consonant}
+  l: {type: voiced_consonant}
+  v: {type: voiced_consonant}
+  z: {type: voiced_consonant}
+  r: {type: voiced_consonant, n_states: 3}
+
+  # -- unvoiced consonants ---------------------------------------------------
+  s: {type: unvoiced_consonant}
+  f: {type: unvoiced_consonant}
+  k: {type: unvoiced_consonant}
+  t: {type: unvoiced_consonant}
+  p: {type: unvoiced_consonant}
+  h: {type: unvoiced_consonant, n_states: 1}
+
+aliases:
+  pau: sil
+  _: sil
+  S: s
+  sh: s
+  x: k
+  b: p
+  d: t
+  g: k
+  c: k
+  j: z
+  w: u
+  y: i
+  A: a
+  E: e
+  I: i
+  O: o
+  U: u
