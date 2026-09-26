@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hms"
+version = "0.1.0"
+description = "HMS - Hidden Markov Singer: a lightweight, non-neural singing synthesizer (HMM/GMM + WORLD)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.20",
+    "PyYAML>=5.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+hms = "hms.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["hms*"]
+
+[tool.setuptools.package-data]
+hms = ["config/*.yaml", "vocoder/_native/*.so"]
+
+[tool.pytest.ini_options]
+testpaths = ["hms/tests"]
+addopts = "-q"

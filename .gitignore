@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Model artefacts / intermediate features
+hms/models/*/
+hms-demo/
+hms/demo/
+hms/data/example/wav/
+*.npz
+
+# Compiled WORLD library (rebuild with tools/build_world.sh)
+hms/vocoder/_native/*.so
+tools/world_native/World/
+
+# audio outputs
+out/
+*.out.wav

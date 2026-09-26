@@ -1,0 +1,80 @@
+# HMS parameters
+# =============
+# Every tunable of the system in one readable file.  The trainer reads the
+# `training` and `acoustic` sections, synthesis reads `synthesis`.  Any value
+# here can also be overridden on the command line.
+#
+# The defaults are tuned for a *small* single-speaker corpus (a few minutes of
+# sung audio, one voice).  Where a knob trades data against quality, the comment
+# says which way to turn it.
+
+acoustic:
+  # Sample rate and frame rate.  44.1 kHz / 5 ms is the WORLD default and what
+  # the HMM literature assumes; 22050 Hz halves the spectral dimensionality if
+  # you are really short on data.
+  fs: 44100
+  frame_period_ms: 5.0
+  # null -> whatever the vocoder backend uses (2048 at 44.1 kHz).
+  fft_size: null
+  # Mel-cepstral coefficients kept for the spectral envelope, *including* c0
+  # (overall energy).  24-30 is the sweet spot for a compact model; higher
+  # values track formants more sharply at the cost of more Gaussian parameters.
+  n_mcep: 30
+  # Aperiodicity bands (mel-spaced).  5 is plenty; the ear is insensitive to
+  # the fine structure of aperiodicity.
+  n_band: 5
+  # Dynamic features.  Deltas are essentially required: without them the
+  # generated trajectory is not smooth.  Delta-deltas add detail for ~2x the
+  # acoustic parameters -- only enable with a larger corpus.
+  use_delta: true
+  use_delta2: false
+  delta_window: 2
+  f0_floor: 71.0
+  f0_ceil: 800.0
+  f0_estimation: dio        # "dio" (fast) or "harvest" (robust, slower)
+  refine_f0: true
+  vocoder: auto             # auto | native | pyworld | builtin
+
+training:
+  # Per phoneme-class budgets live in phonemes.yaml, not here.
+  covariance_type: diag     # "tied" shares one covariance per state (small data)
+  var_floor_ratio: 0.001    # variance floor, as a fraction of the data variance
+  training_method: viterbi  # "viterbi" (robust) or "baum_welch" (textbook)
+  n_iterations: 5
+  normalize_scale: true     # per-dimension variance normalisation of features
+  min_phoneme_frames: 20    # below this a phoneme is left to the backoff model
+  allow_skip: false         # s_i -> s_i+2 transitions
+  default_note: 60.0        # MIDI note assumed for segments without one
+  time_unit: seconds        # how to read the label file's time columns
+  seed: 0
+
+synthesis:
+  # Scales the *delta* (dynamic) variances.  >1 trusts the deltas less, so the
+  # trajectory follows the frame-by-frame means more literally (livelier, more
+  # detail); <1 trusts them more, which flattens/smooths the trajectory.  1.0
+  # reproduces the model exactly.
+  variance_scale: 1.0
+  pitch_variation: 1.0      # scale of the learned deviation from the note
+  f0_source: acoustic       # acoustic | state_means
+  duration_mode: score      # score | model
+  mixture: dominant         # dominant | marginal
+  pitch_smoothing: 0        # frames of moving average on F0 (0 = off)
+  transpose: 0.0            # semitones
+  seed: null
+
+pitch:
+  # Vibrato is a separate, controllable component -- the HMM cannot reproduce
+  # fast oscillation because MLPG smooths it away.
+  vibrato:
+    enabled: false
+    rate_hz: 5.5
+    depth_semitones: 0.6
+    delay_ms: 120.0
+    attack_ms: 80.0
+    randomness: 0.15
+    waveform: sine          # sine | triangle
+  # Estimate vibrato rate/depth from training data instead of the values above.
+  vibrato_estimate_from_data: true
+
+duration:
+  variance_scale: 1.0       # >1 adds timing variation when predicting durations
