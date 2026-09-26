@@ -49,7 +49,11 @@ training:
   seed: 0
 
 synthesis:
-  variance_scale: 1.0       # >1 smoother and less literal, <1 tighter
+  # Scales the *delta* (dynamic) variances.  >1 trusts the deltas less, so the
+  # trajectory follows the frame-by-frame means more literally (livelier, more
+  # detail); <1 trusts them more, which flattens/smooths the trajectory.  1.0
+  # reproduces the model exactly.
+  variance_scale: 1.0
   pitch_variation: 1.0      # scale of the learned deviation from the note
   f0_source: acoustic       # acoustic | state_means
   duration_mode: score      # score | model

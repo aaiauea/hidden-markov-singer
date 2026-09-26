@@ -18,8 +18,10 @@ Each stage is independently replaceable:
 Options that matter in practice (all in `SynthesisConfig`):
 
 ``variance_scale``
-    >1 smooths the trajectory and loosens the fit to the model means, <1
-    follows the means more literally.  The classic HTS relaxation knob.
+    Scales the *dynamic* (delta) variances.  >1 weakens the delta constraints,
+    so the trajectory follows the per-frame means more literally (more detail,
+    livelier); <1 strengthens them and flattens/smooths the trajectory.  1.0
+    reproduces the model.
 ``pitch_variation``
     0 makes F0 exactly the note plus the model's mean deviation
     (deterministic, useful for testing and for "straight" singing); 1 uses the

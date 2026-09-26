@@ -198,10 +198,29 @@ def logmel_to_power(logmel: np.ndarray, n_bands: int, fft_size: int, fs: int,
     return np.exp(logmel @ weight.T)
 
 
+def mel_band_count(n_mcep: int) -> int:
+    """Number of mel bands the spectral envelope is *sampled* on.
+
+    This is the analysis/reconstruction resolution; it is deliberately
+    decoupled from the model order ``n_mcep``.  The envelope is reconstructed by
+    interpolating between band centres, so a band whose value is the average of
+    a wide triangle blurs whatever fine structure lies inside it: a formant
+    sitting between two knots gets flattened, and the reconstructed curve can
+    peak at a knot instead (a 32-band grid put a knot at 2365 Hz, which is
+    exactly the spurious ~2.4 kHz peak every synthesised vowel used to show).
+
+    Sampling at twice the model order keeps the band spacing (at 44.1 kHz:
+    150-230 Hz in the 2-4 kHz region) well below the ~130 mel smoothing width of
+    the truncated DCT, which is where the reconstruction error stops improving
+    while the model size stays exactly the same (still ``n_mcep`` coefficients).
+    """
+    return 2 * n_mcep
+
+
 def power_to_mcep(sp: np.ndarray, fft_size: int, fs: int, n_mcep: int,
                   f_min: float = 0.0) -> np.ndarray:
     """Linear power spectrum -> mel-cepstrum (T, n_mcep), c0..c_{n-1}."""
-    n_bands = n_mcep + 2
+    n_bands = mel_band_count(n_mcep)
     logmel = power_to_logmel(sp, n_bands, fft_size, fs, f_min=f_min)
     return dct2(logmel)[:, :n_mcep]
 
@@ -210,14 +229,15 @@ def mcep_to_power(mcep: np.ndarray, fft_size: int, fs: int, n_mcep: int,
                   out_bins: int | None = None, f_min: float = 0.0) -> np.ndarray:
     """Mel-cepstrum -> linear power spectrum on the WORLD grid.
 
-    Exact inverse of :func:`power_to_mcep` up to the truncation of the last two
-    cepstral coefficients (which is the intended compactness).
+    Inverse of :func:`power_to_mcep` up to the DCT truncation at ``n_mcep`` of
+    `mel_band_count(n_mcep)` bands (that truncation is the intended
+    compactness).
     """
     mcep = np.atleast_2d(np.asarray(mcep, dtype=np.float64))
     if mcep.shape[1] != n_mcep:
         raise ValueError(f"expected {n_mcep} cepstral coefficients, "
                          f"got {mcep.shape[1]}")
-    n_bands = n_mcep + 2
+    n_bands = mel_band_count(n_mcep)
     full = np.zeros((mcep.shape[0], n_bands), dtype=np.float64)
     full[:, :n_mcep] = mcep
     logmel = idct2(full)
@@ -284,7 +304,10 @@ class FeatureSpec:
         Analysis/synthesis geometry; `fft_size` must match the vocoder backend
         (see `hms.vocoder.world.WorldVocoder.fft_size`).
     n_mcep
-        Mel-cepstral coefficients stored, *including* c0 (overall energy).
+        Mel-cepstral coefficients stored, *including* c0 (overall energy).  The
+        envelope is sampled on `mel_band_count(n_mcep)` mel bands before the
+        DCT keeps this many coefficients; that analysis grid is part of the
+        feature definition (see :func:`mel_band_count`).
     n_band
         Number of aperiodicity bands.
     use_delta / use_delta2

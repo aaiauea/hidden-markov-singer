@@ -13,7 +13,7 @@ import pytest
 from hms.core.features import AcousticFrameSequence
 from hms.data import wavio
 from hms.vocoder import BACKENDS, available_backends, get_vocoder
-from hms.vocoder.base import VocoderUnavailable
+from hms.vocoder.base import VocoderUnavailable, limit_peak
 
 FRAME_PERIOD = 5.0
 
@@ -103,14 +103,70 @@ def test_analysis_synthesis_roundtrip_preserves_pitch(example_wav_path):
     assert np.abs(log_out - log_in).mean() < 1.5
 
 
+def test_native_synthesize_matches_the_raw_c_call_sample_for_sample():
+    """The class wrapper must be transparent: no hidden, peak-dependent gain.
+
+    Regression test for an RMS mismatch between the two paths (0.526 raw vs
+    0.199 through the class on identical parameters).  The difference was a
+    peak normalisation applied only on the class path, which also made an
+    utterance's level depend on its own peak.  Identical parameters must now
+    come back identical, including when WORLD's output exceeds +/-1.
+    """
+    vocoder = native_vocoder()
+    fs = 22050
+    fft_size = vocoder.fft_size_for(fs)
+    bins = fft_size // 2 + 1
+    n_frames = 80
+    f0 = np.full(n_frames, 233.0)
+    freqs = np.linspace(0.0, fs / 2.0, bins)
+    envelope = 1.0 / (1.0 + (freqs / 900.0) ** 2) + 1e-4
+    # a loud, very periodic vowel: WORLD's synthesis overshoots 1.0 here, which
+    # is exactly the case the old code rescaled
+    sp = np.repeat(envelope[None, :], n_frames, axis=0) * 400.0
+    ap = np.full((n_frames, bins), 0.05)          # already inside [1e-4, 1]
+    sequence = AcousticFrameSequence(f0=f0, sp=sp, ap=ap, frame_period=FRAME_PERIOD,
+                                     fs=fs, fft_size=fft_size)
+
+    reference = np.zeros(int(vocoder._lib.hms_synth_length(
+        n_frames, fs, FRAME_PERIOD)))
+    vocoder._lib.hms_synthesize(
+        vocoder._ptr(np.ascontiguousarray(f0)), n_frames,
+        vocoder._ptr(np.ascontiguousarray(sp)),
+        vocoder._ptr(np.ascontiguousarray(ap)),
+        fft_size, FRAME_PERIOD, fs, len(reference),
+        vocoder._ptr(reference))
+    assert np.abs(reference).max() > 1.0, "test needs a peak above full scale"
+
+    audio = vocoder.synthesize(sequence)
+    assert len(audio) == len(reference)
+    assert np.array_equal(audio, reference), (
+        "class path differs from the raw C call: max |diff| "
+        f"{np.abs(audio - reference).max():.3e}")
+
+
 def test_unvoiced_frames_stay_unvoiced(example_wav_path):
+    """All-breath parameters must render (near) silence, not a pulse train.
+
+    The backend returns its synthesis verbatim, so the level check goes through
+    `limit_peak` -- the shared headroom helper -- instead of a hidden gain
+    inside the backend (which would also have rescaled this near-silent render
+    because of one onset spike).
+    """
     vocoder = native_vocoder()
     signal, fs = wavio.read_wav(example_wav_path)
     sequence = vocoder.analyze_to_sequence(signal, fs, frame_period=FRAME_PERIOD)
     sequence.f0[:] = 0.0                       # pretend it is all breath
     audio = vocoder.synthesize(sequence)
     assert np.isfinite(audio).all()
-    assert np.abs(audio).max() < 1.0
+    assert np.abs(limit_peak(audio)).max() <= 1.0
+    # it is a *noise* excitation, not a pulse train: no periodicity, so the
+    # normalised autocorrelation must stay low at every plausible pitch lag
+    middle = audio[len(audio) // 3: len(audio) // 3 + 8192]
+    middle = middle - middle.mean()
+    ac = np.correlate(middle, middle, mode="full")[len(middle) - 1:]
+    ac = ac / (ac[0] + 1e-30)
+    lo, hi = int(fs / 1000.0), int(fs / 50.0)
+    assert ac[lo:hi].max() < 0.5, "unvoiced frames rendered a periodic signal"
 
 
 def test_flat_pitch_track_is_synthesised_at_the_requested_frequency():

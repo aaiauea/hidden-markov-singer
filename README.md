@@ -29,8 +29,10 @@ score (phones, notes, times) ──► duration/state plan ──► HMM state s
   budgets, tied covariances, variance floors, parameter sharing and class
   backoff models are all there to keep that possible.
 * **Compact, statistically modelable features.** Mel-cepstrum spectral envelope
-  (from WORLD's `sp`), mel-band aperiodicity (from `ap`), note-relative log-F0,
-  plus deltas. No hand-written formant tables anywhere in the engine.
+  (from WORLD's `sp`, sampled on a mel grid twice the model order so formants
+  are not rounded onto the grid knots), mel-band aperiodicity (from `ap`),
+  note-relative log-F0, plus deltas. No hand-written formant tables anywhere in
+  the engine.
 * **The score drives the pitch.** Training stores F0 *relative to the sung
   note*; synthesis adds the requested note back. The model never replays the
   training speaker's absolute pitch.
@@ -211,5 +213,9 @@ documentation tries to explain *why* each piece looks the way it does.
 * The `builtin` vocoder is a fallback: it uses a zero-phase magnitude response
   instead of WORLD's minimum-phase impulse response, so build the native
   backend (or install `pyworld`) for the real thing.
+* WORLD's synthesis is returned unscaled (see `Vocoder.synthesize`); it can
+  overshoot `[-1, 1]` on very periodic material and `write_wav` applies the
+  headroom.  A trained model is tied to the feature definition that produced
+  it: `model.yaml` records `format_version: 2`.
 * Synthesis is a single-pass MLPG render; no prosody/expression editing beyond
   `--transpose`, `--tempo`, `--variance-scale` and vibrato.

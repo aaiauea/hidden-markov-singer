@@ -12,6 +12,7 @@ import pytest
 
 from hms.core import labels as labels_module
 from hms.core.synthesizer import SynthesisConfig, Synthesizer
+from hms.vocoder.base import limit_peak
 
 F_REF = 261.6255653005986            # C4, the default F0 reference
 
@@ -43,7 +44,11 @@ def test_generated_audio_is_sane(trained_model, short_score):
     result = render(trained_model, score)
     audio = result.audio
     assert np.isfinite(audio).all()
-    assert np.abs(audio).max() <= 1.0
+    # The vocoder returns WORLD's output verbatim (no hidden peak gain; see
+    # `Vocoder.synthesize`), so a very periodic render may overshoot +/-1 and
+    # the writer's headroom handling is what brings it back into range.
+    assert np.abs(audio).max() < 10.0
+    assert np.abs(limit_peak(audio)).max() <= 1.0
     assert np.sqrt((audio ** 2).mean()) > 0.01
     # the render must not be one long silence: voiced frames carry energy
     voiced = result.params.f0 > 0

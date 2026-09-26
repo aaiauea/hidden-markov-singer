@@ -37,7 +37,10 @@ from hms.core.phonemes import PhonemeSet
 from hms.core.pitch import PitchModel
 
 #: Bumped when the on-disk layout changes incompatibly.
-MODEL_FORMAT_VERSION = 1
+#: 2 -- the spectral envelope is sampled on `2 * n_mcep` mel bands instead of
+#:      `n_mcep + 2` (see `hms.core.features.mel_band_count`), so the stored
+#:      cepstral coefficients mean something different from format 1.
+MODEL_FORMAT_VERSION = 2
 
 _MODEL_YAML = "model.yaml"
 _HMM_NPZ = "hmm.npz"

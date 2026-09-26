@@ -199,6 +199,11 @@ def mlpg(means: np.ndarray, variances: np.ndarray,
         One entry per dynamic stream (all equal to D).
     window : int
         Delta window used during training.
+    variance_scale : float
+        Multiplies the *dynamic* streams' variances: >1 weakens the delta
+        constraints (the trajectory follows the per-frame means more literally,
+        i.e. keeps more dynamic detail), <1 strengthens them and flattens the
+        trajectory.  1.0 is the unmodified maximum-likelihood solution.
     smooth : bool
         ``False`` returns the static means unchanged (no dynamic features).
 

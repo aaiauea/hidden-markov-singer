@@ -76,6 +76,5 @@ class PyWorldVocoder(Vocoder):
         frame_period = float(params.frame_period or self.default_frame_period)
         y = pw.synthesize(f0, sp, np.ascontiguousarray(ap), fs, frame_period,
                           fft_size=int(params.fft_size or self.fft_size))
-        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-        peak = float(np.max(np.abs(y))) if y.size else 0.0
-        return y / (peak * 1.02) if peak > 1.0 else y
+        # keep both WORLD backends consistent: no hidden peak normalisation
+        return np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)

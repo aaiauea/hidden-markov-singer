@@ -6,10 +6,11 @@ import numpy as np
 import pytest
 
 from hms.core import labels as labels_module
-from hms.core.features import (AcousticFrameSequence, FeatureSpec,
-                               add_dynamic_features, aperiodicity_to_bands,
-                               bands_to_aperiodicity, dct2, hz_to_mel,
-                               hz_to_semitone, idct2, mel_filterbank, mel_to_hz,
+from hms.core.features import (DEFAULT_N_MCEP, AcousticFrameSequence,
+                               FeatureSpec, add_dynamic_features,
+                               aperiodicity_to_bands, bands_to_aperiodicity,
+                               dct2, hz_to_mel, hz_to_semitone, idct2,
+                               mel_band_count, mel_filterbank, mel_to_hz,
                                mcep_to_power, power_to_logmel, power_to_mcep,
                                remove_dynamic_features, semitone_to_hz,
                                split_streams)
@@ -55,12 +56,65 @@ def test_spectral_envelope_roundtrip_is_accurate(n_mcep):
     assert mcep.shape == (5, n_mcep)
     reconstructed = mcep_to_power(mcep, fft_size, fs, n_mcep)
 
-    error = np.abs(power_to_logmel(reconstructed, n_mcep + 2, fft_size, fs)
-                   - power_to_logmel(sp, n_mcep + 2, fft_size, fs))
+    # Evaluate on a *finer* grid than the analysis bands: measuring on the
+    # analysis grid itself would only check the transform against itself.
+    grid = 2 * mel_band_count(n_mcep)
+    error = np.abs(power_to_logmel(reconstructed, grid, fft_size, fs)
+                   - power_to_logmel(sp, grid, fft_size, fs))
     assert error.mean() < 0.1, "envelope representation should be near lossless"
     # absolute level must survive too (c0 is part of the feature vector)
-    assert abs(np.mean(power_to_logmel(reconstructed, n_mcep + 2, fft_size, fs))
-               - np.mean(power_to_logmel(sp, n_mcep + 2, fft_size, fs))) < 0.05
+    assert abs(np.mean(power_to_logmel(reconstructed, grid, fft_size, fs))
+               - np.mean(power_to_logmel(sp, grid, fft_size, fs))) < 0.05
+
+
+def test_envelope_band_spacing_resolves_the_formant_region():
+    """The analysis grid must be much finer than one band per coefficient.
+
+    The envelope is rebuilt by interpolating between mel band centres, so a
+    formant (or valley) that falls *between* two knots is flattened, and the
+    reconstructed curve can then peak at a knot instead.  The historical
+    one-band-per-coefficient grid had 307-421 Hz spacing between 1.8 and
+    3.2 kHz -- coarse enough to put a knot at 2365 Hz, which is the frequency
+    the demo vowels used to show a spurious peak at.
+    """
+    fs = 44100
+    knots = mel_to_hz(np.linspace(hz_to_mel(0.0), hz_to_mel(fs / 2.0),
+                                  mel_band_count(DEFAULT_N_MCEP) + 2)[1:-1])
+    spacing = np.diff(knots)[(knots[:-1] >= 1800) & (knots[:-1] <= 3200)]
+    assert spacing.size and spacing.max() < 250.0
+
+
+def test_narrow_formant_is_not_replaced_by_a_peak_at_a_band_knot():
+    """A formant between two knots must not come back as a peak *at* a knot.
+
+    Regression test for the constant ~2.4 kHz peak in the demo vowel spectra:
+    with the old 32-band grid (one band per cepstral coefficient, knot #13 at
+    2365 Hz) a narrow third formant at 2.5 kHz was reconstructed as a peak at
+    2369 Hz.  The reconstruction's peak has to sit nearer the real formant than
+    the knot that used to capture it.
+    """
+    fs, fft_size, n_mcep = 44100, 2048, DEFAULT_N_MCEP
+    formant_hz, knot_hz = 2500.0, 2365.5
+    freqs = np.linspace(0.0, fs / 2.0, fft_size // 2 + 1)
+    db = (-30.0
+          + 34.0 * np.exp(-0.5 * ((freqs - 800.0) / 250.0) ** 2)      # F1
+          + 26.0 * np.exp(-0.5 * ((freqs - 1200.0) / 250.0) ** 2)     # F2
+          + 22.0 * np.exp(-0.5 * ((freqs - formant_hz) / 150.0) ** 2)  # narrow F3
+          - 14.0 * np.exp(-0.5 * ((freqs - knot_hz) / 70.0) ** 2)     # narrow valley
+          - 40.0 * np.exp(-0.5 * ((freqs - 6000.0) / 2500.0) ** 2))   # spectral tilt
+    sp = (10.0 ** (db / 10.0))[None, :]
+
+    reconstructed = mcep_to_power(power_to_mcep(sp, fft_size, fs, n_mcep),
+                                  fft_size, fs, n_mcep)[0]
+    window = (freqs >= 2100.0) & (freqs <= 2800.0)
+    true_peak = float(freqs[window][np.argmax(sp[0][window])])
+    decoded_peak = float(freqs[window][np.argmax(reconstructed[window])])
+
+    assert true_peak == pytest.approx(formant_hz, abs=100.0)
+    assert abs(decoded_peak - formant_hz) < abs(decoded_peak - knot_hz), (
+        f"envelope peak reconstructed at {decoded_peak:.0f} Hz, i.e. pinned to "
+        f"the band knot at {knot_hz:.0f} Hz instead of the formant at "
+        f"{formant_hz:.0f} Hz")
 
 
 def test_aperiodicity_bands_roundtrip():
@@ -95,9 +149,12 @@ def test_encode_decode_roundtrip_preserves_pitch_and_level():
     assert features.shape == (n_frames, spec.static_dim)
     decoded = spec.decode(features)
     assert np.allclose(decoded.f0, f0, rtol=1e-6)
-    # spectral shape (in the model's own band-density space) is preserved
-    density_before = power_to_logmel(sp, spec.n_mcep + 2, spec.fft_size, fs)
-    density_after = power_to_logmel(decoded.sp, spec.n_mcep + 2, spec.fft_size, fs)
+    # spectral shape (in band-density space) is preserved -- measured on a
+    # finer grid than the envelope is sampled on, so the reconstruction has to
+    # be right between the knots too, not just at them
+    grid = 2 * mel_band_count(spec.n_mcep)
+    density_before = power_to_logmel(sp, grid, spec.fft_size, fs)
+    density_after = power_to_logmel(decoded.sp, grid, spec.fft_size, fs)
     assert np.abs(density_after - density_before).mean() < 0.25
 
 

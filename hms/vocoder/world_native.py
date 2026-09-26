@@ -201,11 +201,7 @@ class NativeWorldVocoder(Vocoder):
         self._lib.hms_synthesize(self._ptr(f0), n_frames, self._ptr(sp),
                                  self._ptr(ap), fft_size, frame_period, fs,
                                  y_length, self._ptr(y))
-        return self._limit(np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0))
-
-    @staticmethod
-    def _limit(y: np.ndarray) -> np.ndarray:
-        peak = float(np.max(np.abs(y))) if y.size else 0.0
-        if peak > 1.0:
-            y = y / (peak * 1.02)
-        return y
+        # Return WORLD's output verbatim (sans NaNs): the raw C ABI call and
+        # this method must agree sample for sample.  See `Vocoder.synthesize`
+        # for why no peak normalisation happens here.
+        return np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)

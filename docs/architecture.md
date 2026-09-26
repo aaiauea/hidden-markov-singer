@@ -80,15 +80,30 @@ per frame plus dynamic (delta) features. `FeatureSpec` owns the geometry and the
 | slot | content | dim (default) |
 |---|---|---|
 | 0 | log-F0 in semitones **relative to the sung note** | 1 |
-| 1 … n_mcep | mel-cepstrum c0…c29 of the WORLD spectral envelope | 30 |
+| 1 … n_mcep | mel-cepstrum c0…c29 of the WORLD spectral envelope, sampled on 2·n_mcep mel bands | 30 |
 | next n_band | mel-spaced aperiodicity bands | 5 |
 
 * **Spectral envelope**: the filterbank band densities of `sp` are normalised by
   the filter weight sums (otherwise low bands come out ~10 dB high), log'd, and
   projected with an orthonormal DCT-II; the first `n_mcep` coefficients are
-  kept. `decode` inverts this exactly, and the round-trip error measured in
-  band-density space is ~0.2 dB for typical frames, i.e. the truncation is the
-  only loss.
+  kept.  `decode` inverts that projection, interpolating the band values back
+  onto the spectrum, and the round-trip error measured in band-density space is
+  ~0.2 dB for typical frames, i.e. the truncation is the only loss.
+
+  The envelope is sampled on `mel_band_count(n_mcep) = 2 * n_mcep` mel bands
+  (`FeatureSpec.n_mcep` on the model side; the analysis grid is part of the
+  feature definition, see `hms.core.features.mel_band_count`).  The sampling
+  grid matters more than it looks: each band value is an *average* over a wide
+  triangle and the decoder interpolates between band centres, so structure
+  narrower than the band spacing is flattened and a formant that falls between
+  two knots can come back as a peak *on* a knot.  With one band per coefficient
+  (the historical `n_mcep + 2` grid) the spacing between 1.8 and 3.2 kHz was
+  307-421 Hz and a knot sat exactly at 2365 Hz, which is where every synthesised
+  vowel used to show a spurious ~2.4 kHz peak.  Doubling the grid costs nothing
+  in model size (the model still stores `n_mcep` coefficients) and cuts the
+  2-4 kHz reconstruction error by roughly a third; beyond 2x the band spacing
+  drops below the ~130 mel smoothing width of the truncated DCT and the error
+  stops improving.
 * **Aperiodicity**: 5 mel bands, interpolated back onto the spectrum by
   `decode`. 5 bands is enough because the ear is insensitive to the fine
   structure of aperiodicity; it is also 5 parameters instead of 1025.
@@ -180,10 +195,12 @@ static + delta feature sequence, then solve
 the solver is a banded Cholesky written directly in `numpy` (no scipy), checked
 against a dense solve in the tests to ~1e-15.
 
-* `variance_scale` relaxes the *dynamic* constraints (>1 = smoother, <1 =
-  follows the deltas more literally). Scaling every precision by the same factor
-  would leave the solution unchanged, which is why the knob acts on the delta
-  streams only.
+* `variance_scale` scales the *dynamic* (delta) variances: >1 trusts the
+  deltas less, so the trajectory follows the per-frame means more literally
+  (livelier, more detail), while <1 strengthens them and flattens the
+  trajectory.  Scaling *every* precision by the same factor would leave the
+  solution unchanged (the normal equations are homogeneous), which is why the
+  knob has to act on the delta streams only.
 * `smooth=False` skips MLPG entirely and returns the state means (useful when
   debugging the acoustic model without the dynamics).
 

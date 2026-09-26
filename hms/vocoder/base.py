@@ -14,6 +14,24 @@ class VocoderUnavailable(RuntimeError):
     """Raised when a backend cannot be used on this machine."""
 
 
+def limit_peak(audio: np.ndarray, ceiling: float = 1.0,
+               headroom: float = 1.02) -> np.ndarray:
+    """Scale ``audio`` down so its peak sits at ``ceiling / headroom``.
+
+    Headroom is the *writer's* job -- :func:`hms.data.wavio.write_wav` already
+    normalises whatever it is given -- so backends do not apply this to their
+    output.  It is provided for callers that want a signal guaranteed to fit in
+    ``[-1, 1]`` (e.g. before handing samples to a fixed-point device).
+
+    A backend's ``synthesize`` must therefore return the waveform exactly as
+    produced; anything else is a hidden, material-dependent gain.
+    """
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak > ceiling:
+        audio = audio * (ceiling / (peak * headroom))
+    return audio
+
+
 class Vocoder(abc.ABC):
     """Analyse audio into WORLD parameters and synthesise audio back.
 
@@ -85,7 +103,16 @@ class Vocoder(abc.ABC):
 
     @abc.abstractmethod
     def synthesize(self, params: AcousticFrameSequence) -> np.ndarray:
-        """WORLD parameters -> float64 waveform in [-1, 1]."""
+        """WORLD parameters -> float64 waveform.
+
+        The waveform is returned exactly as the backend synthesised it: no
+        peak normalisation is applied here, because a gain that depends on the
+        signal's peak would make otherwise identical parameters produce
+        different output depending on what else is in the utterance.  WORLD's
+        synthesis can exceed +/-1 on high-peak (very periodic) material, so
+        normalise before writing: :func:`hms.data.wavio.write_wav` does, or call
+        :func:`limit_peak` for a hard ceiling.
+        """
 
     # -- convenience -------------------------------------------------------
 

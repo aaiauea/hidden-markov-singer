@@ -31,7 +31,7 @@ import numpy as np
 from hms.core.dsp import (autocorrelation_f0, frame_signal,
                           harmonicity_aperiodicity, spectral_flatness)
 from hms.core.features import AcousticFrameSequence
-from hms.vocoder.base import Vocoder
+from hms.vocoder.base import Vocoder, limit_peak
 
 
 class BuiltinVocoder(Vocoder):
@@ -112,10 +112,11 @@ class BuiltinVocoder(Vocoder):
         y_length = int((n_frames - 1) * hop + fft_size)
         excitation = self._excitation(f0, ap, fs, hop, y_length)
         y = self._apply_envelope(excitation, sp, fft_size, hop, y_length)
-        peak = float(np.max(np.abs(y))) if y.size else 0.0
-        if peak > 1.0:                       # keep it inside [-1, 1] for wavio
-            y = y * (0.99 / peak)
-        return y
+        # This backend builds its excitation from scratch, so its absolute
+        # level is arbitrary: scale it once, via the shared policy, instead of
+        # leaving callers to guess.  WORLD-backed backends return their
+        # synthesis verbatim (see `Vocoder.synthesize`).
+        return limit_peak(y, ceiling=0.99, headroom=1.0)
 
     def _excitation(self, f0: np.ndarray, ap: np.ndarray, fs: int, hop: int,
                     y_length: int) -> np.ndarray:
