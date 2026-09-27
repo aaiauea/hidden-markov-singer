@@ -107,6 +107,79 @@ def test_pitch_outside_the_analysed_range_is_clamped_and_reported(
     assert any("F0 range" in message for message in result.diagnostics)
 
 
+def test_absurd_midi_note_warns_and_is_clamped_not_sung_absurd(trained_model):
+    """MIDI 200 is not a MIDI note: it must be named, not rendered silently."""
+    from hms.core.labels import Score, Utterance, Segment
+
+    score = Score([Utterance(name="absurd", segments=[
+        Segment("a", 0.0, 0.5, note=200.0)])])
+    result = render(trained_model, score)
+    joined = "\n".join(result.diagnostics)
+    assert "MIDI" in joined
+    assert "200" in joined
+    assert "absurd" in joined
+    # the clamping still does its job: no absurd frequency reaches the audio
+    voiced = result.params.f0[result.params.f0 > 0]
+    assert voiced.size > 0
+    assert voiced.max() <= trained_model.spec.f0_ceil + 1.0
+    assert voiced.min() >= trained_model.spec.f0_floor - 1.0
+
+
+def test_transpose_beyond_the_valid_midi_range_is_named(trained_model):
+    from hms.core.labels import Score, Utterance, Segment
+
+    score = Score([Utterance(name="held", segments=[
+        Segment("a", 0.0, 0.5, note=60.0)])])
+    result = render(trained_model, score, transpose=140.0)  # 60 -> 200
+    joined = "\n".join(result.diagnostics)
+    assert "MIDI" in joined                 # the note-level warning
+    assert "F0 range" in joined             # the existing clamp report stays
+    voiced = result.params.f0[result.params.f0 > 0]
+    assert voiced.max() <= trained_model.spec.f0_ceil + 1.0
+
+
+def test_note_beyond_the_trained_f0_range_is_warned(trained_model):
+    """A valid MIDI note above the model's F0 range: warned, then clamped."""
+    from hms.core.labels import Score, Utterance, Segment
+
+    score = Score([Utterance(name="high", segments=[
+        Segment("a", 0.0, 0.5, note=96.0)])])   # ~1975 Hz > 800 Hz ceiling
+    result = render(trained_model, score)
+    joined = "\n".join(result.diagnostics)
+    assert "trained F0 range" in joined
+    assert "96" in joined
+    # 96 is a valid MIDI number: only the trained-range warning, not the
+    # invalid-MIDI one
+    assert not any("valid MIDI range" in message
+                   for message in result.diagnostics)
+
+
+def test_normal_score_notes_produce_no_pitch_range_diagnostics(
+        trained_model, short_score):
+    result = render(trained_model, short_score)
+    joined = "\n".join(result.diagnostics)
+    assert "valid MIDI range" not in joined
+    assert "trained F0 range" not in joined
+
+
+def test_external_f0_render_does_not_warn_about_the_score_notes(
+        trained_model):
+    """With an external trajectory the score note does not drive the pitch."""
+    from hms.core.labels import Score, Utterance, Segment
+
+    score = Score([Utterance(name="high", segments=[
+        Segment("a", 0.0, 0.5, note=200.0)])])
+    synthesizer = Synthesizer(
+        trained_model, SynthesisConfig(vibrato=False, seed=0,
+                                       vocoder="builtin"))
+    n_frames = len(synthesizer.plan(score)[0])
+    result = synthesizer.synthesize(score, f0=np.full(n_frames, 300.0))
+    joined = "\n".join(result.diagnostics)
+    assert "external F0 override" in joined
+    assert "MIDI" not in joined
+    assert "trained F0 range" not in joined
+
+
 def test_an_unseen_note_is_still_sung(trained_model, short_score):
     """Notes outside the training range must not collapse to the trained one."""
     score = short_score

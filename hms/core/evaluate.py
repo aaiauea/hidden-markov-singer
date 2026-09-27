@@ -266,6 +266,8 @@ def evaluate_models(models: Sequence[HMSModel], label_file: str,
                                 vocoder, audio_extensions, log)
     score = labels_module.load(label_file, time_unit=trainer.config.time_unit,
                                frame_period=trainer.config.frame_period)
+    for diagnostic in score.diagnostics:
+        log(f"  ! {diagnostic}")
     corpus = Corpus(score, wav_dir, tuple(audio_extensions))
     utterances = trainer.analyse_corpus(corpus)
     if not utterances:

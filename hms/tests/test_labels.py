@@ -64,6 +64,96 @@ def test_parser_reports_problems_instead_of_crashing():
     assert [s.phone for s in score["phrase"].segments] == ["a"]
 
 
+def test_reversed_segment_is_reported_with_line_number():
+    text = "u 0.0 0.1 a 60\nu 0.5 0.2 b 60\n"
+    score = labels_module.parse(text)
+    assert [s.phone for s in score["u"].segments] == ["a"]
+    assert len(score.diagnostics) == 1
+    message = score.diagnostics[0]
+    assert "line 2" in message
+    assert "before onset" in message
+
+
+def test_zero_duration_segment_is_reported_with_line_number():
+    text = "u 0.0 0.1 a 60\nu 0.4 0.4 b 60\n"
+    score = labels_module.parse(text)
+    assert [s.phone for s in score["u"].segments] == ["a"]
+    assert len(score.diagnostics) == 1
+    message = score.diagnostics[0]
+    assert "line 2" in message
+    assert "zero-duration" in message
+
+
+def test_negative_times_are_reported_and_dropped():
+    score = labels_module.parse("u -0.1 0.5 a 60\n")
+    assert len(score) == 0
+    assert len(score.diagnostics) == 1
+    message = score.diagnostics[0]
+    assert "line 1" in message
+    assert "non-negative" in message
+
+
+def test_out_of_midi_range_note_is_reported_with_line_number():
+    text = "u 0.0 0.5 a 60\nu 0.5 1.0 a 200\n"
+    score = labels_module.parse(text)
+    assert [s.note for s in score["u"].segments] == [60.0]
+    message = score.diagnostics[0]
+    assert "line 2" in message
+    assert "[0, 127]" in message
+    assert "200" in message
+
+
+def test_gap_between_segments_is_reported_but_segments_kept():
+    score = labels_module.parse("u 0.0 0.2 a 60\nu 0.5 0.7 a 64\n")
+    # the gap is tolerated -- documented behaviour -- but no longer silent
+    assert [s.phone for s in score["u"].segments] == ["a", "a"]
+    assert len(score.diagnostics) == 1
+    message = score.diagnostics[0]
+    assert message.startswith("u:")
+    assert "gap" in message
+    assert "0.300" in message
+    # and the fill behaviour itself is unchanged: carried note, first phone
+    phones, notes, _ = score["u"].frame_labels(10.0, default_note=60.0)
+    assert phones[30] == "a"
+    assert notes[30] == pytest.approx(60.0)
+
+
+def test_contiguous_and_adjacent_labels_produce_no_timing_diagnostics():
+    score = sample_score()
+    assert score.diagnostics == []
+    # exact adjacency (shared boundary) is not an overlap or a gap
+    score = labels_module.parse("u 0.0 0.2 a 60\nu 0.2 0.4 b 60\n")
+    assert score.diagnostics == []
+
+
+def test_garbage_extra_column_is_reported_and_row_kept():
+    score = labels_module.parse("u 0.0 0.5 a 60 garbage\n")
+    assert [s.phone for s in score["u"].segments] == ["a"]
+    assert score["u"].segments[0].note == pytest.approx(60.0)
+    assert len(score.diagnostics) == 1
+    message = score.diagnostics[0]
+    assert "line 1" in message
+    assert "garbage" in message
+
+
+def test_malformed_context_column_is_reported_and_valid_context_kept():
+    score = labels_module.parse("u 0.0 0.5 a 60 =x stress=1\n")
+    assert score["u"].segments[0].context == {"stress": "1"}
+    assert len(score.diagnostics) == 1
+    message = score.diagnostics[0]
+    assert "line 1" in message
+    assert "=x" in message
+
+
+def test_valid_midi_boundary_and_fractional_notes_are_accepted():
+    score = labels_module.parse("u 0.0 0.1 a 0\n"
+                                "u 0.1 0.2 a 127\n"
+                                "u 0.2 0.3 a 60.5\n"
+                                "u 0.3 0.4 sil -\n")
+    assert score.diagnostics == []
+    assert [s.note for s in score["u"].segments] == [0.0, 127.0, 60.5, None]
+
+
 def test_frame_time_unit_converts_to_seconds_using_the_analysis_period():
     score = labels_module.parse("u\t0\t20\ta\t60\n",
                                 time_unit="frames", frame_period=5.0)

@@ -260,7 +260,8 @@ class Synthesizer:
 
     # -- plan the state sequence ------------------------------------------
 
-    def plan(self, score: labels_module.Score, default_note: float = 60.0
+    def plan(self, score: labels_module.Score, default_note: float = 60.0,
+             *, check_pitch_range: bool = True
              ) -> Tuple[List[str], List[int], List[int], np.ndarray,
                         List[int], List[str]]:
         """Turn a score into (phone, segment, frame) aligned state indices.
@@ -269,6 +270,14 @@ class Synthesizer:
         segment_frames, diagnostics)`` -- the diagnostics list is returned so
         the caller can show it, instead of being written into hidden state.
         Notes are MIDI numbers (float, so fractional detuning is allowed).
+
+        ``check_pitch_range`` (default) adds one diagnostic per utterance
+        when an *effective* note -- score note + transpose, including the
+        default note for unnoted segments -- is not a valid MIDI number or
+        falls outside the model's trained F0 range.  Parsed scores are
+        already within the MIDI range, so this is what catches ``--transpose``
+        and programmatic notes; it is skipped when an external F0 trajectory
+        replaces the score pitch entirely.
         """
         config = self.config
         spec = self.model.spec
@@ -309,6 +318,12 @@ class Synthesizer:
                     segments.append((phone, max(1, hi - lo), note))
                     previous_end = hi
 
+            if check_pitch_range:
+                diagnostics.extend(
+                    self._note_range_diagnostics(
+                        utterance.name, segments, default_note,
+                        float(config.transpose), spec))
+
             # Context neighbourhood: the sibling segments of this utterance;
             # utterance edges use the inventory's existing silence symbol --
             # there are no BOS/EOS tokens.
@@ -348,6 +363,64 @@ class Synthesizer:
             note_per_frame = note_per_frame + float(self.config.transpose)
         return (frame_phones, state_ids, segment_ids, note_per_frame,
                 segment_frames, diagnostics)
+
+    @staticmethod
+    def _note_range_diagnostics(utterance_name: str,
+                                segments: List[Tuple[str, int,
+                                                     Optional[float]]],
+                                default_note: float, transposition: float,
+                                spec: FeatureSpec) -> List[str]:
+        """Name the notes that cannot be what they ask for.
+
+        Two distinct problems, two distinct messages:
+
+        * an effective note outside the valid MIDI range 0-127 (only possible
+          via transpose / default note / programmatic scores, since parsed
+          files are already checked) is clearly invalid input;
+        * a valid MIDI note whose frequency lies outside the model's analysed
+          F0 range (``f0_floor``-``f0_ceil``) is unusual but may be
+          legitimate -- it is warned about, and the existing clamping keeps
+          it audible.  Neither changes any synthesis result.
+        """
+        low_hz, high_hz = spec.f0_floor, spec.f0_ceil
+        low_midi = float(labels_module.hz_to_midi(low_hz))
+        high_midi = float(labels_module.hz_to_midi(high_hz))
+        invalid_midi: set = set()
+        beyond_range: set = set()
+        for _phone, _frames, note in segments:
+            effective = round(
+                (default_note if note is None else float(note))
+                + transposition, 4)
+            if effective < labels_module.MIDI_NOTE_MIN \
+                    or effective > labels_module.MIDI_NOTE_MAX:
+                invalid_midi.add(effective)
+            elif effective < low_midi or effective > high_midi:
+                beyond_range.add(effective)
+        diagnostics: List[str] = []
+        if invalid_midi:
+            listing = ", ".join(f"{value:g}"
+                                for value in sorted(invalid_midi)[:5])
+            if len(invalid_midi) > 5:
+                listing += f", ... ({len(invalid_midi)} notes)"
+            diagnostics.append(
+                f"{utterance_name}: note(s) {listing} (score note + "
+                f"transpose {transposition:+g}, incl. the default note "
+                f"{default_note:g} for unnoted segments) are outside the "
+                f"valid MIDI range [{labels_module.MIDI_NOTE_MIN:g}, "
+                f"{labels_module.MIDI_NOTE_MAX:g}]; they will be clamped "
+                f"into the model's F0 range ({low_hz:g}-{high_hz:g} Hz)")
+        if beyond_range:
+            listing = ", ".join(
+                f"{value:g} (~{labels_module.midi_to_hz(value):.0f} Hz)"
+                for value in sorted(beyond_range)[:5])
+            if len(beyond_range) > 5:
+                listing += f", ... ({len(beyond_range)} notes)"
+            diagnostics.append(
+                f"{utterance_name}: note(s) {listing} fall outside the "
+                f"model's trained F0 range ({low_hz:g}-{high_hz:g} Hz, "
+                f"MIDI {low_midi:.0f}-{high_midi:.0f}); they will be "
+                f"clamped to the edge of that range")
+        return diagnostics
 
     # -- per-frame statistics ---------------------------------------------
 
@@ -535,7 +608,8 @@ class Synthesizer:
         diagnostics: List[str] = []
 
         (frame_phones, state_ids, segment_ids, notes, _segments,
-         plan_diagnostics) = self.plan(score, default_note=default_note)
+         plan_diagnostics) = self.plan(score, default_note=default_note,
+                                       check_pitch_range=f0 is None)
         diagnostics.extend(plan_diagnostics)
         if not frame_phones:
             raise ValueError("the score produced no frames")

@@ -169,6 +169,8 @@ def cmd_extract(args) -> int:
 
     score = labels_module.load(args.labels, time_unit=config.time_unit,
                                frame_period=config.frame_period)
+    for diagnostic in score.diagnostics:
+        _log(f"  ! {diagnostic}")
     corpus = Corpus(score, Path(args.wav_dir), config.audio_extensions)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
