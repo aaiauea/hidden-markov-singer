@@ -35,6 +35,15 @@ pitch. This is an optional learned-deviation source at synthesis; the default
 score-driven path uses the requested note directly as target F0. See
 `hms.core.pitch` and `SynthesisConfig.f0_source`.
 
+*`f0_floor`-`f0_ceil` are analysis bounds, not synthesis bounds.* They bound the
+F0 estimator (DIO/Harvest) that produced the training features, so they say
+where the model has observations rather than what it may be asked to sing. The
+spectral model is not indexed by F0 at all -- a mel-cepstrum envelope is a
+vocal-tract description, not a pitch-dependent one -- so `decode` passes the
+requested F0 to the vocoder unchanged and the synthesizer reports, rather than
+suppresses, frames outside the trained range. See
+`Synthesizer._out_of_range_pitch_diagnostics`.
+
 *Mel-cepstrum instead of raw log-spectrum.*  The HMM needs per-dimension
 random variables it can put a Gaussian on.  Raw log-spectrum bins are 513
 strongly correlated numbers per frame; a mel-cepstrum is ~30 decorrelated,
@@ -457,14 +466,22 @@ class FeatureSpec:
         f0_semitones : (T,), optional
             Absolute log-F0 (semitones re. `f0_ref_hz`) to use instead of
             feature dimension 0.  This is how the pitch model injects the
-            musical note; NaN (or values below `f0_floor`) become unvoiced
-            frames.
+            musical note; NaN, and anything below `voiced_threshold` (below
+            which there is no pitch to speak of), become unvoiced frames.
 
             Note that feature dimension 0 stores 0.0 -- not NaN -- for unvoiced
             frames when ``encode`` wrote them, because a Gaussian cannot be
             fitted around NaN.  Voicing is therefore *not* recoverable from the
             feature vector alone; pass this argument (as the synthesizer does)
             when voicing matters.
+
+        Notes
+        -----
+        The decoded F0 is whatever the caller asked for, including values
+        outside `f0_floor`-`f0_ceil`. Those two bound the F0 *analyser* that
+        produced the training features, not playback: clipping here would
+        silently move a requested note to the edge of the training range before
+        the vocoder ever sees it. A frame only loses its F0 when it has none.
         """
         static = np.atleast_2d(np.asarray(static, dtype=np.float64))
         if static.ndim != 2 or static.shape[1] != self.static_dim:
@@ -479,7 +496,12 @@ class FeatureSpec:
             if f0_semi.ndim != 1 or len(f0_semi) != len(static):
                 raise ValueError("f0_semitones must have one value per frame")
         f0 = semitone_to_hz(f0_semi, self.f0_ref_hz)
-        unvoiced = (~np.isfinite(f0)) | (f0 < self.f0_floor) | (f0 > self.f0_ceil)
+        # Voicing is a synthesis decision, not an analysis one: a frame is
+        # unvoiced exactly when it carries no pitch. `f0_floor`/`f0_ceil` are
+        # the search range of the F0 *estimator* used to build the training
+        # features, so they are deliberately not applied here -- see the notes
+        # on `f0_semitones`.
+        unvoiced = (~np.isfinite(f0)) | (f0 < self.voiced_threshold)
         f0 = np.where(unvoiced, 0.0, f0)
 
         mcep = static[:, 1:1 + self.n_mcep]

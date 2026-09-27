@@ -240,7 +240,7 @@ def test_synth_cli_reports_invalid_midi_score_notes(tmp_path, trained_model,
 
 def test_synth_cli_warns_about_score_notes_above_the_f0_range(
         tmp_path, trained_model, capsys):
-    """A valid MIDI note the model cannot produce is warned about."""
+    """A valid MIDI note the model has no observation for is warned about."""
     model_dir = tmp_path / "model"
     trained_model.save(model_dir)
     score = tmp_path / "score.tsv"
@@ -248,11 +248,20 @@ def test_synth_cli_warns_about_score_notes_above_the_f0_range(
                      "demo\t0.1\t0.6\ta\t127\n"
                      "demo\t0.6\t0.7\tsil\t-\n", encoding="utf-8")
     out_wav = tmp_path / "out.wav"
+    trace = tmp_path / "trace.tsv"
     assert main(["synth", "--model", str(model_dir), "--score", str(score),
-                 "--out", str(out_wav), "--vocoder", "builtin"]) == 0
+                 "--out", str(out_wav), "--vocoder", "builtin",
+                 "--trace", str(trace)]) == 0
     out = capsys.readouterr().out
     assert "trained F0 range" in out
-    assert "clamped" in out
+    assert "requested F0 is preserved" in out
+    assert "clamped" not in out
+    # and it is really rendered at MIDI 127, not pulled down to f0_ceil
+    rendered = [float(row.split("\t")[-1]) for row in
+                trace.read_text(encoding="utf-8").splitlines()[1:]
+                if row.split("\t")[-1] != "-"]
+    assert rendered
+    assert max(rendered) == pytest.approx(12543.85, rel=1e-3)
 
 
 def test_missing_model_is_a_clean_error(tmp_path, capsys):

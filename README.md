@@ -43,6 +43,12 @@ score (phones, notes, times) ──► duration/state plan ──► HMM state s
   training-speaker F0 is never replayed. Callers can also supply their own
   frame-level F0 trajectory (`synthesize(..., f0=...)`, `hms synth --f0-file`),
   which replaces the generated contour instead of being mixed into it.
+* **The requested pitch is the pitch you get.** `f0_floor`–`f0_ceil` bound the
+  F0 *analyser* that produced the training features, not the synthesizer: a
+  valid MIDI note above the ceiling (or below the floor) is rendered at its own
+  frequency, with the model's nearest trained spectral envelope, and reported
+  in `result.diagnostics`. Nothing is silently moved to the edge of the
+  training range — see [Out-of-training-range F0](docs/architecture.md).
 * **Every component is replaceable.** Vocoder backends, phoneme inventory,
   feature set, model files and the CLI are all thin layers over plain data.
 * **Readable models.** A trained voice is a `model.yaml` you can inspect plus
@@ -274,9 +280,10 @@ hms synth --model model --score score.tsv --out song.wav --f0-file contour.npy
 * HMS never resamples, interpolates, truncates or pads an explicit trajectory:
   a wrong length, a wrong shape, an empty array, non-numeric values, `NaN`/`inf`
   or negative frequencies raise `ValueError` naming the offending frame, and the
-  CLI turns that into a one-line error. Values outside the model's analysed F0
-  range (`f0_floor`–`f0_ceil`) are clamped and reported in
-  `result.diagnostics`, exactly as for score-driven F0.
+  CLI turns that into a one-line error. Values outside the model's trained F0
+  range (`f0_floor`–`f0_ceil`) are *not* an error and are not altered: they are
+  synthesised at the supplied frequency and reported in `result.diagnostics`,
+  exactly as for score-driven F0.
 
 ## Model format
 
@@ -303,7 +310,9 @@ solve), the statistical models (GMM/HMM behaviour, duration allocation), the
 feature transforms (round-trip accuracy in the model's own space), the vocoder
 contract for both backends, model serialisation (including the format-3
 context payload and format-2 compatibility), the sparse context feature,
-model evaluation, the CLI, the external F0 override (trajectory preservation,
+model evaluation, the CLI, out-of-training-range F0 (in both directions, from
+the score and from an external trajectory, asserted on the parameters handed
+to the vocoder), the external F0 override (trajectory preservation,
 independence from learned deviation and vibrato, and its validation), and an
 end-to-end train→synthesise run that checks the rendered notes really are the
 requested ones.
@@ -336,3 +345,7 @@ documentation tries to explain *why* each piece looks the way it does.
 * Synthesis is a single-pass MLPG render; no prosody/expression editing beyond
   `--transpose`, `--tempo`, `--variance-scale`, vibrato and an externally
   supplied F0 trajectory (`--f0-file` / `synthesize(f0=...)`).
+* Notes outside the F0 range the model was trained on are rendered at the
+  requested pitch using the nearest trained spectral envelope, so they are
+  audible but are not *natural* for this voice: the envelope comes from frames
+  the model never saw at that pitch.

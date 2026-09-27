@@ -192,6 +192,34 @@ def test_decode_accepts_an_explicit_pitch_track():
     assert decoded.f0[1] > 0
 
 
+def test_decode_preserves_f0_outside_the_analysed_range():
+    """`f0_floor`/`f0_ceil` bound the analyser, not the decoder.
+
+    A requested pitch has to survive the trip to the vocoder: the model having
+    no observation at 40 Hz or 3 kHz is a fact about its *training data*, not
+    a licence to move the note. Only a frame with no pitch at all (NaN, or
+    below the voicing threshold) loses its F0.
+    """
+    spec = FeatureSpec(fs=22050, fft_size=1024, n_mcep=12)
+    sp = np.ones((5, spec.n_bins)) * 1e-3
+    ap = np.full((5, spec.n_bins), 0.5)
+    features = spec.encode(np.full(5, 220.0), sp, ap)
+
+    requested = np.array([40.0, 220.0, 3000.0, 12543.85, 8.1757989])
+    semitones = 12.0 * np.log2(requested / spec.f0_ref_hz)
+    decoded = spec.decode(features, f0_semitones=semitones)
+
+    assert np.allclose(decoded.f0, requested, rtol=1e-6)
+    assert decoded.f0.min() < spec.f0_floor
+    assert decoded.f0.max() > spec.f0_ceil
+
+    # and a frame that genuinely has no pitch is still unvoiced
+    silent = np.array([np.nan, np.inf, -np.inf,
+                       12.0 * np.log2(0.5 / spec.f0_ref_hz)])   # 0.5 Hz
+    unvoiced = spec.decode(features[:4], f0_semitones=silent)
+    assert (unvoiced.f0 == 0.0).all()
+
+
 def test_dynamic_features_shapes_and_edges():
     rng = np.random.default_rng(4)
     static = rng.normal(size=(10, 3))

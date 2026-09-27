@@ -204,23 +204,44 @@ can be *measured* from the training data (`estimate_vibrato` finds the dominant
 3–9 Hz component of the longest sustained note). Vibrato is disabled by
 default and can be added independently of the target note.
 
-All sources are followed by clamping into the analysed F0 range so that
-transposing a score beyond the training range degrades audibly but does not
-silently drop the melody.
+### Out-of-training-range F0
 
-*Out-of-range notes are named before rendering, not only at the clamp.*
-`plan()` reports the effective notes (score note + transpose, including the
-default note for unnoted segments) that are (a) not valid MIDI numbers — only
-possible via transpose, a `default_note` override or a programmatic score,
-since parsed files are already checked against 0-127 — or (b) valid MIDI
-numbers whose frequency lies outside the model's analysed F0 range
-(`f0_floor`-`f0_ceil`). Training likewise warns about label notes outside
-that range (the extractor can never produce an F0 to match them, so the
-note-relative pitch learned on those segments is off), and
-`default_note` outside the MIDI range is a configuration error. The checks
-never change what is rendered — the clamping semantics are untouched — so
-unusual but legitimate notes (a score note above `f0_ceil`, an exotic
-`default_note`) still sound: clamped, and now named as such.
+`f0_floor`-`f0_ceil` bound the F0 **analyser** (DIO/Harvest) that produced the
+training features, not what the synthesizer may be asked for. They describe
+where the model has observations; they are not a playback limit. So an F0
+outside that range is handled by separating what the model knows from what the
+caller asked for:
+
+* **The pitch is never adjusted.** The requested F0 — score note, or the
+  external trajectory — reaches `FeatureSpec.decode` and the vocoder verbatim.
+  `decode` unvoices a frame only when it has no pitch at all (`NaN`, or below
+  `voiced_threshold`), so MIDI 96 (~2.1 kHz) is synthesised at 2.1 kHz and
+  MIDI 24 (~32.7 Hz) at 32.7 Hz.
+* **The spectral parameters are the nearest trained ones.** HMS's acoustic
+  model is not indexed by F0: a state's statistics are a mel-cepstrum envelope
+  and a band aperiodicity, i.e. a description of the vocal tract, learned from
+  whatever frames happened to sing that phone. There is no second envelope at
+  2.1 kHz to interpolate towards, so the boundary region it does have is
+  reused unchanged — Sinsy's "use the closest observed F0's acoustic
+  parameters", reduced to what this architecture can express, with no neural
+  model and no explicit formant parameters. What you hear is a trained vowel
+  excited at a pitch the model never heard it at.
+* **It is reported, not clamped.** `plan()` names out-of-range notes before
+  rendering, and `Synthesizer._out_of_range_pitch_diagnostics` adds one
+  message per render with the requested frequencies, e.g. *"100 of 100 voiced
+  frame(s) request F0 outside the model's trained F0 range 71-800 Hz (up to
+  2093.0 Hz); the boundary acoustic statistics for those frames are reused
+  unchanged and the requested F0 is preserved"*.
+
+The one case that *is* normalised is a note that is not a MIDI note at all
+(outside 0-127; reachable only through `transpose`, a `default_note` override
+or a programmatic score, since parsed labels are already checked). Such a note
+names no musical pitch, so it is rendered at the nearest valid MIDI note and
+reported — which also keeps every rendered frequency below Nyquist. Valid MIDI
+numbers are never moved, however far their frequency is from the trained
+range. Training warns separately about *label* notes outside the analysis
+range, because there the extractor really cannot produce a matching F0 and the
+note-relative pitch learned on those segments is off.
 
 *External F0 override*: `Synthesizer.synthesize(score, f0=…)` (and the CLI's
 `hms synth --f0-file`) accepts a frame-level F0 trajectory, in Hz, with one
@@ -229,8 +250,9 @@ frames — the same convention `FeatureSpec.encode` and WORLD use. The insert
 point is deliberately narrow: `external_f0_to_semitones` converts the array
 into the representation `PitchModel.generate` returns (semitones re.
 `f0_ref_hz`, `NaN` where unvoiced) and the synthesizer then treats it exactly
-like a generated contour — same clamping, same `FeatureSpec.decode`, same
-vocoder. Because it replaces the generated trajectory rather than feeding into
+like a generated contour — same `FeatureSpec.decode`, same out-of-range
+reporting, same vocoder, and the same rule that the values are used exactly as
+supplied. Because it replaces the generated trajectory rather than feeding into
 it, an external F0 automatically receives no score pitch, no learned deviation,
 no generated vibrato and no `pitch_smoothing`, and nothing about `sp`/`ap`,
 timing or the vocoder interface changes.
@@ -361,8 +383,8 @@ against its baseline is the usual reason to run it.
 4. `denormalize` → static features; voicing from HMM/phoneme statistics;
    target F0 from score notes, with optional acoustic/state-mean deviation and
    optional vibrato — or, when `f0=` is passed, that external trajectory
-   instead (validated and converted by `external_f0_to_semitones`); clamp;
-   decode features to `(f0, sp, ap)`.
+   instead (validated and converted by `external_f0_to_semitones`); report
+   out-of-trained-range F0; decode features to `(f0, sp, ap)`.
 5. `vocoder.synthesize` → waveform (written by `wavio.write_wav`, 16-bit by
    default).
 
