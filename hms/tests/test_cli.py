@@ -133,6 +133,63 @@ def test_synth_cli_honours_frame_based_score_times(
     assert "rendered 1 utterance(s)" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("suffix", [".npy", ".txt"])
+def test_synth_cli_honours_an_external_f0_file(tmp_path, trained_model, capsys,
+                                               suffix):
+    """`--f0-file` replaces the generated contour with the supplied one."""
+    model_dir = tmp_path / "model"
+    trained_model.save(model_dir)
+    score = tmp_path / "score.tsv"
+    score.write_text("demo\t0.0\t0.1\tsil\t-\n"
+                     "demo\t0.1\t0.6\ta\t60\n"
+                     "demo\t0.6\t0.7\tsil\t-\n", encoding="utf-8")
+    reference = tmp_path / "reference.npz"
+
+    assert main(["synth", "--model", str(model_dir), "--score", str(score),
+                 "--out", str(tmp_path / "plain.wav"), "--vocoder", "builtin",
+                 "--save-params", str(reference), "--seed", "0"]) == 0
+    frames = len(wavio.load_params(reference).f0)
+    assert frames > 20
+
+    trajectory = np.full(frames, 330.0)
+    f0_file = tmp_path / f"f0{suffix}"
+    if suffix == ".npy":
+        np.save(f0_file, trajectory)
+    else:
+        f0_file.write_text("# one F0 value per frame, in Hz\n"
+                           + "\n".join(f"{value:.6f}" for value in trajectory)
+                           + "\n", encoding="utf-8")
+
+    params = tmp_path / "external.npz"
+    capsys.readouterr()
+    assert main(["synth", "--model", str(model_dir), "--score", str(score),
+                 "--out", str(tmp_path / "external.wav"), "--vocoder",
+                 "builtin", "--f0-file", str(f0_file),
+                 "--save-params", str(params), "--seed", "0"]) == 0
+    assert np.allclose(wavio.load_params(params).f0, trajectory, rtol=1e-9)
+    assert "external F0 override" in capsys.readouterr().out
+
+
+def test_synth_cli_reports_an_f0_file_of_the_wrong_length(tmp_path,
+                                                          trained_model,
+                                                          capsys):
+    model_dir = tmp_path / "model"
+    trained_model.save(model_dir)
+    score = tmp_path / "score.tsv"
+    score.write_text("demo\t0.0\t0.1\tsil\t-\n"
+                     "demo\t0.1\t0.6\ta\t60\n"
+                     "demo\t0.6\t0.7\tsil\t-\n", encoding="utf-8")
+    f0_file = tmp_path / "f0.npy"
+    np.save(f0_file, np.full(5, 330.0))            # the render has many more
+
+    capsys.readouterr()
+    code = main(["synth", "--model", str(model_dir), "--score", str(score),
+                 "--out", str(tmp_path / "out.wav"), "--vocoder", "builtin",
+                 "--f0-file", str(f0_file)])
+    assert code == 2
+    assert "external F0 has 5 frame(s)" in capsys.readouterr().err
+
+
 def test_synth_unknown_utterance_is_reported(tmp_path, demo_dataset, capsys):
     labels = write_subset_labels(demo_dataset, tmp_path / "labels.tsv")
     model_dir = tmp_path / "model"
