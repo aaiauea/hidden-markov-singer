@@ -1,0 +1,4 @@
+# utt_id	onset	offset	phone	note
+training_a	0.000	0.100	sil	-
+training_a	0.100	0.700	a	60
+training_a	0.700	0.800	sil	-

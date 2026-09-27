@@ -72,6 +72,10 @@ vocoder backends :
 
 ## Quickstart
 
+For the smallest explicit train → save → load → synthesize workflow (one
+0.8-second generated recording, no native WORLD), see
+[the minimal end-to-end example](examples/minimal/README.md).
+
 One command generates an example corpus with a synthetic singer, trains on it
 and sings it back:
 
