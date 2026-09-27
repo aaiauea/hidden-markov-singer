@@ -1,0 +1,11 @@
+# Procedural example voices (experimental data generator)
+
+This example builds four deterministic, entirely mathematical source-filter voices using HMS's existing `hms.data.demo_singer.DemoSinger` and its ground-truth `SegmentSpec` timing/label API. It does not use external recordings or synthesize labels from audio. Japanese rows are individual phone symbols, not morae; English rows use the current generator's existing phone symbols, **not ARPABET**.
+
+Run `python examples/procedural_voices/generate.py` from the repository root. WAVs and labels are written beneath `generated/<voice>/` (ignored by Git). Seeds and source settings are recorded in `voice.json`; repeated execution is deterministic. Each generated clip rotates phone contexts, spans multiple MIDI notes and four durations, and includes phrase silences. The voices use independent seeds, pitch registers, jitter, vibrato depth, scoop, and spectral tilt.
+
+## Scope / current HMS limitations
+
+This is a reproducible starting example, not four trained, ready-to-redistribute models. `DemoSinger` currently exposes a deliberately small shared inventory and shared vowel/consonant source-filter tables. It does not support complete Japanese phonemic coverage or ARPABET and its fixed inventory cannot truthfully represent all requested sounds. Inventing aliases would collapse distinct phonemes and give misleading labels, so this generator retains only genuine supported atomic symbols. No model training or demos are bundled: training these labels with HMS's analysis pipeline also requires acoustic analysis of the synthesized waveforms, and its available built-in vocoder is an approximation. Do not treat this limited corpus as satisfying full-language coverage.
+
+The HMS pitch model learns per-phoneme/state deviations relative to the MIDI note; this generator distributes each phone across notes rather than assigning fixed pitches. A complete four-voice corpus/model release requires expanding the data-only singer with language-specific phoneme parameters (not changing HMS's acoustic representation), then running the ordinary `hms train` and `hms synth` workflows. The engine, pitch architecture, labels, and serialization are unchanged.
