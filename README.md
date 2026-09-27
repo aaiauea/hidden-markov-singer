@@ -104,12 +104,15 @@ trace.tsv` (frame-by-frame phoneme/state/note/F0 table).
 
 ## Comparing models: `hms evaluate`
 
-`hms evaluate` scores one or more trained models against an *evaluation*
-corpus (labels + WAVs the models were not trained on) and prints the numbers
-side by side — held-out log-likelihood, voicing agreement, duration error and
+`hms evaluate` scores one or more trained models against an *evaluation
+corpus* (a label file plus its WAVs) and prints the numbers side by side —
+evaluation-corpus log-likelihood, voicing agreement, duration error and
 backoff usage. It deliberately reports the metrics **separately**: there is no
 aggregate quality score, because collapsing them would hide what actually
-changed.
+changed. The command does not require the evaluation corpus to be disjoint
+from the models' training data; it measures whatever corpus it is given
+(using a corpus the models have not seen is what makes the numbers read as
+generalisation).
 
 ```bash
 hms evaluate --labels eval/labels.tsv --wav-dir eval/wav \
@@ -276,8 +279,9 @@ documentation tries to explain *why* each piece looks the way it does.
   overshoot `[-1, 1]` on very periodic material and `write_wav` applies the
   headroom.  A trained model is tied to the feature definition that produced
   it: `model.yaml` records `format_version: 3` (format-2 models still load).
-* `hms evaluate` compares models with separate objective metrics (held-out
-  likelihood, voicing agreement, duration error, backoff usage) and by design
-  reports no aggregate quality score.
+* `hms evaluate` compares models with separate objective metrics
+  (evaluation-corpus likelihood, voicing agreement, duration error, backoff
+  usage) and by design reports no aggregate quality score; it also does not
+  enforce that the evaluation corpus is disjoint from the training data.
 * Synthesis is a single-pass MLPG render; no prosody/expression editing beyond
   `--transpose`, `--tempo`, `--variance-scale` and vibrato.

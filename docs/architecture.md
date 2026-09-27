@@ -278,10 +278,12 @@ payload; format-2 models load with an empty context tier).
 
 `hms evaluate` compares trained models on an evaluation corpus without
 rendering audio and **without an aggregate quality score**: it reports
-separate objective metrics per model — held-out log-likelihood (total and per
-frame, under the units synthesis would select, contexts included), voicing
-agreement, duration prediction MAE, and backoff-routed frames — so the reader
-sees *what* differs, not just a fused number.
+separate objective metrics per model — evaluation-corpus log-likelihood (total
+and per frame, under the units synthesis would select, contexts included),
+voicing agreement, duration prediction MAE, and backoff-routed frames — so the
+reader sees *what* differs, not just a fused number. It does not enforce that
+the evaluation corpus is disjoint from the models' training data; the metrics
+describe the corpus they were measured on, nothing more.
 
 Because those metrics are only comparable between like-for-like models,
 evaluation first cross-checks them: the feature spec must match exactly (hard

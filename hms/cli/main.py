@@ -334,13 +334,17 @@ def cmd_evaluate(args) -> int:
     models = [HMSModel.load(directory) for directory in model_dirs]
 
     parameters = load_parameters(getattr(args, "config", None))
-    # Prefer each model's recorded time_unit; fall back to parameters.yaml
-    # when a model carries no training metadata.
+    # Prefer the models' recorded training time_unit (the first model that
+    # carries it wins); the parameters.yaml value is only the fallback for
+    # models with no training metadata of their own.
     time_unit = None
     for model in models:
-        if "time_unit" in ((model.metadata.get("training_config") or {})):
+        recorded = ((model.metadata or {}).get("training_config") or {}) \
+            .get("time_unit")
+        if recorded is not None:
+            time_unit = str(recorded)
             break
-    else:
+    if time_unit is None:
         time_unit = (parameters.get("training") or {}).get("time_unit")
 
     _log(f"corpus : {args.labels} + {args.wav_dir}")

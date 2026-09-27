@@ -1,8 +1,8 @@
 """Objective model evaluation on an evaluation corpus (`hms evaluate`).
 
 No aggregate quality score: models are compared with separate objective
-metrics (held-out log-likelihood, voicing agreement, duration error, backoff
-usage), and the comparison itself is guarded by compatibility checks --
+metrics (evaluation-corpus log-likelihood, voicing agreement, duration error,
+backoff usage), and the comparison itself is guarded by compatibility checks --
 feature spec (hard), inventory, training method, seed, corpus paths and every
 other non-context training setting (warnings).
 """
@@ -200,3 +200,116 @@ def test_cli_evaluate_refuses_mismatched_feature_specs(
                  "--model", str(baseline_dir), "--model", str(other_dir)])
     assert code == 2
     assert "feature spec" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# label time units (regression: the recorded model time_unit must be used)
+# --------------------------------------------------------------------------
+
+
+def write_frames_labels(seconds_labels: Path, path: Path,
+                        frame_period: float = 5.0) -> Path:
+    """Rewrite a seconds label file in analysis frames (frame_period ms)."""
+    scale = 1000.0 / frame_period
+    lines = []
+    for line in seconds_labels.read_text(encoding="utf-8").splitlines():
+        if line.startswith("#") or not line.strip():
+            lines.append(line)
+            continue
+        parts = line.split("\t") if "\t" in line else line.split()
+        parts[1] = f"{float(parts[1]) * scale:.4f}"
+        parts[2] = f"{float(parts[2]) * scale:.4f}"
+        lines.append("\t".join(parts))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _model_recording_time_unit(trained_model, time_unit):
+    """A copy of ``trained_model`` whose metadata records ``time_unit``."""
+    model = copy.deepcopy(trained_model)
+    model.metadata.setdefault("training_config", {})["time_unit"] = time_unit
+    return model
+
+
+def _break_config_restoration(model):
+    """Make the recorded training config unrestorable as a whole.
+
+    Poisons one field so ``TrainingConfig.from_dict`` raises and the analysis
+    config falls back to defaults.  The recorded ``time_unit`` must then be
+    carried by the explicit lookup, not piggy-back on the bulk restore -- this
+    is what turns the test into a real regression for the time_unit fix.
+    """
+    model.metadata.setdefault("training_config", {})["var_floor_ratio"] = -5.0
+    return model
+
+
+def test_evaluate_models_uses_recorded_time_unit_frames(
+        demo_dataset, trained_model, tmp_path):
+    """Frames-based labels align only if the recorded time_unit is honoured.
+
+    Misreading the frame columns as seconds collapses every segment into a
+    single utterance-spanning span, so the per-phone table loses every phone
+    but the first.  The recorded training config is poisoned so the time_unit
+    cannot arrive via the bulk ``from_dict`` restore.
+    """
+    seconds = write_subset_labels(demo_dataset, tmp_path / "eval.tsv",
+                                  names=("syllables_ma",))
+    frames = write_frames_labels(seconds, tmp_path / "eval_frames.tsv")
+    model = _model_recording_time_unit(trained_model, "frames")
+    model = _break_config_restoration(model)
+
+    # no explicit time_unit: the one recorded in the model must be applied
+    report = evaluate_models([model], frames, demo_dataset["wav_dir"])
+    (metrics,) = report["models"].values()
+    assert set(metrics["per_phone_log_likelihood_per_frame"]) == \
+        {"sil", "m", "a"}
+    assert metrics["frames"] > 0
+
+
+def test_cli_evaluate_uses_recorded_time_unit_frames(
+        tmp_path, demo_dataset, trained_model, capsys):
+    seconds = write_subset_labels(demo_dataset, tmp_path / "eval.tsv",
+                                  names=("syllables_ma",))
+    frames = write_frames_labels(seconds, tmp_path / "eval_frames.tsv")
+    model = _model_recording_time_unit(trained_model, "frames")
+    model = _break_config_restoration(model)
+    model_dir = tmp_path / "model"
+    model.save(model_dir)
+    out_json = tmp_path / "report.json"
+
+    capsys.readouterr()
+    assert main(["evaluate", "--labels", str(frames),
+                 "--wav-dir", demo_dataset["wav_dir"],
+                 "--model", str(model_dir), "--json", str(out_json),
+                 "--vocoder", "builtin"]) == 0
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    (metrics,) = payload["models"].values()
+    assert set(metrics["per_phone_log_likelihood_per_frame"]) == \
+        {"sil", "m", "a"}
+
+
+def test_cli_evaluate_time_unit_falls_back_to_parameters_yaml(
+        tmp_path, demo_dataset, trained_model, capsys):
+    """No recorded time_unit -> parameters.yaml supplies it (frames here)."""
+    seconds = write_subset_labels(demo_dataset, tmp_path / "eval.tsv",
+                                  names=("syllables_ma",))
+    frames = write_frames_labels(seconds, tmp_path / "eval_frames.tsv")
+    model = copy.deepcopy(trained_model)
+    model.metadata.get("training_config", {}).pop("time_unit", None)
+    model_dir = tmp_path / "model"
+    model.save(model_dir)
+
+    parameters = tmp_path / "parameters.yaml"
+    parameters.write_text("training:\n  time_unit: frames\n",
+                          encoding="utf-8")
+    out_json = tmp_path / "report.json"
+
+    capsys.readouterr()
+    assert main(["evaluate", "--labels", str(frames),
+                 "--wav-dir", demo_dataset["wav_dir"],
+                 "--model", str(model_dir), "--config", str(parameters),
+                 "--json", str(out_json), "--vocoder", "builtin"]) == 0
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    (metrics,) = payload["models"].values()
+    assert set(metrics["per_phone_log_likelihood_per_frame"]) == \
+        {"sil", "m", "a"}

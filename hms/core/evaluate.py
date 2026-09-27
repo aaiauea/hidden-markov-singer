@@ -3,13 +3,17 @@
 `hms evaluate` renders *no audio* and invents *no quality score*: it reports
 separate, objective, comparable numbers per model so a human can judge:
 
-* acoustic log-likelihood of the held-out frames under each model's own units
-  (with context resolution, exactly as synthesis would select them),
+* acoustic log-likelihood of the evaluation corpus's frames under each model's
+  own units (with context resolution, exactly as synthesis would select them),
 * voicing agreement between each model's state voicing probabilities and the
   analysed voicing,
 * duration prediction error (per-phoneme log-normal means vs. real segment
   lengths),
 * how many frames were routed to backoff models.
+
+The command does not check that the evaluation corpus is disjoint from any
+model's training data -- it measures whatever corpus it is given, and
+interpreting the numbers (e.g. as generalisation) is the caller's job.
 
 Because those numbers are only comparable when the models were trained the
 same way, evaluation also *checks* the models against each other: the feature
@@ -122,7 +126,9 @@ def _analysis_trainer(model: HMSModel, label_file: str, wav_dir: str,
 
     Non-context training settings are restored from the model's metadata so
     the analysis matches; the feature-spec fields are then pinned to the
-    model's own spec.
+    model's own spec.  Label time units follow the same precedence: an
+    explicit ``time_unit`` argument wins, then the model's recorded
+    training setting, then the configuration default.
     """
     metadata_config = _training_config_of(model)
     known = set(TrainingConfig.__dataclass_fields__)  # type: ignore[attr-defined]
@@ -137,6 +143,10 @@ def _analysis_trainer(model: HMSModel, label_file: str, wav_dir: str,
     config.label_file = label_file
     config.wav_dir = wav_dir
     config.audio_extensions = tuple(audio_extensions)
+    if time_unit is None:
+        recorded = metadata_config.get("time_unit")
+        if recorded is not None:
+            time_unit = str(recorded)
     if time_unit is not None:
         config.time_unit = time_unit
     config.fs = spec.fs
