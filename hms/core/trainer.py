@@ -34,6 +34,7 @@ The defaults are chosen so that a handful of sung phrases trains a usable voice:
 from __future__ import annotations
 
 import datetime as _dt
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -50,7 +51,7 @@ from hms.core.features import (AcousticFrameSequence, FeatureSpec,
 from hms.core.hmm import LeftToRightHMM
 from hms.core.model import HMSModel, ModelStats
 from hms.core.phonemes import PhonemeSet
-from hms.core.pitch import PitchModel, note_relative_pitch
+from hms.core.pitch import PitchModel, PitchStats, note_relative_pitch
 from hms.data import wavio
 from hms.vocoder import get_vocoder
 
@@ -210,20 +211,55 @@ class Corpus:
 
 @dataclass
 class UtteranceData:
-    """One analysed utterance, ready to be cut into phoneme segments."""
+    """One analysed utterance, ready to be cut into phoneme segments.
+
+    Trainer-created instances retain only values consumed after feature
+    encoding. WORLD's full spectral envelope and aperiodicity arrays are much
+    larger than the model features and are left unset for compatibility with
+    older callers that used these optional fields.
+    """
 
     name: str
     f0: np.ndarray
-    sp: np.ndarray
-    ap: np.ndarray
-    phones: List[str]                     # per frame
-    notes: np.ndarray                     # per frame, MIDI numbers
     voiced: np.ndarray                    # per frame, bool
-    note_semitones: np.ndarray            # per frame, semitones re. f0_ref
     relative_pitch: np.ndarray            # per frame, semitones re. the note
     features: np.ndarray                  # (T, dim) with dynamic streams
     phoneme_spans: List[Tuple[str, int, int]]
     diagnostics: List[str] = field(default_factory=list)
+    # Kept as optional constructor fields for older callers; the trainer no
+    # longer populates them because none is used after feature extraction.
+    sp: Optional[np.ndarray] = None
+    ap: Optional[np.ndarray] = None
+    phones: Optional[List[str]] = None
+    notes: Optional[np.ndarray] = None
+    note_semitones: Optional[np.ndarray] = None
+
+
+@dataclass
+class _UtteranceAnalysis:
+    """Temporary arrays for one utterance during feature extraction only."""
+
+    f0: np.ndarray
+    static_features: np.ndarray
+    voiced: np.ndarray
+    relative_pitch: np.ndarray
+    phoneme_spans: List[Tuple[str, int, int]]
+
+
+@dataclass
+class _CachedUtterance:
+    """Small metadata record for training data held in temporary .npy files.
+
+    The per-frame arrays are memory-mapped only while a stage consumes them;
+    this record deliberately contains paths and spans, never feature arrays.
+    """
+
+    name: str
+    features_path: Path
+    relative_pitch_path: Path
+    voiced_path: Path
+    phoneme_spans: List[Tuple[str, int, int]]
+    n_frames: int
 
 
 class Trainer:
@@ -263,8 +299,58 @@ class Trainer:
 
     # -- stage 1: analyse --------------------------------------------------
 
+    def _analyse_utterance(self, utterance: labels_module.Utterance,
+                           path: Path) -> _UtteranceAnalysis:
+        """Analyse one clip and return only data needed by later stages.
+
+        The returned object intentionally excludes ``sp`` and ``ap``.  Those
+        WORLD arrays are consumed by ``FeatureSpec.encode`` and are released as
+        soon as this method returns, rather than being retained for every
+        utterance in the corpus.
+        """
+        self.spec = self.spec or self.build_spec()
+        spec = self.spec
+        signal, fs = wavio.read_wav(path)
+        if fs != spec.fs:
+            raise ValueError(
+                f"{path.name} is {fs} Hz but the configuration expects "
+                f"{spec.fs} Hz; resample it or change `fs` "
+                f"(HMS does not resample implicitly)")
+        sequence = self.vocoder.analyze_to_sequence(
+            signal, fs, frame_period=spec.frame_period,
+            f0_floor=spec.f0_floor, f0_ceil=spec.f0_ceil,
+            f0_estimation=spec.f0_estimation, refine_f0=spec.refine_f0)
+        # WORLD does not retain the waveform. Drop it before the relatively
+        # large spectral arrays are transformed into the compact feature space.
+        del signal
+
+        n_frames = len(sequence)
+        phones, notes, _ = utterance.frame_labels(
+            spec.frame_period, self.config.default_note, n_frames=n_frames)
+        del phones
+        voiced = sequence.f0 > spec.voiced_threshold
+        relative = note_relative_pitch(
+            sequence.f0, labels_module.midi_to_hz(notes), voiced,
+            spec.f0_ref_hz)
+        del notes
+        static = spec.encode(sequence.f0, sequence.sp, sequence.ap)
+        # Dimension 0 carries note-relative pitch instead of absolute pitch.
+        static[:, 0] = relative
+        spans = [(phone, lo, hi) for phone, lo, hi, _note
+                 in labels_module.segment_boundaries(utterance,
+                                                     spec.frame_period,
+                                                     n_frames=n_frames)]
+        return _UtteranceAnalysis(
+            f0=sequence.f0, static_features=static, voiced=voiced,
+            relative_pitch=relative, phoneme_spans=spans)
+
     def analyse_corpus(self, corpus: Corpus) -> List[UtteranceData]:
-        """WORLD analysis + label alignment for every utterance."""
+        """WORLD analysis + label alignment for every utterance.
+
+        This convenience path is used by corpus evaluation. Training itself
+        uses :meth:`_prepare_training_cache`, which writes compact features to a
+        temporary disk-backed cache instead of retaining this list.
+        """
         self.spec = self.spec or self.build_spec()
         spec = self.spec
         hop_ms = spec.frame_period / 1000.0
@@ -275,52 +361,41 @@ class Trainer:
             if path is None:
                 self.log(f"  ! {utterance.name}: no audio found, skipped")
                 continue
-            signal, fs = wavio.read_wav(path)
-            if fs != spec.fs:
-                raise ValueError(
-                    f"{path.name} is {fs} Hz but the configuration expects "
-                    f"{spec.fs} Hz; resample it or change `fs` "
-                    f"(HMS does not resample implicitly)")
-            sequence = self.vocoder.analyze_to_sequence(
-                signal, fs, frame_period=spec.frame_period,
-                f0_floor=spec.f0_floor, f0_ceil=spec.f0_ceil,
-                f0_estimation=spec.f0_estimation, refine_f0=spec.refine_f0)
-            n_frames = len(sequence)
-            phones, notes, _ = utterance.frame_labels(
-                spec.frame_period, self.config.default_note, n_frames=n_frames)
-            voiced = sequence.f0 > spec.voiced_threshold
-
-            note_semitones = 12.0 * np.log2(
-                labels_module.midi_to_hz(notes) / spec.f0_ref_hz)
-            relative = note_relative_pitch(sequence.f0,
-                                           labels_module.midi_to_hz(notes),
-                                           voiced, spec.f0_ref_hz)
-            static = spec.encode(sequence.f0, sequence.sp, sequence.ap)
-            # dimension 0 carries the note-relative pitch instead of the
-            # absolute one: this is the "note conditions F0" mechanism
-            static[:, 0] = relative
-            features = add_dynamic_features(static, spec.use_delta,
-                                            spec.use_delta2,
+            analysis = self._analyse_utterance(utterance, path)
+            features = add_dynamic_features(analysis.static_features,
+                                            spec.use_delta, spec.use_delta2,
                                             window=spec.delta_window)
-
-            spans = [(phone, lo, hi) for phone, lo, hi, _note
-                     in labels_module.segment_boundaries(utterance,
-                                                         spec.frame_period,
-                                                         n_frames=n_frames)]
+            n_frames = len(analysis.f0)
             out.append(UtteranceData(
-                name=utterance.name, f0=sequence.f0, sp=sequence.sp,
-                ap=sequence.ap, phones=phones, notes=notes, voiced=voiced,
-                note_semitones=note_semitones, relative_pitch=relative,
-                features=features, phoneme_spans=spans,
+                name=utterance.name, f0=analysis.f0,
+                voiced=analysis.voiced,
+                relative_pitch=analysis.relative_pitch,
+                features=features,
+                phoneme_spans=analysis.phoneme_spans,
                 diagnostics=[d for d in corpus.score.diagnostics
                               if d.startswith(utterance.name)]))
             self.log(f"  analysed {utterance.name}: {n_frames} frames "
                      f"({n_frames * hop_ms:.2f} s)")
+            del analysis, features
         if not out:
             raise RuntimeError("no training utterances were analysed")
         return out
 
     # -- stage 2: normalise -------------------------------------------------
+
+    def _normalization_from_moments(self, total: np.ndarray,
+                                    total_sq: np.ndarray, count: int
+                                    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Finish corpus normalization from per-dimension running moments."""
+        static_dim = self.spec.static_dim
+        if count == 0:
+            return np.zeros(static_dim), np.ones(static_dim)
+        mean = total / count
+        variance = np.maximum(total_sq / count - mean ** 2, 1e-6)
+        scale = 1.0 / np.sqrt(variance) if self.config.normalize_scale \
+            else np.ones(static_dim)
+        scale = np.minimum(scale, 100.0)          # guard against flat dimensions
+        return mean, scale
 
     def compute_normalization(self, utterances: Sequence[UtteranceData]
                               ) -> Tuple[np.ndarray, np.ndarray]:
@@ -334,14 +409,7 @@ class Trainer:
             total += static.sum(axis=0)
             total_sq += (static ** 2).sum(axis=0)
             count += len(static)
-        if count == 0:
-            return np.zeros(static_dim), np.ones(static_dim)
-        mean = total / count
-        variance = np.maximum(total_sq / count - mean ** 2, 1e-6)
-        scale = 1.0 / np.sqrt(variance) if self.config.normalize_scale \
-            else np.ones(static_dim)
-        scale = np.minimum(scale, 100.0)          # guard against flat dimensions
-        return mean, scale
+        return self._normalization_from_moments(total, total_sq, count)
 
     def normalize_features(self, features: np.ndarray, offset: np.ndarray,
                            scale: np.ndarray) -> np.ndarray:
@@ -358,6 +426,142 @@ class Trainer:
         return add_dynamic_features(normalized, self.spec.use_delta,
                                     self.spec.use_delta2,
                                     window=self.spec.delta_window)
+
+    def _cache_static_utterance(
+            self, utterance: labels_module.Utterance, path: Path,
+            cache_dir: Path, index: int
+            ) -> Tuple[_CachedUtterance, Path, np.ndarray, np.ndarray,
+                       List[Tuple[float, float]]]:
+        """Analyse one utterance, persist only its compact static features.
+
+        The waveform, WORLD spectra, and all frame arrays stay local to this
+        call.  The static matrix is written to a temporary ``.npy`` file so
+        corpus normalization can be computed without keeping matrices from
+        previously analysed utterances in Python memory.
+        """
+        analysis = self._analyse_utterance(utterance, path)
+        static = analysis.static_features
+        n_frames = len(static)
+        stem = f"utterance_{index:05d}"
+        static_path = cache_dir / f"{stem}.static.npy"
+        record = _CachedUtterance(
+            name=utterance.name,
+            features_path=cache_dir / f"{stem}.features.npy",
+            relative_pitch_path=cache_dir / f"{stem}.pitch.npy",
+            voiced_path=cache_dir / f"{stem}.voiced.npy",
+            phoneme_spans=analysis.phoneme_spans,
+            n_frames=n_frames)
+
+        np.save(static_path, static)
+        np.save(record.voiced_path, analysis.voiced)
+        total = static.sum(axis=0)
+        total_sq = (static ** 2).sum(axis=0)
+
+        vibrato_candidates: List[Tuple[float, float]] = []
+        if self.config.vibrato_enabled and self.config.vibrato_estimate_from_data:
+            from hms.core.pitch import estimate_vibrato
+
+            long_spans = {(lo, hi) for _phone, lo, hi in analysis.phoneme_spans
+                          if hi - lo >= 80}
+            for lo, hi in long_spans:
+                estimate = estimate_vibrato(
+                    analysis.f0[lo:hi], analysis.voiced[lo:hi],
+                    self.spec.fs, self.spec.frame_period)
+                if estimate:
+                    vibrato_candidates.append(estimate)
+
+        return record, static_path, total, total_sq, vibrato_candidates
+
+    def _prepare_training_cache(
+            self, corpus: Corpus, cache_dir: Path
+            ) -> Tuple[List[_CachedUtterance], np.ndarray, np.ndarray,
+                       int, List[Tuple[float, float]]]:
+        """Analyse incrementally, normalize, and spool training features.
+
+        Pass one retains only corpus-wide scalar moments and writes each
+        utterance's static features to disk.  Once the final normalization is
+        known, pass two turns one cached utterance at a time into normalized
+        static+delta features.  The cache contains the per-frame sequences that
+        the multi-utterance HMM estimators genuinely need, but they remain
+        disk-backed until a particular phone/model consumes them.
+        """
+        self.spec = self.spec or self.build_spec()
+        spec = self.spec
+        static_dim = spec.static_dim
+        total = np.zeros(static_dim, dtype=np.float64)
+        total_sq = np.zeros(static_dim, dtype=np.float64)
+        frame_count = 0
+        records: List[_CachedUtterance] = []
+        static_paths: List[Path] = []
+        vibrato_candidates: List[Tuple[float, float]] = []
+
+        for utterance in corpus.score:
+            path = corpus.audio_path(utterance.name)
+            if path is None:
+                self.log(f"  ! {utterance.name}: no audio found, skipped")
+                continue
+            record, static_path, utt_total, utt_total_sq, candidates = \
+                self._cache_static_utterance(
+                    utterance, path, cache_dir, len(records))
+            records.append(record)
+            static_paths.append(static_path)
+            total += utt_total
+            total_sq += utt_total_sq
+            frame_count += record.n_frames
+            vibrato_candidates.extend(candidates)
+            self.log(f"  analysed {utterance.name}: {record.n_frames} frames "
+                     f"({record.n_frames * spec.frame_period / 1000.0:.2f} s)")
+
+        if not records:
+            raise RuntimeError("no training utterances were analysed")
+        offset, scale = self._normalization_from_moments(
+            total, total_sq, frame_count)
+
+        # Normalize/rebuild dynamics one utterance at a time. The temporary
+        # static file is removed immediately after its compact training feature
+        # file and pitch stream have been written.
+        for record, static_path in zip(records, static_paths):
+            # NumPy cannot mmap a zero-byte data payload; empty utterances are
+            # harmless and keep the in-memory path bounded to an empty array.
+            static = np.load(static_path, mmap_mode="r" if record.n_frames else None)
+            np.save(record.relative_pitch_path, static[:, 0])
+            normalized_static = np.empty(static.shape, dtype=np.float64)
+            np.subtract(static, offset, out=normalized_static)
+            np.multiply(normalized_static, scale, out=normalized_static)
+            features = add_dynamic_features(
+                normalized_static, spec.use_delta, spec.use_delta2,
+                window=spec.delta_window)
+            np.save(record.features_path, features)
+            del static, normalized_static, features
+            static_path.unlink()
+
+        return records, offset, scale, frame_count, vibrato_candidates
+
+    def _collect_cached_phoneme_data(
+            self, utterances: Sequence[_CachedUtterance]
+            ) -> Tuple[Dict[str, List[np.ndarray]],
+                       Dict[str, List[np.ndarray]], Dict[str, List[float]]]:
+        """Build HMM sequence indexes over memory-mapped utterance features."""
+        features: Dict[str, List[np.ndarray]] = {}
+        voiced: Dict[str, List[np.ndarray]] = {}
+        durations: Dict[str, List[float]] = {}
+        for data in utterances:
+            if not data.n_frames:
+                continue
+            feature_matrix = np.load(data.features_path, mmap_mode="r")
+            voiced_frames = np.load(data.voiced_path, mmap_mode="r")
+            for phone, lo, hi in data.phoneme_spans:
+                if hi <= lo:
+                    continue
+                canonical = self.phoneme_set.canonical(phone)
+                # Slices remain views on the .npy mmap; no utterance-sized or
+                # corpus-sized feature copy is made by this index.
+                features.setdefault(canonical, []).append(
+                    feature_matrix[lo:hi])
+                voiced.setdefault(canonical, []).append(voiced_frames[lo:hi])
+                durations.setdefault(canonical, []).append(float(hi - lo))
+            del feature_matrix, voiced_frames
+        return features, voiced, durations
 
     # -- stage 3: HMMs -----------------------------------------------------
 
@@ -477,6 +681,43 @@ class Trainer:
         return backoff
 
     # -- stage 3b: optional sparse phoneme contexts ------------------------
+
+    def _collect_cached_context_data(
+            self, utterances: Sequence[_CachedUtterance]
+            ) -> Dict[str, Dict[str, object]]:
+        """Group context occurrences using views into the disk-backed cache."""
+        config = self.config
+        silence = self.phoneme_set.silence
+        wildcard = context_wildcard(self.phoneme_set.phonemes)
+        occurrences: Dict[str, Dict[str, object]] = {}
+        for data in utterances:
+            if not data.n_frames:
+                continue
+            feature_matrix = np.load(data.features_path, mmap_mode="r")
+            voiced_frames = np.load(data.voiced_path, mmap_mode="r")
+            spans = [(self.phoneme_set.canonical(phone), lo, hi)
+                     for phone, lo, hi in data.phoneme_spans if hi > lo]
+            for index, (curr, lo, hi) in enumerate(spans):
+                pre = spans[index - 1][0] if index > 0 else silence
+                post = spans[index + 1][0] if index < len(spans) - 1 \
+                    else silence
+                for key, kind in context_keys(pre, curr, post, wildcard,
+                                              partial=config.context_partial):
+                    entry = occurrences.get(key)
+                    if entry is None:
+                        entry = {
+                            "kind": kind,
+                            "pre": pre if kind != KIND_RIGHT else None,
+                            "curr": curr,
+                            "post": post if kind != KIND_LEFT else None,
+                            "features": [],
+                            "voiced": [],
+                        }
+                        occurrences[key] = entry
+                    entry["features"].append(feature_matrix[lo:hi])
+                    entry["voiced"].append(voiced_frames[lo:hi])
+            del feature_matrix, voiced_frames
+        return occurrences
 
     def collect_context_data(self, utterances: Sequence[UtteranceData],
                              offset: np.ndarray, scale: np.ndarray
@@ -690,6 +931,92 @@ class Trainer:
                              f"{estimate['depth_semitones']:.2f} semitones")
         return model
 
+    @staticmethod
+    def _merge_moments(count: int, mean: float, m2: float,
+                       values: np.ndarray) -> Tuple[int, float, float]:
+        """Merge one frame batch into running population moments."""
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        values = values[np.isfinite(values)]
+        if not values.size:
+            return count, mean, m2
+        batch_count = int(values.size)
+        batch_mean = float(values.mean())
+        batch_m2 = float(((values - batch_mean) ** 2).sum())
+        if count == 0:
+            return batch_count, batch_mean, batch_m2
+        combined_count = count + batch_count
+        delta = batch_mean - mean
+        combined_mean = mean + delta * batch_count / combined_count
+        combined_m2 = (m2 + batch_m2
+                       + delta * delta * count * batch_count / combined_count)
+        return combined_count, combined_mean, combined_m2
+
+    def _build_pitch_model_from_cache(
+            self, utterances: Sequence[_CachedUtterance],
+            hmms: Dict[str, LeftToRightHMM],
+            vibrato_candidates: Sequence[Tuple[float, float]]) -> PitchModel:
+        """Accumulate state pitch/voicing statistics without retaining frames."""
+        model = PitchModel(pitch_variation=self.config.pitch_variation)
+        pitch_moments: Dict[str, List[Tuple[int, float, float]]] = {}
+        voiced_counts: Dict[str, Tuple[int, int]] = {}
+
+        # HMM state assignments are only available after acoustic training, so
+        # revisit the disk-backed utterance files. Each frame contributes to a
+        # few scalar accumulators and is released before the next occurrence.
+        for data in utterances:
+            if not data.n_frames:
+                continue
+            features = np.load(data.features_path, mmap_mode="r")
+            relative_pitch = np.load(data.relative_pitch_path, mmap_mode="r")
+            voiced = np.load(data.voiced_path, mmap_mode="r")
+            for phone, lo, hi in data.phoneme_spans:
+                canonical = self.phoneme_set.canonical(phone)
+                hmm = hmms.get(canonical)
+                if hmm is None or hi <= lo:
+                    continue
+                state_path = hmm.segment(features[lo:hi])
+                moments = pitch_moments.setdefault(
+                    canonical, [(0, 0.0, 0.0) for _ in range(hmm.n_states)])
+                previous_voiced, previous_frames = voiced_counts.get(
+                    canonical, (0, 0))
+                phone_voiced = np.asarray(voiced[lo:hi], dtype=bool)
+                voiced_counts[canonical] = (
+                    previous_voiced + int(phone_voiced.sum()),
+                    previous_frames + len(phone_voiced))
+
+                pitch_segment = relative_pitch[lo:hi]
+                for state in range(hmm.n_states):
+                    indices = np.flatnonzero(state_path == state)
+                    if not len(indices):
+                        continue
+                    state_values = np.asarray(pitch_segment[indices],
+                                              dtype=np.float64)
+                    moments[state] = self._merge_moments(
+                        *moments[state], state_values)
+            del features, relative_pitch, voiced
+
+        for phone, moments in pitch_moments.items():
+            model.stats[phone] = [
+                PitchStats(
+                    mean=mean if count else 0.0,
+                    variance=max(m2 / count, 1e-4) if count else 0.35 ** 2,
+                    count=count)
+                for count, mean, m2 in moments]
+            voiced_total, frame_total = voiced_counts.get(phone, (0, 0))
+            if frame_total:
+                model.voiced_prior[phone] = voiced_total / frame_total
+
+        if self.config.vibrato_enabled:
+            model.vibrato.enabled = True
+            if self.config.vibrato_estimate_from_data and vibrato_candidates:
+                rates = np.asarray([item[0] for item in vibrato_candidates])
+                depths = np.asarray([item[1] for item in vibrato_candidates])
+                estimate = {"rate_hz": float(np.median(rates)),
+                            "depth_semitones": float(np.median(depths))}
+                self.log(f"  vibrato from data: {estimate['rate_hz']:.2f} Hz, "
+                         f"{estimate['depth_semitones']:.2f} semitones")
+        return model
+
     def _estimate_vibrato(self, utterances: Sequence[UtteranceData]
                           ) -> Optional[dict]:
         from hms.core.pitch import estimate_vibrato
@@ -775,16 +1102,30 @@ class Trainer:
                  f"{corpus.total_seconds:.1f} s of labelled audio")
 
         self.log("2/5  analysing (WORLD) and aligning")
-        utterances = self.analyse_corpus(corpus)
+        # HMM re-estimation genuinely needs sequences from multiple utterances.
+        # Keep their compact, normalized feature representation in a temporary
+        # mmap cache; waveform, WORLD spectra, and analysis intermediates never
+        # accumulate in the training process.
+        with tempfile.TemporaryDirectory(prefix="hms-training-") as tmp:
+            cache_dir = Path(tmp)
+            (utterances, offset, scale, total_frames,
+             vibrato_candidates) = self._prepare_training_cache(corpus, cache_dir)
+            return self._train_cached(
+                score, utterances, offset, scale, total_frames,
+                vibrato_candidates)
 
+    def _train_cached(
+            self, score: labels_module.Score,
+            utterances: Sequence[_CachedUtterance], offset: np.ndarray,
+            scale: np.ndarray, total_frames: int,
+            vibrato_candidates: Sequence[Tuple[float, float]]) -> HMSModel:
+        config = self.config
         self.log("3/5  building features")
-        offset, scale = self.compute_normalization(utterances)
-        phoneme_features, phoneme_voiced, _pitch, durations = \
-            self.collect_phoneme_data(utterances, offset, scale)
+        phoneme_features, phoneme_voiced, durations = \
+            self._collect_cached_phoneme_data(utterances)
         n_occurrences = sum(len(v) for v in phoneme_features.values())
         covered_frames = sum(int(sum(len(s) for s in v))
                              for v in phoneme_features.values())
-        total_frames = sum(len(u.features) for u in utterances)
         self.log(f"  {len(phoneme_features)} distinct phonemes, "
                  f"{n_occurrences} occurrences, {covered_frames}/{total_frames} "
                  f"frames covered by labels")
@@ -796,27 +1137,25 @@ class Trainer:
             raise RuntimeError("no known phoneme data was available for dedicated "
                                "or class backoff training")
 
-        # Optional sparse phoneme contexts (off by default).  Their seeds are
-        # offset past the class backoffs', so enabling them never perturbs the
+        # Optional sparse phoneme contexts (off by default). Their seeds are
+        # offset past the class backoffs, so enabling them never perturbs the
         # dedicated/backoff models.
         contexts: Dict[str, LeftToRightHMM] = {}
         context_index: Dict[str, dict] = {}
         global_backoff: Optional[LeftToRightHMM] = None
+        context_occurrences: Optional[Dict[str, Dict[str, object]]] = None
         if config.context_enabled:
             seed_base = config.seed + 10_000 * len(backoff)
-            occurrences = self.collect_context_data(utterances, offset, scale)
-            selected = self.select_context_models(occurrences)
-            self.log(f"  contexts: {len(occurrences)} observed, "
+            context_occurrences = self._collect_cached_context_data(utterances)
+            selected = self.select_context_models(context_occurrences)
+            self.log(f"  contexts: {len(context_occurrences)} observed, "
                      f"{len(selected)} selected "
                      f"(>= {config.context_min_frames} frames, "
                      f">= {config.context_min_occurrences} occurrences, "
                      f"cap {config.context_max_models})")
             contexts, context_index = self.train_contexts(
-                occurrences, selected, seed_base)
+                context_occurrences, selected, seed_base)
             if not contexts:
-                # Don't let the run look like contextual modelling happened:
-                # the fallback hierarchy (phone -> class -> global backoff)
-                # is what synthesis will actually use.
                 self.log(
                     "  ! context modelling is enabled but 0 context models "
                     "were created: no observed context met the support "
@@ -838,9 +1177,14 @@ class Trainer:
                  f"{len(contexts)} context model(s), "
                  f"{total_params:,} total free params")
 
+        # The next stage reopens one utterance at a time, so discard all the
+        # per-phone mmap views and context indexes before computing pitch stats.
+        del phoneme_features, phoneme_voiced, context_occurrences
+
         self.log("5/5  duration, pitch and voicing models")
         duration_model = self.build_duration_model(durations)
-        pitch_model = self.build_pitch_model(utterances, offset, scale, hmms)
+        pitch_model = self._build_pitch_model_from_cache(
+            utterances, hmms, vibrato_candidates)
 
         stats = ModelStats(
             utterances=len(utterances),

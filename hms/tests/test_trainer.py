@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -9,11 +11,12 @@ import pytest
 
 from hms.config import training_config_from_parameters
 from hms.core import labels as labels_module
+from hms.core.features import AcousticFrameSequence, FeatureSpec
 from hms.core.duration import DurationModel, DurationStats
 from hms.core.labels import Score, Segment, Utterance
 from hms.core.phonemes import PhonemeSet
 from hms.core.synthesizer import SynthesisConfig, Synthesizer
-from hms.core.trainer import Trainer, TrainingConfig
+from hms.core.trainer import Corpus, Trainer, TrainingConfig
 
 
 def simple_vowel_set() -> PhonemeSet:
@@ -116,6 +119,79 @@ def _small_train_config(labels, wav_dir, **overrides):
                   n_iterations=1, min_phoneme_frames=10, vocoder="builtin")
     values.update(overrides)
     return TrainingConfig(**values)
+
+
+def test_training_analysis_releases_each_utterance_into_a_disk_backed_cache(
+        tmp_path, monkeypatch):
+    """WORLD outputs die between utterances; only metadata remains in RAM."""
+    frame_count = 12
+    spec = FeatureSpec(fs=8000, frame_period=10.0, fft_size=16,
+                       n_mcep=3, n_band=2)
+    score = Score([
+        Utterance("first", [Segment("a", 0.0, 0.12, note=60.0)]),
+        Utterance("second", [Segment("a", 0.0, 0.12, note=64.0)]),
+    ])
+    wav_dir = tmp_path / "wav"
+    wav_dir.mkdir()
+    for name in ("first", "second"):
+        (wav_dir / f"{name}.wav").write_bytes(b"test")
+
+    class RecordingVocoder:
+        name = "test"
+
+        def __init__(self):
+            self.intermediates = []
+
+        def analyze_to_sequence(self, signal, fs, frame_period, **_kwargs):
+            gc.collect()
+            assert all(ref() is None for refs in self.intermediates
+                       for ref in refs), (
+                "the previous utterance's waveform/WORLD arrays are still live")
+            index = int(signal[0])
+            f0 = np.full(frame_count, 220.0 + 20.0 * index)
+            sp = np.full((frame_count, spec.n_bins), 1.0 + 0.1 * index)
+            ap = np.full((frame_count, spec.n_bins), 0.25)
+            self.intermediates.append(tuple(
+                weakref.ref(array) for array in (signal, f0, sp, ap)))
+            return AcousticFrameSequence(
+                f0=f0, sp=sp, ap=ap, frame_period=frame_period,
+                fs=fs, fft_size=spec.fft_size)
+
+    def read_wav(path):
+        return np.full(4, 0 if Path(path).stem == "first" else 1.0), 8000
+
+    monkeypatch.setattr("hms.core.trainer.wavio.read_wav", read_wav)
+    config = TrainingConfig(
+        label_file="unused.tsv", wav_dir=str(wav_dir), fs=8000,
+        frame_period=10.0, fft_size=16, n_mcep=3, n_band=2,
+        n_iterations=1, vocoder="builtin")
+    trainer = Trainer(config, simple_vowel_set())
+    trainer.spec = spec
+    vocoder = RecordingVocoder()
+    trainer._vocoder = vocoder
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    cached, offset, scale, total_frames, _vibrato = \
+        trainer._prepare_training_cache(Corpus(score, wav_dir), cache_dir)
+
+    assert len(cached) == 2
+    assert total_frames == frame_count * 2
+    assert offset.shape == scale.shape == (spec.static_dim,)
+    assert not list(cache_dir.glob("*.static.npy"))
+    assert len(list(cache_dir.glob("*.features.npy"))) == 2
+    for record in cached:
+        assert not any(isinstance(value, np.ndarray)
+                       for value in vars(record).values())
+        features = np.load(record.features_path, mmap_mode="r")
+        assert isinstance(features, np.memmap)
+        assert features.shape == (frame_count, spec.dim)
+        assert len(np.load(record.relative_pitch_path, mmap_mode="r")) == frame_count
+        assert len(np.load(record.voiced_path, mmap_mode="r")) == frame_count
+    by_phone, _voiced, _durations = trainer._collect_cached_phoneme_data(cached)
+    assert all(isinstance(sequence, np.memmap)
+               for sequences in by_phone.values() for sequence in sequences)
+    assert all(ref() is None for refs in vocoder.intermediates for ref in refs)
 
 
 def test_notes_outside_the_analysis_f0_range_are_warned(demo_dataset,
