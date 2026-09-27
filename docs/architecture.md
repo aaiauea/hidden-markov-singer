@@ -222,8 +222,10 @@ read label file → analyse every utterance (WORLD) → per-frame phoneme/note l
 → per-dimension mean/std normalisation over the whole corpus
 → per phoneme: collect frames, train a LeftToRightHMM
 → pooled per phoneme-class backoff models for phonemes with too little data
+→ optional (context.enabled): sparse HMMs for the observed phone contexts,
+  plus an optional pooled global backoff
 → duration model (per phoneme) → pitch model (per phoneme/state) → voicing
-→ HMSModel (spec, hmms, backoff, normalisation, stats, metadata)
+→ HMSModel (spec, hmms, backoff, contexts, normalisation, stats, metadata)
 ```
 
 `min_phoneme_frames` (default 20) is the guard rail: a phoneme below it does
@@ -232,13 +234,71 @@ feature sequences of *all* known phones in that class, including under-threshold
 phones; each frame contributes once, so a common phone naturally contributes
 more than a rare one. Backoff GMM components are never formed by averaging
 component indices from separately trained phone models. The parameter report
-shows dedicated and backoff budgets separately.
+shows dedicated, context, class-backoff and global-backoff budgets separately.
+
+### Optional sparse phone contexts (`context.enabled: true`)
+
+Off by default; `hms train --context` (or `context.enabled: true` in
+`parameters.yaml`) adds a *sparse* context tier on top of the phoneme models:
+
+* **Observed contexts only.** For every labelled segment the trainer records
+  its exact `(pre_phone, curr_phone, future_phone)` triphone and — with
+  `context.partial: true` — the one-sided diphone contexts `(pre, curr, _)`
+  and `(_, curr, post)`. There is no full triphone inventory: a context is a
+  candidate only if it occurs in the corpus. Utterance boundaries use the
+  inventory's existing `sil` symbol as the neighbour; there are no BOS/EOS
+  tokens.
+* **Thresholds and a cap.** A context earns its own HMM only with at least
+  `context.min_frames` pooled frames and `context.min_occurrences`
+  occurrences; beyond the `context.max_models` cap the best-supported contexts
+  win. Selection sorts by (frames, occurrences, key), so the sparse set is
+  deterministic for a given corpus.
+* **Trained from pooled raw sequences.** Exactly like the class backoffs, each
+  context HMM is fitted directly to the feature sequences of its occurrences —
+  never by averaging separately trained phone models. The state/component
+  budget follows the *current* phone's definition, so a context of a vowel
+  spends like a vowel. Context seeds are offset past the backoffs', so
+  enabling the feature does not perturb the other tiers.
+* **Optional global backoff.** `context.global_backoff: true` additionally
+  trains one small pooled HMM over every frame, as the last safety net for
+  phones nothing else covers.
+
+Resolution at synthesis time (`HMSModel.resolve_unit`) follows a fixed
+hierarchy: exact triphone → best-supported one-sided diphone (ties favour the
+left context) → dedicated current-phone HMM → phone-class backoff → optional
+global backoff. The resolved unit drives state allocation, acoustic statistics
+and voicing; the `plan()` API keeps its six return values (the per-frame unit
+choice travels alongside, internally). Score notes remain the base F0 path;
+learned pitch deviations remain optional exactly as in the context-free case.
+With contexts disabled every code path is bit-identical to the classic
+pipeline, and models stay format-compatible (contexts are an additive format-3
+payload; format-2 models load with an empty context tier).
+
+## 7b. Model evaluation (`hms/core/evaluate.py`, `hms evaluate`)
+
+`hms evaluate` compares trained models on an evaluation corpus without
+rendering audio and **without an aggregate quality score**: it reports
+separate objective metrics per model — held-out log-likelihood (total and per
+frame, under the units synthesis would select, contexts included), voicing
+agreement, duration prediction MAE, and backoff-routed frames — so the reader
+sees *what* differs, not just a fused number.
+
+Because those metrics are only comparable between like-for-like models,
+evaluation first cross-checks them: the feature spec must match exactly (hard
+error), and differences in phoneme inventory, training method, seed, training
+corpus paths, and any other non-context training setting are surfaced as
+warnings. Context settings are deliberately exempt — comparing a context model
+against its baseline is the usual reason to run it.
 
 ## 8. Synthesis pipeline (`hms/core/synthesizer.py`)
 
 1. `plan` — score segments → phoneme durations → per-state frame counts →
    `(phone, state)` per frame; gaps become silence; unknown phonemes are
-   reported and routed to the backoff model.
+   reported and routed to the backoff model. With context models present, each
+   segment's unit is resolved through the context hierarchy (exact triphone →
+   best-supported diphone, ties left → phone → class backoff → global
+   backoff), which changes the state allocation for that segment; the six-value
+   return signature is unchanged.
 2. `frame_statistics` — per-state GMM means/variances stacked into per-frame
    statistics (dominant component by default, or the mixture marginal).
 3. `mlpg` — the trajectory.
@@ -258,21 +318,32 @@ decided.
 ```
 model.yaml      human readable: format version, feature spec, normalisation
                 (offset/scale), phoneme set, duration model, pitch model
-                (including vibrato), HMM index, parameter budget, metadata
+                (including vibrato), HMM index, context index (when context
+                modelling was on), parameter budget, metadata
 hmm.npz         arrays: GMM weights/means/variances, self-loops, durations,
                 voicing probabilities
 backoff.npz     the same for the pooled per-class models
+context.npz     the same for the sparse phone-context models and the optional
+                global backoff (only written when any of them exist)
 ```
 
 YAML for anything a human might want to read or tweak, `.npz` for the arrays.
 `HMSModel.save/load` is the only serialisation code in the project, and the
-loader validates the format version.
+loader validates the format version. The current format is 3; it is additive
+over format 2 (the context tier), so format-2 models keep loading — with an
+empty context tier. Context keys are three `^`-joined phone symbols
+(`a^i^sil`); a reserved wildcard marks the unmodelled side of a one-sided
+diphone (`s^a^_` = `a` given left neighbour `s`, `_^a^i` = `a` given right
+neighbour `i`), which keeps the two diphone pools of one bigram distinct.
 
 ## 10. Design trade-offs (what is deliberately missing)
 
 | decision | why |
 |---|---|
 | per-phoneme HMMs, no state tying across phonemes | the inventory is small; backoff models cover rare phonemes with one pooled model per class |
+| phone contexts are opt-in, sparse and capped | a full triphone inventory would spend parameters on contexts the corpus never shows; observed-only contexts with thresholds and a model cap keep the budget honest, and the fixed fallback hierarchy means nothing can fall through |
+| no BOS/EOS tokens for context boundaries | the inventory's `sil` already marks utterance edges in labels and scores, so contexts reuse it instead of inventing parallel symbols |
+| `hms evaluate` reports metrics separately, no fused quality score | collapsing likelihood, voicing and duration errors into one number would hide which part of the model a change actually moved |
 | log-normal durations, no duration HMM | the score already carries the timing; the model only fills gaps |
 | 5 aperiodicity bands | the fine structure of `ap` is perceptually unimportant compared to 1025 extra parameters |
 | vibrato outside the HMM | MLPG would smooth it away; keeping it explicit makes it controllable |

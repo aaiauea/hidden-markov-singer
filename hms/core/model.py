@@ -25,11 +25,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import yaml
 
+from hms.core.context import (GLOBAL_KEY, context_wildcard,
+                              left_diphone_key, right_diphone_key,
+                              triphone_key)
 from hms.core.duration import DurationModel
 from hms.core.features import FeatureSpec
 from hms.core.hmm import LeftToRightHMM
@@ -40,11 +43,18 @@ from hms.core.pitch import PitchModel
 #: 2 -- the spectral envelope is sampled on `2 * n_mcep` mel bands instead of
 #:      `n_mcep + 2` (see `hms.core.features.mel_band_count`), so the stored
 #:      cepstral coefficients mean something different from format 1.
-MODEL_FORMAT_VERSION = 2
+#: 3 -- adds optional sparse phoneme-context modelling: a `context_index` in
+#:      the YAML and a `context.npz` array file (plus an optional global
+#:      backoff model).  Format-2 files carry no contexts and still load.
+MODEL_FORMAT_VERSION = 3
+
+#: Format versions this build can read.
+SUPPORTED_FORMAT_VERSIONS = (2, 3)
 
 _MODEL_YAML = "model.yaml"
 _HMM_NPZ = "hmm.npz"
 _BACKOFF_NPZ = "backoff.npz"
+_CONTEXT_NPZ = "context.npz"
 
 
 @dataclass
@@ -92,7 +102,10 @@ class HMSModel:
                  normalization: Optional[Dict[str, np.ndarray]] = None,
                  stats: Optional[ModelStats] = None,
                  backoff: Optional[Dict[str, LeftToRightHMM]] = None,
-                 metadata: Optional[Dict[str, object]] = None) -> None:
+                 metadata: Optional[Dict[str, object]] = None,
+                 contexts: Optional[Dict[str, LeftToRightHMM]] = None,
+                 context_index: Optional[Dict[str, dict]] = None,
+                 global_backoff: Optional[LeftToRightHMM] = None) -> None:
         self.name = name
         self.spec = spec
         self.phoneme_set = phoneme_set
@@ -105,6 +118,14 @@ class HMSModel:
         self.stats = stats or ModelStats()
         self.backoff = backoff or {}
         self.metadata = metadata or {}
+        #: sparse phone-context HMMs (empty unless trained with contexts on)
+        self.contexts = contexts or {}
+        #: per context key: kind, phones, support, trained geometry
+        self.context_index = context_index or {}
+        #: optional pooled catch-all HMM, last rung of the fallback hierarchy
+        self.global_backoff = global_backoff
+        #: format version the model was read from (set by `load`)
+        self.loaded_format_version: Optional[int] = None
 
     # -- geometry ----------------------------------------------------------
 
@@ -158,7 +179,61 @@ class HMSModel:
         for key in (klass, "unvoiced_consonant"):
             if key in self.backoff:
                 return self.backoff[key]
+        if self.global_backoff is not None:
+            return self.global_backoff
         raise KeyError(f"no model for phoneme {phoneme!r} and no backoff "
+                       f"available (classes: {sorted(self.backoff)})")
+
+    # -- context resolution --------------------------------------------------
+
+    def context_support(self, key: str) -> Optional[int]:
+        """Pooled training frames of a context key, if that context exists."""
+        if key not in self.contexts:
+            return None
+        info = self.context_index.get(key) or {}
+        try:
+            return int(info.get("frames", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def resolve_unit(self, pre: str, curr: str, post: str
+                     ) -> Tuple[Optional[str], LeftToRightHMM, str]:
+        """Pick the HMM for a phone occurrence with context fallbacks.
+
+        Returns ``(context_key_or_None, hmm, tier)`` following the fixed
+        hierarchy: exact triphone, best-supported one-sided diphone (ties
+        favour the left context), dedicated current-phone HMM, phone-class
+        backoff, optional global backoff.  With no trained contexts this is
+        exactly `get_or_backoff`.
+        """
+        canonical = self.phoneme_set.canonical
+        pre_c, curr_c, post_c = canonical(pre), canonical(curr), canonical(post)
+        if self.contexts:
+            tri = triphone_key(pre_c, curr_c, post_c)
+            if tri in self.contexts:
+                return tri, self.contexts[tri], "triphone"
+            wildcard = context_wildcard(self.phoneme_set.phonemes)
+            left_key = left_diphone_key(pre_c, curr_c, wildcard)
+            right_key = right_diphone_key(curr_c, post_c, wildcard)
+            left_support = self.context_support(left_key)
+            right_support = self.context_support(right_key)
+            if left_support is not None \
+                    and (right_support is None
+                         or left_support >= right_support):
+                return left_key, self.contexts[left_key], "left"
+            if right_support is not None:
+                return right_key, self.contexts[right_key], "right"
+        hmm = self.get_hmm(curr)
+        if hmm is not None:
+            return None, hmm, "phone"
+        definition = self.phoneme_set.resolve(curr)
+        klass = definition.type if definition else "unvoiced_consonant"
+        for key in (klass, "unvoiced_consonant"):
+            if key in self.backoff:
+                return None, self.backoff[key], "class"
+        if self.global_backoff is not None:
+            return None, self.global_backoff, "global"
+        raise KeyError(f"no model for phoneme {curr!r} and no backoff "
                        f"available (classes: {sorted(self.backoff)})")
 
     @property
@@ -172,17 +247,35 @@ class HMSModel:
         return sum(h.n_free_params for h in self.backoff.values())
 
     @property
+    def context_n_free_params(self) -> int:
+        """Free parameters in the sparse phone-context HMMs."""
+        return sum(h.n_free_params for h in self.contexts.values())
+
+    @property
+    def global_backoff_n_free_params(self) -> int:
+        """Free parameters in the optional pooled global backoff HMM."""
+        if self.global_backoff is None:
+            return 0
+        return self.global_backoff.n_free_params
+
+    @property
     def n_free_params(self) -> int:
-        """Total free parameters, including dedicated and backoff HMMs."""
-        return self.phoneme_n_free_params + self.backoff_n_free_params
+        """Total free parameters across every model tier."""
+        return (self.phoneme_n_free_params + self.context_n_free_params
+                + self.backoff_n_free_params
+                + self.global_backoff_n_free_params)
 
     def parameter_report(self) -> List[str]:
         lines = [
             f"  phonemes modelled : {len(self.hmms)}",
+            f"  context models    : {len(self.contexts)}"
+            + (" + global backoff" if self.global_backoff is not None else ""),
             f"  feature dim       : {self.feature_dim} "
             f"({self.static_dim} static x {len(self.spec.stream_sizes)} streams)",
             f"  phoneme HMM params: {self.phoneme_n_free_params:,}",
+            f"  context HMM params: {self.context_n_free_params:,}",
             f"  backoff HMM params: {self.backoff_n_free_params:,}",
+            f"  global HMM params : {self.global_backoff_n_free_params:,}",
             f"  total HMM params  : {self.n_free_params:,}",
             f"  frames of training: {self.stats.frames:,} "
             f"({self.stats.duration_seconds:.1f} s)",
@@ -229,6 +322,25 @@ class HMSModel:
         if backoff_arrays:
             np.savez_compressed(directory / _BACKOFF_NPZ, **backoff_arrays)
 
+        context_arrays: Dict[str, np.ndarray] = {}
+        for key, hmm in sorted(self.contexts.items()):
+            for name, value in hmm.to_arrays().items():
+                context_arrays[f"{key}/{name}"] = value
+        global_index: Dict[str, object] = {}
+        if self.global_backoff is not None:
+            for name, value in self.global_backoff.to_arrays().items():
+                context_arrays[f"{GLOBAL_KEY}/{name}"] = value
+            global_index = {
+                "n_states": self.global_backoff.n_states,
+                "n_components":
+                    self.global_backoff.states[0].gmm.n_components,
+                "covariance": self.global_backoff.covariance_type,
+                "allow_skip": bool(self.global_backoff.allow_skip),
+                "n_free_params": self.global_backoff.n_free_params,
+            }
+        if context_arrays:
+            np.savez_compressed(directory / _CONTEXT_NPZ, **context_arrays)
+
         document = {
             "format_version": MODEL_FORMAT_VERSION,
             "name": self.name,
@@ -250,6 +362,10 @@ class HMSModel:
             "hmm_index": index,
             "backoff_index": backoff_index,
         }
+        if self.contexts:
+            document["context_index"] = dict(sorted(self.context_index.items()))
+        if global_index:
+            document["global_backoff_index"] = global_index
         with open(directory / _MODEL_YAML, "w", encoding="utf-8") as handle:
             yaml.safe_dump(document, handle, sort_keys=False, allow_unicode=True)
         return directory
@@ -268,9 +384,11 @@ class HMSModel:
             document = yaml.safe_load(handle) or {}
 
         version = int(document.get("format_version", 0))
-        if version != MODEL_FORMAT_VERSION:
-            raise ValueError(f"model format version {version} is not supported "
-                             f"by this build (expected {MODEL_FORMAT_VERSION})")
+        if version not in SUPPORTED_FORMAT_VERSIONS:
+            raise ValueError(
+                f"model format version {version} is not supported by this "
+                f"build (supported: {SUPPORTED_FORMAT_VERSIONS}; this build "
+                f"writes {MODEL_FORMAT_VERSION})")
 
         spec = FeatureSpec.from_dict(document.get("feature_spec") or {})
         phoneme_set = PhonemeSet.from_dict(document.get("phonemes") or {})
@@ -302,8 +420,42 @@ class HMSModel:
                         subset, allow_skip=bool(info.get("allow_skip", False)),
                         covariance_type=str(info.get("covariance", "diag")))
 
+        contexts: Dict[str, LeftToRightHMM] = {}
+        context_index = dict(document.get("context_index") or {})
+        global_index = document.get("global_backoff_index") or {}
+        global_backoff: Optional[LeftToRightHMM] = None
+        if context_index or global_index:
+            context_path = directory / _CONTEXT_NPZ
+            if not context_path.exists():
+                raise ValueError(
+                    f"{directory} declares context models but {_CONTEXT_NPZ} "
+                    f"is missing")
+            with np.load(context_path) as handle:
+                context_arrays = {key: handle[key] for key in handle.files}
+            for key, info in context_index.items():
+                prefix = f"{key}/"
+                subset = {k[len(prefix):]: v
+                          for k, v in context_arrays.items()
+                          if k.startswith(prefix)}
+                if subset:
+                    contexts[key] = LeftToRightHMM.from_arrays(
+                        subset, allow_skip=bool(info.get("allow_skip", False)),
+                        covariance_type=str(info.get("covariance", "diag")))
+            context_index = {key: context_index[key] for key in contexts}
+            if global_index:
+                prefix = f"{GLOBAL_KEY}/"
+                subset = {k[len(prefix):]: v
+                          for k, v in context_arrays.items()
+                          if k.startswith(prefix)}
+                if subset:
+                    global_backoff = LeftToRightHMM.from_arrays(
+                        subset,
+                        allow_skip=bool(global_index.get("allow_skip", False)),
+                        covariance_type=str(
+                            global_index.get("covariance", "diag")))
+
         normalization = document.get("normalization") or {}
-        return cls(
+        model = cls(
             name=str(document.get("name", directory.name)),
             spec=spec,
             phoneme_set=phoneme_set,
@@ -322,7 +474,12 @@ class HMSModel:
             stats=ModelStats.from_dict(document.get("stats") or {}),
             backoff=backoff,
             metadata=document.get("metadata") or {},
+            contexts=contexts,
+            context_index=context_index,
+            global_backoff=global_backoff,
         )
+        model.loaded_format_version = version
+        return model
 
     def exists(self, directory) -> bool:
         return (Path(directory) / _MODEL_YAML).exists()
@@ -331,8 +488,10 @@ class HMSModel:
 
     def summary(self) -> str:
         """Multi-line description used by `hms inspect-model`."""
+        version = getattr(self, "loaded_format_version", None) \
+            or MODEL_FORMAT_VERSION
         lines = [f"model          : {self.name}",
-                 f"format version : {MODEL_FORMAT_VERSION}",
+                 f"format version : {version}",
                  f"loader         : {self.metadata.get('hms_version', 'hms')}"]
         lines += self.parameter_report()
         lines.append("")
@@ -351,6 +510,24 @@ class HMSModel:
                 f"  {phoneme:8s} {hmm.n_states} x "
                 f"{hmm.states[0].gmm.n_components:<2d} "
                 f"{hmm.n_free_params:7,d} params")
+        if self.contexts or self.global_backoff is not None:
+            lines.append("")
+            lines.append("context HMMs (sparse, key: states x components, "
+                         "params):")
+            for key, hmm in sorted(self.contexts.items()):
+                info = self.context_index.get(key) or {}
+                lines.append(
+                    f"  {key:18s} {str(info.get('kind', '?')):8s} "
+                    f"{hmm.n_states} x {hmm.states[0].gmm.n_components:<2d} "
+                    f"{hmm.n_free_params:7,d} params "
+                    f"({info.get('frames', '?')} frames, "
+                    f"{info.get('occurrences', '?')} occ)")
+            if self.global_backoff is not None:
+                lines.append(
+                    f"  {'(global backoff)':18s} {'pooled':8s} "
+                    f"{self.global_backoff.n_states} x "
+                    f"{self.global_backoff.states[0].gmm.n_components:<2d} "
+                    f"{self.global_backoff.n_free_params:7,d} params")
         lines.append("")
         lines.append("training:")
         for key, value in self.stats.to_dict().items():

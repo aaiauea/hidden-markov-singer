@@ -4,6 +4,7 @@
     hms extract        analyse a corpus into WORLD parameters
     hms train          train a voice model
     hms synth          render a score to a WAV file
+    hms evaluate       objectively compare models on an evaluation corpus
     hms inspect-model  print what a model contains
     hms doctor         report available backends and where they came from
 
@@ -70,6 +71,8 @@ def _training_config(args) -> TrainingConfig:
         overrides["use_delta"] = bool(args.delta)
     if getattr(args, "vibrato", None) is not None:
         overrides["vibrato_enabled"] = bool(args.vibrato)
+    if getattr(args, "context", None) is not None:
+        overrides["context_enabled"] = bool(args.context)
     for key, value in overrides.items():
         if value is not None:
             setattr(config, key, value)
@@ -323,6 +326,59 @@ def _write_trace(path, result, f0_ref_hz: float = 261.6255653) -> None:
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def cmd_evaluate(args) -> int:
+    """Objectively compare models on an evaluation corpus (no quality score)."""
+    from hms.core.evaluate import evaluate_models
+
+    model_dirs = list(dict.fromkeys(args.model))     # de-dup, keep order
+    models = [HMSModel.load(directory) for directory in model_dirs]
+
+    parameters = load_parameters(getattr(args, "config", None))
+    # Prefer each model's recorded time_unit; fall back to parameters.yaml
+    # when a model carries no training metadata.
+    time_unit = None
+    for model in models:
+        if "time_unit" in ((model.metadata.get("training_config") or {})):
+            break
+    else:
+        time_unit = (parameters.get("training") or {}).get("time_unit")
+
+    _log(f"corpus : {args.labels} + {args.wav_dir}")
+    for model in models:
+        _log(f"model  : {model.name} ({model.metadata.get('label_file', '?')})")
+    try:
+        report = evaluate_models(models, args.labels, args.wav_dir, log=_log,
+                                 time_unit=time_unit, vocoder=args.vocoder)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    corpus = report["corpus"]
+    _log("")
+    _log(f"evaluated {corpus['utterances']} utterances, "
+         f"{corpus['frames']} frames ({corpus['seconds']:.1f} s)")
+    _log("")
+    _log(f"{'model':24s} {'LL total':>14s} {'LL/frame':>10s} "
+         f"{'voicing':>9s} {'dur MAE':>10s} {'backoff':>10s}")
+    _log(f"{'':24s} {'':>14s} {'':>10s} "
+         f"{'agree':>9s} {'frames':>10s} {'frames':>10s}")
+    for name, metrics in report["models"].items():
+        _log(f"{name[:24]:24s} "
+             f"{metrics['total_log_likelihood']:>14,.1f} "
+             f"{metrics['log_likelihood_per_frame']:>10.2f} "
+             f"{metrics['voicing_agreement']:>9.3f} "
+             f"{metrics['duration_mae_frames']:>10.2f} "
+             f"{metrics['backoff_frames']:>10d}")
+    _log("")
+    _log("metrics are reported separately on purpose: there is no aggregate "
+         "quality score.")
+    if args.json:
+        Path(args.json).write_text(json.dumps(report, indent=2, sort_keys=True),
+                                   encoding="utf-8")
+        _log(f"wrote {args.json}")
+    return 0
+
+
 def cmd_inspect_model(args) -> int:
     model = HMSModel.load(args.model)
     if args.json:
@@ -330,6 +386,12 @@ def cmd_inspect_model(args) -> int:
             "name": model.name,
             "stats": model.stats.to_dict(),
             "parameter_budget": model.n_free_params,
+            "parameter_breakdown": {
+                "phoneme": model.phoneme_n_free_params,
+                "context": model.context_n_free_params,
+                "class_backoff": model.backoff_n_free_params,
+                "global_backoff": model.global_backoff_n_free_params,
+            },
             "feature_spec": model.spec.to_dict(),
             "phonemes": model.phoneme_set.to_dict(),
             "duration_model": model.duration_model.to_dict(),
@@ -338,6 +400,16 @@ def cmd_inspect_model(args) -> int:
                              "n_components": hmm.states[0].gmm.n_components,
                              "n_free_params": hmm.n_free_params}
                      for phone, hmm in sorted(model.hmms.items())},
+            "context_models": {
+                key: {**(model.context_index.get(key) or {}),
+                      "n_free_params": hmm.n_free_params}
+                for key, hmm in sorted(model.contexts.items())},
+            "global_backoff": (
+                {"n_states": model.global_backoff.n_states,
+                 "n_components":
+                     model.global_backoff.states[0].gmm.n_components,
+                 "n_free_params": model.global_backoff.n_free_params}
+                if model.global_backoff is not None else None),
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
@@ -519,6 +591,13 @@ def build_parser() -> argparse.ArgumentParser:
                             "WAV must already be at this rate.")
     train.add_argument("--f0-estimation", default=None, choices=["dio", "harvest"])
     train.add_argument("--pitch-variation", type=float, default=None)
+    train.add_argument("--context", dest="context", action="store_true",
+                       default=None,
+                       help="learn sparse phoneme-context HMMs for the "
+                            "contexts observed in the corpus")
+    train.add_argument("--no-context", dest="context", action="store_false",
+                       help="do not learn phoneme-context HMMs "
+                            "(the default; context.enabled in parameters.yaml)")
     train.add_argument("--evaluate", action="store_true",
                        help="report the training-set log likelihood")
     train.add_argument("--resume", action="store_true",
@@ -569,6 +648,24 @@ def build_parser() -> argparse.ArgumentParser:
     synth.add_argument("--save-params", default=None,
                        help="also save the WORLD parameters (.npz)")
     synth.set_defaults(func=cmd_synth)
+
+    # -- evaluate ----------------------------------------------------------
+    evaluate = sub.add_parser(
+        "evaluate",
+        help="objectively compare models on an evaluation corpus "
+             "(reports separate metrics; no aggregate quality score)")
+    add_config(evaluate)
+    evaluate.add_argument("--labels", required=True,
+                          help="evaluation label file")
+    evaluate.add_argument("--wav-dir", required=True,
+                          help="directory of the evaluation WAVs")
+    evaluate.add_argument("--model", action="append", required=True,
+                          help="model directory (repeat the flag to compare "
+                               "several models)")
+    evaluate.add_argument("--json", default=None,
+                          help="also write the full report as JSON")
+    evaluate.add_argument("--vocoder", default=None)
+    evaluate.set_defaults(func=cmd_evaluate)
 
     # -- inspect-model -----------------------------------------------------
     inspect = sub.add_parser("inspect-model",

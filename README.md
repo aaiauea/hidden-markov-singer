@@ -98,8 +98,58 @@ hms extract --labels corpus/labels.tsv --wav-dir corpus/wav --out params --featu
 
 Useful flags: `hms train --covariance tied` (share one covariance per state —
 fewer parameters for very small corpora), `hms train --iterations 10 --evaluate`,
+`hms train --context` (optional sparse phoneme-context models, see below),
 `hms synth --transpose 5 --vibrato --variance-scale 2`, `hms synth --trace
 trace.tsv` (frame-by-frame phoneme/state/note/F0 table).
+
+## Comparing models: `hms evaluate`
+
+`hms evaluate` scores one or more trained models against an *evaluation*
+corpus (labels + WAVs the models were not trained on) and prints the numbers
+side by side — held-out log-likelihood, voicing agreement, duration error and
+backoff usage. It deliberately reports the metrics **separately**: there is no
+aggregate quality score, because collapsing them would hide what actually
+changed.
+
+```bash
+hms evaluate --labels eval/labels.tsv --wav-dir eval/wav \
+    --model model-baseline --model model-context --json report.json
+```
+
+Before comparing, evaluation checks that the comparison is fair: the feature
+specs must match exactly (a hard error), and differences in phoneme inventory,
+training method, seed, training corpus paths, or any other non-context
+training setting are reported as warnings. (Context settings are expected to
+differ — that is usually what you are comparing.)
+
+## Optional phoneme-context modelling
+
+By default HMS models *phonemes*. Optionally — `context.enabled: true` in
+`parameters.yaml` or `hms train --context` — it also learns HMMs for the phone
+contexts that actually occur in the corpus. The design stays sparse and
+data-efficient:
+
+* only **observed** contexts are modelled — never a full triphone inventory;
+* each context is the exact `(pre_phone, curr_phone, future_phone)` triple,
+  plus one-sided diphone contexts `(pre, curr, _)` / `(_, curr, post)` where
+  supported; utterance boundaries use the existing `sil` symbol (no BOS/EOS);
+* a context gets its own HMM only past configurable support thresholds
+  (`context.min_frames`, `context.min_occurrences`) and within the
+  `context.max_models` cap — the best-supported contexts win deterministically;
+* context HMMs are trained directly from the pooled raw feature sequences of
+  their occurrences (like the class backoffs), and they take over state
+  allocation, acoustic statistics and voicing for the segments they cover;
+* resolution falls back gracefully: exact triphone → best-supported one-sided
+  diphone (ties favour the left context) → dedicated phone HMM → phone-class
+  backoff → optional pooled global backoff (`context.global_backoff`);
+* the score notes remain the base F0 path; learned pitch deviations stay
+  optional exactly as before.
+
+With `context.enabled: false` (the default) nothing changes: same training,
+same files, same synthesis. Context models are stored in `context.npz`
+(model format 3; format-2 models still load, without contexts), and
+`hms inspect-model` reports contextual, dedicated-phone, class-backoff and
+global-backoff parameter counts separately.
 
 ## Data format
 
@@ -182,24 +232,28 @@ model.save("model")
 ```
 model/
 ├── model.yaml     # format version, feature spec, phoneme set, duration and
-│                  # pitch models, normalisation, parameter budget -- readable
+│                  # pitch models, normalisation, context index, parameter
+│                  # budget -- readable
 ├── hmm.npz        # GMM weights/means/variances and transition stats
-└── backoff.npz    # per phoneme-class pooled models
+├── backoff.npz    # per phoneme-class pooled models
+└── context.npz    # sparse phone-context HMMs + optional global backoff
+                   # (only written when context modelling was enabled)
 ```
 
 ## Tests
 
 ```bash
 HMS_NO_AUTO_BUILD=1 python -m pytest
-# 187 tests: 179 passed, 8 optional skips without WORLD
+# 221 tests: 213 passed, 8 optional skips without WORLD
 ```
 
 The suite covers the numerical core (banded Cholesky, MLPG against a dense
 solve), the statistical models (GMM/HMM behaviour, duration allocation), the
 feature transforms (round-trip accuracy in the model's own space), the vocoder
-contract for both backends, model serialisation, the CLI, and an end-to-end
-train→synthesise run that checks the rendered notes really are the requested
-ones.
+contract for both backends, model serialisation (including the format-3
+context payload and format-2 compatibility), the sparse context feature,
+model evaluation, the CLI, and an end-to-end train→synthesise run that checks
+the rendered notes really are the requested ones.
 
 ## How it works
 
@@ -221,6 +275,9 @@ documentation tries to explain *why* each piece looks the way it does.
 * WORLD's synthesis is returned unscaled (see `Vocoder.synthesize`); it can
   overshoot `[-1, 1]` on very periodic material and `write_wav` applies the
   headroom.  A trained model is tied to the feature definition that produced
-  it: `model.yaml` records `format_version: 2`.
+  it: `model.yaml` records `format_version: 3` (format-2 models still load).
+* `hms evaluate` compares models with separate objective metrics (held-out
+  likelihood, voicing agreement, duration error, backoff usage) and by design
+  reports no aggregate quality score.
 * Synthesis is a single-pass MLPG render; no prosody/expression editing beyond
   `--transpose`, `--tempo`, `--variance-scale` and vibrato.

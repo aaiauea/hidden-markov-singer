@@ -42,6 +42,8 @@ import numpy as np
 
 from hms import __version__
 from hms.core import labels as labels_module
+from hms.core.context import (KIND_LEFT, KIND_RIGHT, context_keys,
+                              context_wildcard)
 from hms.core.duration import DurationModel
 from hms.core.features import (AcousticFrameSequence, FeatureSpec,
                                add_dynamic_features)
@@ -96,6 +98,20 @@ class TrainingConfig:
     vibrato_estimate_from_data: bool = True
     pitch_variation: float = 1.0
 
+    # -- optional sparse phoneme contexts (off by default) -----------------
+    #: learn HMMs for observed phone contexts (see `hms.core.context`)
+    context_enabled: bool = False
+    #: minimum pooled frames before a context gets its own HMM
+    context_min_frames: int = 100
+    #: minimum occurrences before a context gets its own HMM
+    context_min_occurrences: int = 3
+    #: cap on the number of context HMMs (the best-supported are kept)
+    context_max_models: int = 64
+    #: also train one-sided diphone contexts (left and right)
+    context_partial: bool = True
+    #: train a pooled catch-all backoff HMM as the last fallback
+    context_global_backoff: bool = False
+
     def __post_init__(self) -> None:
         numeric_values = (self.n_iterations, self.min_phoneme_frames,
                           self.var_floor_ratio, self.fs, self.frame_period,
@@ -141,6 +157,12 @@ class TrainingConfig:
             raise ValueError("pitch_variation must be finite and non-negative")
         if self.duration_variance_scale < 0:
             raise ValueError("duration_variance_scale must be non-negative")
+        if self.context_min_frames < 1:
+            raise ValueError("context_min_frames must be at least 1")
+        if self.context_min_occurrences < 1:
+            raise ValueError("context_min_occurrences must be at least 1")
+        if self.context_max_models < 0:
+            raise ValueError("context_max_models must be non-negative")
 
     @classmethod
     def from_dict(cls, data: Dict) -> "TrainingConfig":
@@ -447,6 +469,169 @@ class Trainer:
                      f"{total_frames} pooled frames")
         return backoff
 
+    # -- stage 3b: optional sparse phoneme contexts ------------------------
+
+    def collect_context_data(self, utterances: Sequence[UtteranceData],
+                             offset: np.ndarray, scale: np.ndarray
+                             ) -> Dict[str, Dict[str, object]]:
+        """Group frames by observed phone context.
+
+        Returns a mapping ``key -> entry`` where ``entry`` holds the context
+        ``kind`` (triphone / left / right diphone), the ``pre``/``curr``/``post``
+        phones (``None`` on the missing side of a diphone) and the pooled raw
+        feature and voicing sequences of every occurrence.  Utterance
+        boundaries use the inventory's silence symbol; there are no BOS/EOS
+        tokens.
+        """
+        config = self.config
+        silence = self.phoneme_set.silence
+        wildcard = context_wildcard(self.phoneme_set.phonemes)
+        occurrences: Dict[str, Dict[str, object]] = {}
+        for data in utterances:
+            normalized = self.normalize_features(data.features, offset, scale)
+            spans = [(self.phoneme_set.canonical(phone), lo, hi)
+                     for phone, lo, hi in data.phoneme_spans if hi > lo]
+            for index, (curr, lo, hi) in enumerate(spans):
+                pre = spans[index - 1][0] if index > 0 else silence
+                post = spans[index + 1][0] if index < len(spans) - 1 \
+                    else silence
+                for key, kind in context_keys(pre, curr, post, wildcard,
+                                              partial=config.context_partial):
+                    entry = occurrences.get(key)
+                    if entry is None:
+                        entry = {
+                            "kind": kind,
+                            "pre": pre if kind != KIND_RIGHT else None,
+                            "curr": curr,
+                            "post": post if kind != KIND_LEFT else None,
+                            "features": [],
+                            "voiced": [],
+                        }
+                        occurrences[key] = entry
+                    entry["features"].append(normalized[lo:hi])
+                    entry["voiced"].append(data.voiced[lo:hi])
+        return occurrences
+
+    def select_context_models(self, occurrences: Dict[str, Dict[str, object]]
+                              ) -> List[str]:
+        """Pick which observed contexts get their own HMM.
+
+        A context qualifies when it clears both support thresholds
+        (`context_min_frames`, `context_min_occurrences`); the best-supported
+        ones are kept up to the `context_max_models` cap.  Ordering is
+        deterministic: frames descending, occurrences descending, key
+        ascending.
+        """
+        config = self.config
+        candidates: List[Tuple[int, int, str]] = []
+        for key, entry in occurrences.items():
+            sequences = entry["features"]
+            frames = int(sum(len(s) for s in sequences))
+            count = len(sequences)
+            if frames < config.context_min_frames \
+                    or count < config.context_min_occurrences:
+                continue
+            candidates.append((frames, count, key))
+        candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        return [key for _frames, _count, key
+                in candidates[:max(0, config.context_max_models)]]
+
+    def train_contexts(self, occurrences: Dict[str, Dict[str, object]],
+                       selected: Sequence[str], seed_base: int
+                       ) -> Tuple[Dict[str, LeftToRightHMM], Dict[str, dict]]:
+        """Train one HMM per selected context, directly from pooled frames.
+
+        Like the class backoffs, each context model is fitted to the raw
+        feature sequences of its occurrences -- never by averaging separately
+        trained phone models.  The state/component budget follows the current
+        phone's definition, so a context of a vowel spends like a vowel.
+        """
+        config = self.config
+        contexts: Dict[str, LeftToRightHMM] = {}
+        index: Dict[str, dict] = {}
+        for position, key in enumerate(selected):
+            entry = occurrences[key]
+            sequences = entry["features"]
+            voiced = entry["voiced"]
+            total_frames = int(sum(len(s) for s in sequences))
+            curr = entry["curr"]
+            definition = self.phoneme_set.resolve(curr)
+            if definition is not None:
+                requested_states = definition.n_states
+                n_components = definition.n_components
+            else:
+                defaults = self.phoneme_set.defaults.get("unvoiced_consonant", {})
+                requested_states = int(defaults.get("n_states", 2))
+                n_components = int(defaults.get("n_components", 1))
+            n_states = min(requested_states, max(1, total_frames // 2))
+            hmm = LeftToRightHMM(
+                n_states=n_states, allow_skip=config.allow_skip,
+                covariance_type=config.covariance_type)
+            hmm.train(sequences, n_components=n_components,
+                      covariance_type=config.covariance_type,
+                      n_iterations=config.n_iterations,
+                      var_floor_ratio=config.var_floor_ratio,
+                      seed=seed_base + position,
+                      method=config.training_method, voiced=voiced)
+            contexts[key] = hmm
+            index[key] = {
+                "kind": entry["kind"],
+                "pre": entry["pre"],
+                "curr": entry["curr"],
+                "post": entry["post"],
+                "frames": total_frames,
+                "occurrences": len(sequences),
+                "n_states": hmm.n_states,
+                "n_components": hmm.states[0].gmm.n_components,
+                "covariance": hmm.covariance_type,
+                "allow_skip": bool(hmm.allow_skip),
+                "n_free_params": hmm.n_free_params,
+            }
+            self.log(f"  context {key:18s} ({entry['kind']}) "
+                     f"{hmm.n_states} states x "
+                     f"{hmm.states[0].gmm.n_components} comp, "
+                     f"{total_frames} frames / {len(sequences)} occ")
+        return contexts, index
+
+    def build_global_backoff(self, features: Dict[str, List[np.ndarray]],
+                             voiced: Dict[str, List[np.ndarray]],
+                             seed: int) -> LeftToRightHMM:
+        """One pooled catch-all HMM over every training frame.
+
+        The last rung of the context fallback hierarchy: it covers phones with
+        neither a dedicated, context, nor class model.  Deliberately small
+        (3 states, 1 component) -- it is a safety net, not an acoustic model.
+        """
+        pooled: List[np.ndarray] = []
+        pooled_voiced: List[np.ndarray] = []
+        for phone in sorted(features):
+            sequences = features[phone]
+            phone_voiced = voiced.get(phone)
+            for position, sequence in enumerate(sequences):
+                sequence = np.asarray(sequence, dtype=np.float64)
+                pooled.append(sequence)
+                if phone_voiced is None:
+                    pooled_voiced.append(np.zeros(len(sequence), dtype=bool))
+                else:
+                    pooled_voiced.append(
+                        np.asarray(phone_voiced[position], dtype=bool)
+                        .reshape(-1))
+        total_frames = sum(len(sequence) for sequence in pooled)
+        n_states = min(3, max(1, total_frames // 2))
+        hmm = LeftToRightHMM(
+            n_states=n_states, allow_skip=self.config.allow_skip,
+            covariance_type=self.config.covariance_type)
+        hmm.train(pooled, n_components=1,
+                  covariance_type=self.config.covariance_type,
+                  n_iterations=self.config.n_iterations,
+                  var_floor_ratio=self.config.var_floor_ratio,
+                  seed=seed, method=self.config.training_method,
+                  voiced=pooled_voiced)
+        self.log(f"  global backoff         {hmm.n_states} states x "
+                 f"{hmm.states[0].gmm.n_components} comp, "
+                 f"{total_frames} pooled frames")
+        return hmm
+
     # -- stage 4: duration and pitch ---------------------------------------
 
     def build_duration_model(self, durations: Dict[str, List[float]]
@@ -563,9 +748,35 @@ class Trainer:
         if not hmms and not backoff:
             raise RuntimeError("no known phoneme data was available for dedicated "
                                "or class backoff training")
+
+        # Optional sparse phoneme contexts (off by default).  Their seeds are
+        # offset past the class backoffs', so enabling them never perturbs the
+        # dedicated/backoff models.
+        contexts: Dict[str, LeftToRightHMM] = {}
+        context_index: Dict[str, dict] = {}
+        global_backoff: Optional[LeftToRightHMM] = None
+        if config.context_enabled:
+            seed_base = config.seed + 10_000 * len(backoff)
+            occurrences = self.collect_context_data(utterances, offset, scale)
+            selected = self.select_context_models(occurrences)
+            self.log(f"  contexts: {len(occurrences)} observed, "
+                     f"{len(selected)} selected "
+                     f"(>= {config.context_min_frames} frames, "
+                     f">= {config.context_min_occurrences} occurrences, "
+                     f"cap {config.context_max_models})")
+            contexts, context_index = self.train_contexts(
+                occurrences, selected, seed_base)
+            if config.context_global_backoff:
+                global_backoff = self.build_global_backoff(
+                    phoneme_features, phoneme_voiced,
+                    seed=seed_base + len(contexts))
+
         total_params = sum(h.n_free_params for h in hmms.values()) \
-            + sum(h.n_free_params for h in backoff.values())
+            + sum(h.n_free_params for h in backoff.values()) \
+            + sum(h.n_free_params for h in contexts.values()) \
+            + (global_backoff.n_free_params if global_backoff else 0)
         self.log(f"  {len(hmms)} HMMs, {len(backoff)} backoff model(s), "
+                 f"{len(contexts)} context model(s), "
                  f"{total_params:,} total free params")
 
         self.log("5/5  duration, pitch and voicing models")
@@ -592,6 +803,9 @@ class Trainer:
             normalization={"offset": offset, "scale": scale},
             stats=stats,
             backoff=backoff,
+            contexts=contexts,
+            context_index=context_index,
+            global_backoff=global_backoff,
             metadata={
                 "hms_version": __version__,
                 "vocoder": getattr(self.vocoder, "name", "unknown"),
