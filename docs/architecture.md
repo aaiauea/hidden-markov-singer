@@ -24,12 +24,15 @@ hms.core.hmm + hms.core.gmm        left-to-right HMM, diagonal GMMs
 hms.core.model                     HMSModel.save / load  (model.yaml + npz)
 ```
 
-Synthesis keeps target musical F0 distinct from optional learned prosody:
+Synthesis keeps target musical F0 distinct from optional learned prosody, and an
+external trajectory overrides both:
 
 ```
 score notes ─► target F0 ─────────────────────────────────────────────┐
 score phones ─► hms.core.synthesizer.plan ─► HMM/GMM ─► MLPG ─► sp/ap ├─► WORLD
                                       └─ optional F0 deviation / vibrato ─► F0 ┘
+                                      └─ external F0 (synthesize(f0=…)) ─► F0 ─┘
+                                         (authoritative: replaces, not added)
 ```
 
 ## Why HMM/GMM in 2020s terms
@@ -192,6 +195,25 @@ All sources are followed by clamping into the analysed F0 range so that
 transposing a score beyond the training range degrades audibly but does not
 silently drop the melody.
 
+*External F0 override*: `Synthesizer.synthesize(score, f0=…)` (and the CLI's
+`hms synth --f0-file`) accepts a frame-level F0 trajectory, in Hz, with one
+value per *synthesis frame* of the whole score and `0.0` marking unvoiced
+frames — the same convention `FeatureSpec.encode` and WORLD use. The insert
+point is deliberately narrow: `external_f0_to_semitones` converts the array
+into the representation `PitchModel.generate` returns (semitones re.
+`f0_ref_hz`, `NaN` where unvoiced) and the synthesizer then treats it exactly
+like a generated contour — same clamping, same `FeatureSpec.decode`, same
+vocoder. Because it replaces the generated trajectory rather than feeding into
+it, an external F0 automatically receives no score pitch, no learned deviation,
+no generated vibrato and no `pitch_smoothing`, and nothing about `sp`/`ap`,
+timing or the vocoder interface changes.
+
+The trajectory is never resampled: it must be one value per frame, and anything
+else (wrong length or shape, empty input, non-numeric values, `NaN`/`inf`,
+negative frequencies) is a `ValueError` naming the offending frame index. That
+validation lives in one place, `external_f0_to_semitones`, precisely so the
+vocoder is never handed a trajectory it can only fail on later.
+
 ## 6. Parameter generation (`hms/core/generation.py`)
 
 Classic MLPG: build the window matrix `W` that maps a static trajectory to the
@@ -306,7 +328,9 @@ against its baseline is the usual reason to run it.
 3. `mlpg` — the trajectory.
 4. `denormalize` → static features; voicing from HMM/phoneme statistics;
    target F0 from score notes, with optional acoustic/state-mean deviation and
-   optional vibrato; clamp; decode features to `(f0, sp, ap)`.
+   optional vibrato — or, when `f0=` is passed, that external trajectory
+   instead (validated and converted by `external_f0_to_semitones`); clamp;
+   decode features to `(f0, sp, ap)`.
 5. `vocoder.synthesize` → waveform (written by `wavio.write_wav`, 16-bit by
    default).
 
@@ -365,3 +389,7 @@ neighbour `i`), which keeps the two diphone pools of one bigram distinct.
 * **Expression** — `transpose`, `tempo`, `variance_scale`, `pitch_variation`
   and `Vibrato` are all synthesis-time knobs; adding another one means adding a
   field to `SynthesisConfig` and applying it in one place.
+* **External F0** — `synthesize(score, f0=…)` (CLI: `hms synth --f0-file`)
+  replaces the generated contour. It is deliberately not a `SynthesisConfig`
+  field: the trajectory is render-specific data, not a voice setting, and the
+  whole override is one conversion function plus one branch in `synthesize`.

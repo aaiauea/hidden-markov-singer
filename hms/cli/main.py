@@ -43,6 +43,27 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
+def _load_f0_file(path):
+    """Read an external F0 trajectory: ``.npy``, or text with one Hz per line.
+
+    Unvoiced frames are ``0.0`` (WORLD's convention); ``#`` starts a comment.
+    The frame count itself is checked later, when the render knows how many
+    frames the score produces.
+    """
+    import numpy as np
+
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"F0 file not found: {path}")
+    if path.suffix.lower() == ".npy":
+        return np.load(path)
+    try:
+        return np.loadtxt(path, dtype=np.float64, comments="#", ndmin=1)
+    except ValueError as exc:
+        raise ValueError(f"could not read {path} as one F0 value per line "
+                         f"(in Hz, 0.0 for unvoiced): {exc}") from exc
+
+
 def _load_lib_config(args) -> Dict:
     parameters = load_parameters(getattr(args, "config", None))
     phonemes = load_phoneme_set(getattr(args, "phonemes", None))
@@ -281,11 +302,16 @@ def cmd_synth(args) -> int:
             return 2
         score = labels_module.Score(selected)
 
+    external_f0 = None
+    if getattr(args, "f0_file", None):
+        external_f0 = _load_f0_file(args.f0_file)
+        _log(f"f0 file : {args.f0_file}")
+
     synthesizer = Synthesizer(model, config, log=_log)
     _log(f"model   : {model.name} ({len(model.hmms)} phonemes)")
     _log(f"backend : {synthesizer.vocoder.name}")
     t0 = time.time()
-    result = synthesizer.synthesize(score)
+    result = synthesizer.synthesize(score, f0=external_f0)
     _log(f"rendered {len(score)} utterance(s), {result.duration:.2f} s "
          f"of audio in {time.time() - t0:.1f} s")
     for diagnostic in result.diagnostics:
@@ -626,6 +652,12 @@ def build_parser() -> argparse.ArgumentParser:
                        choices=["score", "acoustic", "state_means"],
                        help="score F0 (default), optional acoustic deviation, "
                             "or separate pitch-model state means")
+    synth.add_argument("--f0-file", default=None,
+                       help="external F0 trajectory (.npy, or text with one "
+                            "value per line): Hz, one value per synthesis "
+                            "frame, 0.0 for unvoiced. Overrides the "
+                            "generated contour, which is never resized, so "
+                            "the file must hold one value per frame")
     synth.add_argument("--duration-mode", default=None,
                        choices=["score", "model"],
                        help="use the score's durations or predict them")
@@ -708,6 +740,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         return int(args.func(args) or 0)
     except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        # bad arguments / malformed input files (e.g. --f0-file) are user
+        # errors, not crashes: report them the same way as a missing file
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:  # pragma: no cover

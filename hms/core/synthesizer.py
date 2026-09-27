@@ -16,6 +16,13 @@ Each stage is independently replaceable:
   the score alone supplies target F0 in the default mode;
 * `hms.vocoder` turns (f0, sp, ap) into samples.
 
+F0 can also be supplied from outside.  Passing ``f0=`` to `synthesize` replaces
+the generated contour outright -- see `external_f0_to_semitones`:
+
+    score / learned pitch / vibrato -> generated F0 --.
+                                                      +--> F0 -> vocoder
+    caller-supplied f0 trajectory --------------------'
+
 Options that matter in practice (all in `SynthesisConfig`):
 
 ``variance_scale``
@@ -38,6 +45,13 @@ Options that matter in practice (all in `SynthesisConfig`):
     ``score`` honours the score's segment boundaries (normal use);
     ``model`` asks the duration model to predict them, for scores that only
     list phonemes and notes.
+
+``f0=`` (argument, not a config field)
+    Optional external F0 trajectory, one value per *synthesis frame* in Hz,
+    with ``0.0`` marking unvoiced frames (WORLD's convention).  When given it
+    is authoritative: the score note, the learned deviation, the generated
+    vibrato and ``pitch_smoothing`` are all skipped for that render.  See
+    `external_f0_to_semitones`.
 """
 
 from __future__ import annotations
@@ -49,7 +63,8 @@ import numpy as np
 
 from hms.core import labels as labels_module
 from hms.core.duration import DurationModel
-from hms.core.features import AcousticFrameSequence
+from hms.core.features import (AcousticFrameSequence, FeatureSpec,
+                              hz_to_semitone)
 from hms.core.generation import mlpg, stack_streams
 from hms.core.model import HMSModel
 
@@ -121,6 +136,103 @@ class SynthesisResult:
     @property
     def duration(self) -> float:
         return float(len(self.audio) / self.params.fs)
+
+
+# --------------------------------------------------------------------------
+# External F0 override
+# --------------------------------------------------------------------------
+
+
+def external_f0_to_semitones(f0, n_frames: int, spec: FeatureSpec
+                             ) -> np.ndarray:
+    """Validate a caller-supplied F0 trajectory and convert it for synthesis.
+
+    Parameters
+    ----------
+    f0 : array-like, shape (n_frames,)
+        Absolute F0 in **Hz**, one value per *synthesis frame* -- the frames
+        `Synthesizer.plan` produces for the whole score, not per-phoneme
+        arrays.  Unvoiced frames use the project's existing WORLD convention:
+        ``0.0`` Hz (anything below ``spec.voiced_threshold`` counts as
+        unvoiced, exactly as in `FeatureSpec.encode`).
+    n_frames : int
+        Number of frames the render will produce.
+    spec : FeatureSpec
+        Supplies the reference frequency and the voicing threshold.
+
+    Returns
+    -------
+    numpy.ndarray
+        The trajectory in the synthesizer's internal representation: absolute
+        F0 in semitones re. ``spec.f0_ref_hz``, with ``NaN`` on unvoiced
+        frames -- the same array `Synthesizer.pitch` returns.
+
+    Notes
+    -----
+    The trajectory is *authoritative*: it is converted, never augmented.
+    Nothing is added on top of it -- no score note, no learned deviation, no
+    generated vibrato -- and it is never resampled, interpolated, truncated or
+    padded: a trajectory that does not line up with the frame sequence is an
+    error, not an approximation.  (Clamping into the model's analysed F0 range
+    still applies, as it does for every other F0 source; clamped frames are
+    reported through `SynthesisResult.diagnostics`.)
+
+    Raises
+    ------
+    ValueError
+        For every malformed input the vocoder could only fail on much later:
+        wrong length, wrong shape, an empty trajectory, non-numeric values,
+        NaN/inf, or negative frequencies.  The message names the offending
+        frame index and says how unvoiced frames are written.
+    """
+    if n_frames <= 0:
+        raise ValueError("external F0: the score produced no frames to align "
+                         "the trajectory to")
+    try:
+        raw = np.asarray(f0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("external F0 must be a 1-D array of numbers, got "
+                         f"{type(f0).__name__}") from exc
+    if raw.dtype.kind not in "fiu":
+        raise ValueError("external F0 must be a 1-D array of real numbers, "
+                         f"got dtype '{raw.dtype}'")
+    values = raw.astype(np.float64)
+    if values.ndim != 1:
+        raise ValueError("external F0 must have exactly one value per "
+                         f"frame (shape ({n_frames},)), got shape "
+                         f"{values.shape}; pass a flat array "
+                         f"(e.g. f0.reshape(-1))")
+    if values.size == 0:
+        raise ValueError("external F0 trajectory is empty; this render "
+                         f"needs {n_frames} frame(s), one value per "
+                         f"frame (0.0 Hz marks an unvoiced frame)")
+    if values.size != n_frames:
+        raise ValueError(
+            f"external F0 has {values.size} frame(s) but the render has "
+            f"{n_frames}; supply exactly one value per synthesis frame -- "
+            f"HMS never resizes, interpolates or pads an explicit F0 "
+            f"trajectory")
+    non_finite = ~np.isfinite(values)
+    if non_finite.any():
+        index = int(np.argmax(non_finite))
+        kind = "NaN" if np.isnan(values[index]) else "infinite"
+        raise ValueError(
+            f"external F0 must be finite: frame {index} is {kind} and "
+            f"{int(non_finite.sum())} of {values.size} frame(s) are "
+            f"non-finite; unvoiced frames are 0.0 Hz, not NaN")
+    negative = values < 0.0
+    if negative.any():
+        index = int(np.argmax(negative))
+        raise ValueError(
+            f"external F0 must be non-negative: frame {index} is "
+            f"{values[index]:.6g} Hz and {int(negative.sum())} of "
+            f"{values.size} frame(s) are negative; unvoiced frames "
+            f"are 0.0 Hz")
+
+    voiced = values >= float(spec.voiced_threshold)
+    return np.where(voiced,
+                    hz_to_semitone(np.maximum(values, 1e-12), spec.f0_ref_hz),
+                    np.nan)
 
 
 class Synthesizer:
@@ -406,7 +518,17 @@ class Synthesizer:
     # -- main entry point --------------------------------------------------
 
     def synthesize(self, score: labels_module.Score,
-                   default_note: float = 60.0) -> SynthesisResult:
+                   default_note: float = 60.0,
+                   f0=None) -> SynthesisResult:
+        """Render `score`.
+
+        ``f0`` is an optional external F0 trajectory (Hz, one value per
+        synthesis frame, 0.0 for unvoiced).  When it is given it replaces the
+        generated contour -- score F0, learned deviation and vibrato are all
+        skipped -- so the caller is the only source of pitch for that render.
+        See `external_f0_to_semitones` for the units, the voicing convention
+        and the validation.  With ``f0=None`` (the default) nothing changes.
+        """
         config = self.config
         spec = self.model.spec
         rng = np.random.default_rng(config.seed)
@@ -426,9 +548,21 @@ class Synthesizer:
         # back out of the normalisation into feature space
         static = self.model.denormalize(trajectory)
 
-        voiced = self.voicing(frame_phones, state_ids)
-        f0_semitones = self.pitch(static, notes, voiced, frame_phones,
-                                  state_ids, segment_ids, rng)
+        if f0 is None:
+            voiced = self.voicing(frame_phones, state_ids)
+            f0_semitones = self.pitch(static, notes, voiced, frame_phones,
+                                      state_ids, segment_ids, rng)
+        else:
+            # External F0 override: the caller's trajectory is authoritative,
+            # so the generated one (score note, learned deviation, vibrato) is
+            # not even computed.  Everything downstream -- clamping, decoding
+            # to WORLD parameters, the vocoder -- is untouched.
+            f0_semitones = external_f0_to_semitones(
+                f0, len(frame_phones), spec)
+            diagnostics.append(
+                f"external F0 override: {len(f0_semitones)} frame(s) "
+                f"supplied by the caller "
+                f"({int(np.isfinite(f0_semitones).sum())} voiced)")
         f0_semitones, clipped = self._clamp_pitch(f0_semitones)
         if clipped:
             diagnostics.append(
@@ -450,7 +584,13 @@ class Synthesizer:
 
 def synthesize(model: HMSModel, score: labels_module.Score,
                config: Optional[SynthesisConfig] = None,
-               default_note: float = 60.0, log=None) -> SynthesisResult:
-    """Functional entry point used by the CLI."""
-    return Synthesizer(model, config, log).synthesize(score,
-                                                      default_note=default_note)
+               default_note: float = 60.0, f0=None,
+               log=None) -> SynthesisResult:
+    """Functional entry point used by the CLI.
+
+    ``f0`` is the optional external F0 trajectory (Hz, one value per synthesis
+    frame, 0.0 for unvoiced) that replaces the generated contour; see
+    `external_f0_to_semitones`.
+    """
+    return Synthesizer(model, config, log).synthesize(
+        score, default_note=default_note, f0=f0)
