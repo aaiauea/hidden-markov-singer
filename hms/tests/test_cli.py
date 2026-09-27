@@ -206,6 +206,55 @@ def test_synth_unknown_utterance_is_reported(tmp_path, demo_dataset, capsys):
     assert "no-such-utterance" in capsys.readouterr().out
 
 
+def test_extract_reports_label_diagnostics(tmp_path, demo_dataset, capsys):
+    """Malformed label rows are explained at the CLI, not lost downstream."""
+    labels = write_subset_labels(demo_dataset, tmp_path / "labels.tsv")
+    text = labels.read_text(encoding="utf-8")
+    text += "bad\trow\n"                           # too few columns
+    labels.write_text(text, encoding="utf-8")
+
+    assert main(["extract", "--labels", str(labels),
+                 "--wav-dir", demo_dataset["wav_dir"],
+                 "--out", str(tmp_path / "params"), "--fs", "22050"]) == 0
+    out = capsys.readouterr().out
+    assert "expected at least 4 columns" in out
+
+
+def test_synth_cli_reports_invalid_midi_score_notes(tmp_path, trained_model,
+                                                    capsys):
+    """MIDI 200 in a score file is rejected with a line number."""
+    model_dir = tmp_path / "model"
+    trained_model.save(model_dir)
+    score = tmp_path / "score.tsv"
+    score.write_text("demo\t0.0\t0.1\tsil\t-\n"
+                     "demo\t0.1\t0.6\ta\t200\n"
+                     "demo\t0.6\t0.7\tsil\t-\n", encoding="utf-8")
+    out_wav = tmp_path / "out.wav"
+    assert main(["synth", "--model", str(model_dir), "--score", str(score),
+                 "--out", str(out_wav), "--vocoder", "builtin"]) == 0
+    out = capsys.readouterr().out
+    assert "line 2" in out
+    assert "[0, 127]" in out
+    assert wavio.audio_info(out_wav)["duration"] > 0
+
+
+def test_synth_cli_warns_about_score_notes_above_the_f0_range(
+        tmp_path, trained_model, capsys):
+    """A valid MIDI note the model cannot produce is warned about."""
+    model_dir = tmp_path / "model"
+    trained_model.save(model_dir)
+    score = tmp_path / "score.tsv"
+    score.write_text("demo\t0.0\t0.1\tsil\t-\n"
+                     "demo\t0.1\t0.6\ta\t127\n"
+                     "demo\t0.6\t0.7\tsil\t-\n", encoding="utf-8")
+    out_wav = tmp_path / "out.wav"
+    assert main(["synth", "--model", str(model_dir), "--score", str(score),
+                 "--out", str(out_wav), "--vocoder", "builtin"]) == 0
+    out = capsys.readouterr().out
+    assert "trained F0 range" in out
+    assert "clamped" in out
+
+
 def test_missing_model_is_a_clean_error(tmp_path, capsys):
     code = main(["inspect-model", "--model", str(tmp_path / "nope")])
     assert code == 2

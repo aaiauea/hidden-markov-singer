@@ -153,6 +153,19 @@ carries its GMM, a log-duration mean/variance and a voicing probability.
 frame indices, and `hmm.segment` maps frames to states. There is no separate
 alignment module because there is no separate alignment problem.
 
+* **Input validation with line numbers.** `labels.py` reports every problem
+  instead of failing downstream or staying silent: unusable rows are dropped
+  with a line-numbered diagnostic (missing columns, empty utterance id or
+  phoneme, non-numeric or non-finite times, negative times, offset before
+  onset, zero-duration segments, non-numeric notes, notes outside the MIDI
+  range 0-127) and unrecognised extra columns (everything after the note
+  column must be `key=value` context) are ignored with a diagnostic. Overlaps
+  *and* gaps between consecutive segments of an utterance are reported per
+  utterance; both stay tolerated (a gap is silence in synthesis and a carried
+  note in training) but are no longer silent. Legitimate labels — contiguous
+  rows, boundary silences, unnoted segments, fractional MIDI detuning,
+  `key=value` context — produce no diagnostics.
+
 ## 4. Duration (`hms/core/duration.py`)
 
 Two jobs:
@@ -194,6 +207,20 @@ default and can be added independently of the target note.
 All sources are followed by clamping into the analysed F0 range so that
 transposing a score beyond the training range degrades audibly but does not
 silently drop the melody.
+
+*Out-of-range notes are named before rendering, not only at the clamp.*
+`plan()` reports the effective notes (score note + transpose, including the
+default note for unnoted segments) that are (a) not valid MIDI numbers — only
+possible via transpose, a `default_note` override or a programmatic score,
+since parsed files are already checked against 0-127 — or (b) valid MIDI
+numbers whose frequency lies outside the model's analysed F0 range
+(`f0_floor`-`f0_ceil`). Training likewise warns about label notes outside
+that range (the extractor can never produce an F0 to match them, so the
+note-relative pitch learned on those segments is off), and
+`default_note` outside the MIDI range is a configuration error. The checks
+never change what is rendered — the clamping semantics are untouched — so
+unusual but legitimate notes (a score note above `f0_ceil`, an exotic
+`default_note`) still sound: clamped, and now named as such.
 
 *External F0 override*: `Synthesizer.synthesize(score, f0=…)` (and the CLI's
 `hms synth --f0-file`) accepts a frame-level F0 trajectory, in Hz, with one
@@ -284,6 +311,11 @@ Off by default; `hms train --context` (or `context.enabled: true` in
 * **Optional global backoff.** `context.global_backoff: true` additionally
   trains one small pooled HMM over every frame, as the last safety net for
   phones nothing else covers.
+* **Zero models is said out loud.** When context modelling is enabled but no
+  observed context clears the thresholds (or the cap is 0), training emits an
+  explicit diagnostic that 0 context models were created and that synthesis
+  will rely on the normal phone/backoff hierarchy; context HMMs are never
+  force-created on insufficient data.
 
 Resolution at synthesis time (`HMSModel.resolve_unit`) follows a fixed
 hierarchy: exact triphone → best-supported one-sided diphone (ties favour the

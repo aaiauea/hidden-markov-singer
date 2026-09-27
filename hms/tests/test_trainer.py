@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from hms.config import training_config_from_parameters
+from hms.core import labels as labels_module
 from hms.core.duration import DurationModel, DurationStats
 from hms.core.labels import Score, Segment, Utterance
 from hms.core.phonemes import PhonemeSet
@@ -79,6 +82,90 @@ def test_training_configuration_rejects_invalid_covariance_and_threshold():
         TrainingConfig(covariance_type="full")
     with pytest.raises(ValueError, match="min_phoneme_frames"):
         TrainingConfig(min_phoneme_frames=0)
+
+
+@pytest.mark.parametrize("bad_note", [-1.0, 128.0, 200.0, float("nan")])
+def test_training_config_rejects_an_absurd_default_note(bad_note):
+    # nan is caught by the generic finiteness check, the rest by the
+    # MIDI-range check; either way it is a ValueError, never silent
+    with pytest.raises(ValueError, match="default_note|finite"):
+        TrainingConfig(default_note=bad_note)
+
+
+@pytest.mark.parametrize("good_note", [0.0, 60.0, 127.0])
+def test_training_config_accepts_a_valid_default_note(good_note):
+    assert TrainingConfig(default_note=good_note).default_note == good_note
+
+
+def _subset_labels(demo_dataset, path, utterance="vowel_scale_a"):
+    """A one-utterance subset of the demo labels."""
+    lines = ["# utt_id\tonset\toffset\tphone\tnote"]
+    for line in Path(demo_dataset["labels"]).read_text(
+            encoding="utf-8").splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        if line.split("\t")[0] == utterance:
+            lines.append(line)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _small_train_config(labels, wav_dir, **overrides):
+    values = dict(label_file=str(labels), wav_dir=str(wav_dir),
+                  fs=22050, fft_size=1024, n_mcep=10, n_band=4,
+                  n_iterations=1, min_phoneme_frames=10, vocoder="builtin")
+    values.update(overrides)
+    return TrainingConfig(**values)
+
+
+def test_notes_outside_the_analysis_f0_range_are_warned(demo_dataset,
+                                                        phoneme_set,
+                                                        tmp_path):
+    """Label notes the extractor can never reach are reported, not silent."""
+    labels = _subset_labels(demo_dataset, tmp_path / "labels.tsv")
+    lines = []
+    for line in labels.read_text(encoding="utf-8").splitlines():
+        if line.startswith("#") or not line.strip():
+            lines.append(line)
+            continue
+        parts = line.split("\t")
+        if parts[-1] not in ("-",):
+            parts[-1] = "127"          # ~12.5 kHz, far above f0_ceil
+        lines.append("\t".join(parts))
+    labels.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    messages = []
+    model = Trainer(_small_train_config(labels, demo_dataset["wav_dir"]),
+                    phoneme_set, log=messages.append).train()
+    assert model.hmms or model.backoff, "the model still trains"
+    joined = "\n".join(messages)
+    assert "outside the analysis F0 range" in joined
+    assert "127" in joined
+
+
+def test_notes_inside_the_analysis_f0_range_produce_no_pitch_warning(
+        demo_dataset, phoneme_set, tmp_path):
+    labels = _subset_labels(demo_dataset, tmp_path / "labels.tsv")
+    messages = []
+    Trainer(_small_train_config(labels, demo_dataset["wav_dir"]),
+            phoneme_set, log=messages.append).train()
+    assert not any("analysis F0 range" in message for message in messages)
+
+
+def test_note_range_warnings_flag_only_the_notes_the_extractor_cannot_reach(
+        phoneme_set):
+    trainer = Trainer(_small_train_config("unused.tsv", "unused-dir"),
+                      phoneme_set)
+    in_range = labels_module.parse("u\t0.0\t0.5\ta\t60\n"
+                                   "u\t0.5\t1.0\ta\t75\n")
+    assert trainer.note_range_warnings(in_range) == []
+    out_of_range = labels_module.parse("u\t0.0\t0.5\ta\t127\n"
+                                       "u\t0.5\t1.0\tsil\t-\n")
+    warnings = trainer.note_range_warnings(out_of_range)
+    assert len(warnings) == 1
+    assert warnings[0].startswith("u:")
+    assert "127" in warnings[0]
+    assert "12544" in warnings[0]
 
 
 @pytest.mark.parametrize("value", [-0.1, float("nan"), "invalid"])

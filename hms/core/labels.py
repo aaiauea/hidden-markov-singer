@@ -24,6 +24,19 @@ file.  Overlaps, gaps and malformed rows are tolerated but reported in
 utterance keeps the previous note and the utterance's first phoneme, because
 the label layer has no notion of silence -- callers that do (`Trainer`,
 `Synthesizer`) insert explicit silence for uncovered frames.
+
+Validation policy
+-----------------
+Every problem is a *diagnostic with a line number*, never a crash and never
+silence: rows that cannot be used are dropped and explained (missing
+columns, empty utterance id or phoneme, non-numeric or non-finite times,
+negative times, offset before onset, zero-duration segments, non-numeric
+notes, notes outside the MIDI range 0-127); unrecognised extra columns
+(everything after the note column must be ``key=value`` context) are ignored
+and explained.  Overlaps *and* gaps between consecutive segments of an
+utterance are reported per utterance.  Nothing that is a legitimate HMS label
+(contiguous rows, boundary silences, unnoted segments, fractional MIDI
+detuning, ``key=value`` context columns) produces a diagnostic.
 """
 
 from __future__ import annotations
@@ -36,6 +49,13 @@ import numpy as np
 
 #: Symbols that mean "no note".
 NO_NOTE = {"-", "", "nan", "none", "rest"}
+
+#: Valid range of MIDI note numbers.  Parsed scores are checked against it;
+#: the *model's* supported pitch range is wider in meaning (it is the
+#: analysed F0 floor/ceiling, in Hz) and is checked at training/synthesis
+#: time, not here -- a file parser has no model to ask.
+MIDI_NOTE_MIN = 0.0
+MIDI_NOTE_MAX = 127.0
 
 
 def midi_to_hz(note: float) -> float:
@@ -200,6 +220,10 @@ def parse(text: str, time_unit: str = "seconds",
             continue
         name, onset, offset, phone = (parts[0].strip(), parts[1].strip(),
                                       parts[2].strip(), parts[3].strip())
+        if not name:
+            diagnostics.append(
+                f"line {lineno}: empty utterance id -- dropped")
+            continue
         note_raw = parts[4].strip().lower() if len(parts) > 4 else "-"
         if not phone:
             diagnostics.append(f"line {lineno}: empty phoneme symbol -- dropped")
@@ -214,9 +238,19 @@ def parse(text: str, time_unit: str = "seconds",
             diagnostics.append(f"line {lineno}: time columns must be finite "
                                f"({onset!r}, {offset!r}) -- dropped")
             continue
-        if end <= start:
-            diagnostics.append(f"line {lineno}: non-positive duration "
-                               f"({end - start:+.4f}) -- dropped")
+        if start < 0.0 or end < 0.0:
+            diagnostics.append(f"line {lineno}: time columns must be "
+                               f"non-negative ({onset!r}, {offset!r}) -- "
+                               f"dropped")
+            continue
+        if end < start:
+            diagnostics.append(
+                f"line {lineno}: offset {offset!r} is before onset {onset!r} "
+                f"(negative duration {end - start:+.4f}) -- dropped")
+            continue
+        if end == start:
+            diagnostics.append(f"line {lineno}: zero-duration segment "
+                               f"(onset == offset == {onset!r}) -- dropped")
             continue
         start, end = start * time_scale, end * time_scale
 
@@ -230,16 +264,28 @@ def parse(text: str, time_unit: str = "seconds",
                 diagnostics.append(f"line {lineno}: bad MIDI note {note_raw!r} "
                                    "-- dropped")
                 continue
-            if not np.isfinite(note) or not 0.0 <= note <= 127.0:
-                diagnostics.append(f"line {lineno}: MIDI note must be finite "
-                                   f"and in [0, 127], got {note_raw!r} -- dropped")
+            if (not np.isfinite(note)
+                    or not MIDI_NOTE_MIN <= note <= MIDI_NOTE_MAX):
+                diagnostics.append(
+                    f"line {lineno}: MIDI note must be finite and in "
+                    f"[{MIDI_NOTE_MIN:g}, {MIDI_NOTE_MAX:g}], got "
+                    f"{note_raw!r} -- dropped")
                 continue
 
         context: Dict[str, str] = {}
         for extra in parts[5:]:
             if "=" in extra:
                 key, value = extra.split("=", 1)
-                context[key] = value
+                if key:
+                    context[key] = value
+                else:
+                    diagnostics.append(
+                        f"line {lineno}: malformed context column {extra!r} "
+                        f"(expected key=value) -- ignored")
+            else:
+                diagnostics.append(
+                    f"line {lineno}: unrecognised extra column {extra!r} "
+                    f"(columns after the note must be key=value) -- ignored")
 
         utterance = by_name.get(name)
         if utterance is None:
@@ -258,6 +304,16 @@ def parse(text: str, time_unit: str = "seconds",
                     f"{utterance.name}: overlap between {previous.phone} "
                     f"({previous.start:.3f}-{previous.end:.3f}) and "
                     f"{current.phone} ({current.start:.3f}-{current.end:.3f})")
+            elif current.start > previous.end + 1e-9:
+                diagnostics.append(
+                    f"{utterance.name}: gap of "
+                    f"{current.start - previous.end:.3f} s between "
+                    f"{previous.phone} "
+                    f"({previous.start:.3f}-{previous.end:.3f}) "
+                    f"and {current.phone} "
+                    f"({current.start:.3f}-{current.end:.3f}); uncovered "
+                    f"frames are filled (carried note for labels, silence "
+                    f"for synthesis)")
     return Score(utterances, diagnostics)
 
 

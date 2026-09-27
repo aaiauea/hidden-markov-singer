@@ -16,6 +16,7 @@ import pytest
 
 from hms.cli.main import main
 from hms.config import load_parameters, training_config_from_parameters
+from hms.core import labels as labels_module
 from hms.core.context import (CONTEXT_SEPARATOR, GLOBAL_KEY, KIND_LEFT,
                               KIND_RIGHT, KIND_TRIPHONE, context_keys,
                               context_wildcard, left_diphone_key,
@@ -23,6 +24,7 @@ from hms.core.context import (CONTEXT_SEPARATOR, GLOBAL_KEY, KIND_LEFT,
                               triphone_key)
 from hms.core.features import FeatureSpec
 from hms.core.hmm import LeftToRightHMM
+from hms.core.labels import Score, Segment, Utterance
 from hms.core.model import MODEL_FORMAT_VERSION, HMSModel
 from hms.core.phonemes import PhonemeSet
 from hms.core.synthesizer import SynthesisConfig, Synthesizer
@@ -503,6 +505,70 @@ def test_context_disabled_keeps_the_classic_path(trained_model, short_score):
     assert trained_model.global_backoff is None
     result = synthesizer.synthesize(short_score)
     assert np.isfinite(result.audio).all()
+
+
+def _tiny_context_trainer(demo_dataset, phoneme_set, tmp_path, **overrides):
+    labels = write_subset_labels(demo_dataset, tmp_path / "labels.tsv")
+    values = dict(label_file=str(labels), wav_dir=demo_dataset["wav_dir"],
+                  fs=22050, fft_size=1024, n_mcep=10, n_band=4,
+                  n_iterations=1, min_phoneme_frames=10, vocoder="builtin",
+                  context_enabled=True)
+    values.update(overrides)
+    return TrainingConfig(**values)
+
+
+def test_context_enabled_but_corpus_too_small_reports_zero_context_models(
+        demo_dataset, phoneme_set, tmp_path):
+    """--context on insufficient data must say so, not pretend."""
+    config = _tiny_context_trainer(demo_dataset, phoneme_set, tmp_path,
+                                   context_min_frames=1_000_000,
+                                   context_min_occurrences=99)
+    messages = []
+    model = Trainer(config, phoneme_set, log=messages.append).train()
+
+    # the fallback behaviour is exactly what an uncontexted model does
+    assert model.contexts == {}
+    assert model.context_index == {}
+    assert model.global_backoff is None
+    assert model.hmms, "the phoneme models are still trained"
+
+    joined = "\n".join(messages)
+    assert "0 context models" in joined
+    assert "phone/backoff hierarchy" in joined
+
+    # ...and synthesis really does rely on the normal hierarchy
+    tiny = Score([Utterance("t", [Segment("a", 0.0, 0.3, note=60.0),
+                                  Segment("sil", 0.3, 0.4)])])
+    result = Synthesizer(model, SynthesisConfig(seed=0,
+                                                vocoder="builtin")
+                         ).synthesize(tiny)
+    assert len(result.audio) > 0
+    assert np.isfinite(result.audio).all()
+
+
+def test_context_cap_of_zero_also_reports_zero_context_models(
+        demo_dataset, phoneme_set, tmp_path):
+    config = _tiny_context_trainer(demo_dataset, phoneme_set, tmp_path,
+                                   context_min_frames=1,
+                                   context_min_occurrences=1,
+                                   context_max_models=0)
+    messages = []
+    model = Trainer(config, phoneme_set, log=messages.append).train()
+    assert model.contexts == {}
+    joined = "\n".join(messages)
+    assert "0 context models" in joined
+    assert "cap 0" in joined
+
+
+def test_no_zero_context_diagnostic_when_contexts_are_created(
+        demo_dataset, phoneme_set, tmp_path):
+    config = _tiny_context_trainer(demo_dataset, phoneme_set, tmp_path,
+                                   context_min_frames=10,
+                                   context_min_occurrences=1)
+    messages = []
+    model = Trainer(config, phoneme_set, log=messages.append).train()
+    assert model.contexts, "sanity: this corpus does clear the thresholds"
+    assert not any("0 context models" in message for message in messages)
 
 
 # --------------------------------------------------------------------------

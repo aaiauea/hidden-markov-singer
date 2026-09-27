@@ -153,6 +153,13 @@ class TrainingConfig:
             raise ValueError("n_mcep must be >= 2 and n_band must be >= 2")
         if not np.isfinite(self.default_note):
             raise ValueError("default_note must be finite")
+        if not (labels_module.MIDI_NOTE_MIN <= self.default_note
+                <= labels_module.MIDI_NOTE_MAX):
+            raise ValueError(
+                "default_note must be a MIDI note in "
+                f"[{labels_module.MIDI_NOTE_MIN:g}, "
+                f"{labels_module.MIDI_NOTE_MAX:g}], "
+                f"got {self.default_note!r}")
         if not np.isfinite(self.pitch_variation) or self.pitch_variation < 0:
             raise ValueError("pitch_variation must be finite and non-negative")
         if self.duration_variance_scale < 0:
@@ -705,6 +712,44 @@ class Trainer:
         return {"rate_hz": float(np.median(rates)),
                 "depth_semitones": float(np.median(depths))}
 
+    # -- input validation --------------------------------------------------
+
+    def note_range_warnings(self, score: labels_module.Score) -> List[str]:
+        """Diagnostics for score notes outside the analysis F0 range.
+
+        F0 is only ever *estimated* within ``f0_floor``-``f0_ceil`` (Hz), so a
+        label note beyond that boundary can never match any extracted F0 and
+        the note-relative pitch learned on that segment is wrong by the whole
+        difference.  The notes are kept -- they may be valid MIDI numbers the
+        singer or the extractor simply cannot produce; the point is to say so
+        instead of training on silently garbage features.  Unnoted segments
+        are checked against ``default_note``.
+        """
+        low_hz, high_hz = self.config.f0_floor, self.config.f0_ceiling
+        low_midi = float(labels_module.hz_to_midi(low_hz))
+        high_midi = float(labels_module.hz_to_midi(high_hz))
+        warnings: List[str] = []
+        for utterance in score:
+            out_of_range: set = set()
+            for segment in utterance.segments:
+                note = (segment.note if segment.note is not None
+                        else self.config.default_note)
+                if note < low_midi or note > high_midi:
+                    out_of_range.add(round(float(note), 4))
+            if out_of_range:
+                listing = ", ".join(
+                    f"{value:g} ({labels_module.midi_to_hz(value):.0f} Hz)"
+                    for value in sorted(out_of_range)[:5])
+                if len(out_of_range) > 5:
+                    listing += f", ... ({len(out_of_range)} notes)"
+                warnings.append(
+                    f"{utterance.name}: note(s) {listing} outside the "
+                    f"analysis F0 range ({low_hz:g}-{high_hz:g} Hz, "
+                    f"MIDI {low_midi:.0f}-{high_midi:.0f}); F0 estimation "
+                    f"is bounded by that range, so the note-relative pitch "
+                    f"learned for those segments will be off")
+        return warnings
+
     # -- driver ------------------------------------------------------------
 
     def train(self) -> HMSModel:
@@ -717,6 +762,8 @@ class Trainer:
                                    frame_period=config.frame_period)
         for diagnostic in score.diagnostics:
             self.log(f"  ! {diagnostic}")
+        for warning in self.note_range_warnings(score):
+            self.log(f"  ! {warning}")
         corpus = Corpus(score, Path(config.wav_dir or "."),
                         config.audio_extensions)
         missing = corpus.missing_audio()
@@ -766,6 +813,18 @@ class Trainer:
                      f"cap {config.context_max_models})")
             contexts, context_index = self.train_contexts(
                 occurrences, selected, seed_base)
+            if not contexts:
+                # Don't let the run look like contextual modelling happened:
+                # the fallback hierarchy (phone -> class -> global backoff)
+                # is what synthesis will actually use.
+                self.log(
+                    "  ! context modelling is enabled but 0 context models "
+                    "were created: no observed context met the support "
+                    f"thresholds (>= {config.context_min_frames} pooled "
+                    f"frames, >= {config.context_min_occurrences} "
+                    f"occurrences, cap {config.context_max_models}); "
+                    "synthesis will rely on the normal phone/backoff "
+                    "hierarchy")
             if config.context_global_backoff:
                 global_backoff = self.build_global_backoff(
                     phoneme_features, phoneme_voiced,
