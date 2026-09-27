@@ -120,7 +120,9 @@ def test_incompatible_model_format_is_refused_not_guessed(
     Format 2 changed how the spectral envelope is sampled, so a format-1 file's
     cepstral coefficients mean something different -- loading one silently
     would render the wrong timbre rather than fail.  The version check must
-    reject both directions (older and newer) before any array is used.
+    reject unsupported versions (older format 1 and newer ones) before any
+    array is used; format 2 remains a supported legacy version (see the
+    dedicated compatibility test).
     """
     directory = tmp_path / "model"
     trained_model.save(directory)
@@ -137,6 +139,29 @@ def test_incompatible_model_format_is_refused_not_guessed(
         with pytest.raises(ValueError) as excinfo:
             HMSModel.load(broken)
         assert str(wrong) in str(excinfo.value)
+
+
+def test_format_2_models_still_load_without_contexts(trained_model, tmp_path):
+    """Format-2 loading compatibility: a pre-context model loads unchanged.
+
+    The context feature is additive (format 3 adds an optional `context.npz`
+    plus index sections), so a model whose payload is format 2 must load with
+    an empty context tier instead of being refused.
+    """
+    directory = tmp_path / "model"
+    trained_model.save(directory)
+    text = (directory / "model.yaml").read_text(encoding="utf-8")
+    (directory / "model.yaml").write_text(
+        text.replace(f"format_version: {MODEL_FORMAT_VERSION}",
+                     "format_version: 2"), encoding="utf-8")
+
+    loaded = HMSModel.load(directory)
+    assert loaded.loaded_format_version == 2
+    assert loaded.contexts == {}
+    assert loaded.context_index == {}
+    assert loaded.global_backoff is None
+    assert loaded.n_free_params == trained_model.n_free_params
+    assert loaded.get_or_backoff("a") is loaded.get_hmm("a")
 
 
 def test_model_yaml_is_human_readable(trained_model, tmp_path):

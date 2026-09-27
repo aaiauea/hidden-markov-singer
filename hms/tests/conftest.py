@@ -57,6 +57,24 @@ def trained_model(demo_dataset, phoneme_set):
 
 
 @pytest.fixture(scope="session")
+def trained_context_model(demo_dataset, phoneme_set):
+    """A model trained with sparse phoneme-context modelling enabled.
+
+    Same corpus and acoustic budget as `trained_model`, plus context HMMs for
+    the observed phone contexts and the optional global backoff -- used to
+    exercise the context selection, serialisation and evaluation paths.
+    """
+    config = TrainingConfig(
+        label_file=demo_dataset["labels"], wav_dir=demo_dataset["wav_dir"],
+        fs=TEST_FS, fft_size=TEST_FFT, n_mcep=20, n_band=5, use_delta=True,
+        n_iterations=1, min_phoneme_frames=10, seed=0,
+        context_enabled=True, context_min_frames=100,
+        context_min_occurrences=3, context_max_models=24,
+        context_global_backoff=True)
+    return Trainer(config, phoneme_set).train()
+
+
+@pytest.fixture(scope="session")
 def score(demo_dataset):
     """The whole demo score (18 phrases, ~32 s of audio)."""
     return labels_module.load(demo_dataset["score"])

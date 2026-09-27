@@ -132,6 +132,11 @@ class Synthesizer:
         self.config = config or SynthesisConfig()
         self.log = log or (lambda message: None)
         self._vocoder = None
+        #: Per-frame resolved HMMs from the last `plan` call, populated only
+        #: when the model carries sparse context HMMs; lets
+        #: `frame_statistics`/`voicing` use exactly the units `plan` chose
+        #: without changing the six-value plan() API.
+        self._frame_units = None
 
     @property
     def vocoder(self):
@@ -161,6 +166,10 @@ class Synthesizer:
         notes: List[float] = []
         segment_frames: List[int] = []
         diagnostics: List[str] = []
+        #: resolved HMM per frame (context-aware models only); keeps the
+        #: public plan() return signature unchanged.
+        frame_units = [] if self.model.contexts else None
+        self._frame_units = None
         next_segment_id = 0
         duration_rng = np.random.default_rng(config.seed)
 
@@ -188,9 +197,24 @@ class Synthesizer:
                     segments.append((phone, max(1, hi - lo), note))
                     previous_end = hi
 
-            for phone, frames, note in segments:
-                hmm = self.model.get_or_backoff(phone)
-                if self.model.get_hmm(phone) is None:
+            # Context neighbourhood: the sibling segments of this utterance;
+            # utterance edges use the inventory's existing silence symbol --
+            # there are no BOS/EOS tokens.
+            segment_phones = [self.model.phoneme_set.canonical(phone)
+                              for phone, _frames, _note in segments]
+            silence = self.model.phoneme_set.silence
+            for seg_index, (phone, frames, note) in enumerate(segments):
+                if self.model.contexts:
+                    pre = segment_phones[seg_index - 1] if seg_index > 0 \
+                        else silence
+                    post = segment_phones[seg_index + 1] \
+                        if seg_index < len(segments) - 1 else silence
+                    _key, hmm, tier = self.model.resolve_unit(pre, phone, post)
+                else:
+                    hmm = self.model.get_or_backoff(phone)
+                    tier = None
+                if self.model.get_hmm(phone) is None \
+                        and tier in (None, "class", "global"):
                     diagnostics.append(
                         f"{utterance.name}: phoneme {phone!r} is not in the "
                         f"model; using the backoff model")
@@ -201,9 +225,12 @@ class Synthesizer:
                     segment_ids.extend([next_segment_id] * int(count))
                     notes.extend([default_note if note is None else float(note)]
                                  * int(count))
+                    if frame_units is not None:
+                        frame_units.extend([hmm] * int(count))
                 segment_frames.append(int(sum(counts)))
                 next_segment_id += 1
 
+        self._frame_units = frame_units
         note_per_frame = np.asarray(notes, dtype=np.float64)
         if self.config.transpose:
             note_per_frame = note_per_frame + float(self.config.transpose)
@@ -222,15 +249,20 @@ class Synthesizer:
 
         means = np.zeros((n_frames, dim), dtype=np.float64)
         variances = np.zeros((n_frames, dim), dtype=np.float64)
-        cache: Dict[Tuple[str, int], Tuple[np.ndarray, np.ndarray]] = {}
+        cache: Dict[Tuple[object, int], Tuple[np.ndarray, np.ndarray]] = {}
         use_dominant = self.config.mixture == "dominant"
+        units = self._active_frame_units(n_frames)
 
         for t in range(n_frames):
             phone = frame_phones[t]
             state = int(state_ids[t])
-            key = (phone, state)
-            if key not in cache:
+            if units is not None:
+                hmm = units[t]
+                key = (id(hmm), state)
+            else:
                 hmm = self.model.get_or_backoff(phone)
+                key = (phone, state)
+            if key not in cache:
                 state = min(state, hmm.n_states - 1)
                 gmm = hmm.states[state].gmm
                 cache[key] = gmm.predictive_mean(1.0, use_dominant=use_dominant)
@@ -244,12 +276,24 @@ class Synthesizer:
 
     # -- voicing and pitch -------------------------------------------------
 
+    def _active_frame_units(self, n_frames: int) -> Optional[List]:
+        """The per-frame HMMs chosen by `plan`, when context models apply.
+
+        ``None`` means: resolve per phoneme exactly as before (`get_or_backoff`).
+        """
+        units = self._frame_units
+        if units is not None and len(units) == n_frames:
+            return units
+        return None
+
     def voicing(self, frame_phones: Sequence[str], state_ids: Sequence[int]
                 ) -> np.ndarray:
         """Per-frame voiced mask from the learned state/phone statistics."""
         voiced = np.zeros(len(frame_phones), dtype=bool)
+        units = self._active_frame_units(len(frame_phones))
         for t, (phone, state) in enumerate(zip(frame_phones, state_ids)):
-            hmm = self.model.get_or_backoff(phone)
+            hmm = units[t] if units is not None \
+                else self.model.get_or_backoff(phone)
             state = min(int(state), hmm.n_states - 1)
             probability = hmm.states[state].voiced_prob
             definition = self.model.phoneme_set.resolve(phone)

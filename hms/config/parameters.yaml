@@ -49,6 +49,21 @@ training:
   time_unit: seconds        # how to read the label file's time columns
   seed: 0
 
+context:
+  # Optional sparse phoneme-context modelling (off by default; enable with
+  # `hms train --context`). Only contexts OBSERVED in the corpus are modelled
+  # -- never a full triphone inventory. Each context HMM is trained directly
+  # from the pooled raw feature sequences of its occurrences, and resolution
+  # falls back: exact triphone -> best-supported one-sided diphone (ties go
+  # left) -> dedicated phone HMM -> phone-class backoff -> optional global
+  # backoff. Utterance edges use the ordinary `sil` symbol, no BOS/EOS.
+  enabled: false
+  min_frames: 100           # minimum pooled frames for a context HMM
+  min_occurrences: 3        # minimum occurrences for a context HMM
+  max_models: 64            # cap on context HMMs (best-supported are kept)
+  partial: true             # also train left/right one-sided diphone contexts
+  global_backoff: false     # train a pooled catch-all backoff HMM
+
 synthesis:
   # Scales the *delta* (dynamic) variances.  >1 trusts the deltas less, so the
   # trajectory follows the frame-by-frame means more literally (livelier, more
