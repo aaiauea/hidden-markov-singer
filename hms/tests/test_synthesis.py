@@ -94,21 +94,25 @@ def test_transposing_the_score_moves_the_pitch_one_for_one(trained_model):
         assert np.median(np.abs(deviations)) < 1.0
 
 
-def test_pitch_outside_the_analysed_range_is_clamped_and_reported(
+def test_pitch_outside_the_analysed_range_is_sung_at_the_requested_f0(
         trained_model):
+    """A note above the trained range keeps its pitch instead of the ceiling."""
     from hms.core.labels import Score, Utterance, Segment
 
     score = Score([Utterance(name="high", segments=[
         Segment("a", 0.0, 0.5, note=60.0)])])
     result = render(trained_model, score, transpose=36.0)   # ~2000 Hz
+    spec = trained_model.spec
     assert (result.params.f0 > 0).all()
+    assert spec.f0_ceil < 2000.0
     assert np.median(result.params.f0) == pytest.approx(
-        trained_model.spec.f0_ceil, rel=0.01)
+        labels_module.midi_to_hz(96.0), rel=1e-6)
     assert any("F0 range" in message for message in result.diagnostics)
 
 
-def test_absurd_midi_note_warns_and_is_clamped_not_sung_absurd(trained_model):
-    """MIDI 200 is not a MIDI note: it must be named, not rendered silently."""
+def test_absurd_midi_note_is_named_and_sang_at_the_nearest_valid_note(
+        trained_model):
+    """MIDI 200 is not a MIDI note: it must be named, and normalised."""
     from hms.core.labels import Score, Utterance, Segment
 
     score = Score([Utterance(name="absurd", segments=[
@@ -118,11 +122,14 @@ def test_absurd_midi_note_warns_and_is_clamped_not_sung_absurd(trained_model):
     assert "MIDI" in joined
     assert "200" in joined
     assert "absurd" in joined
-    # the clamping still does its job: no absurd frequency reaches the audio
+    # it is not a musical note, so it is sung at the highest one there is --
+    # and at no other frequency: the old "clamp into the F0 range" answer
+    # would have rendered it at f0_ceil instead
     voiced = result.params.f0[result.params.f0 > 0]
     assert voiced.size > 0
-    assert voiced.max() <= trained_model.spec.f0_ceil + 1.0
-    assert voiced.min() >= trained_model.spec.f0_floor - 1.0
+    assert voiced.max() == pytest.approx(
+        labels_module.midi_to_hz(labels_module.MIDI_NOTE_MAX), rel=1e-6)
+    assert voiced.max() > trained_model.spec.f0_ceil
 
 
 def test_transpose_beyond_the_valid_midi_range_is_named(trained_model):
@@ -133,13 +140,14 @@ def test_transpose_beyond_the_valid_midi_range_is_named(trained_model):
     result = render(trained_model, score, transpose=140.0)  # 60 -> 200
     joined = "\n".join(result.diagnostics)
     assert "MIDI" in joined                 # the note-level warning
-    assert "F0 range" in joined             # the existing clamp report stays
+    assert "F0 range" in joined             # the out-of-trained-range report
     voiced = result.params.f0[result.params.f0 > 0]
-    assert voiced.max() <= trained_model.spec.f0_ceil + 1.0
+    assert voiced.max() == pytest.approx(
+        labels_module.midi_to_hz(127.0), rel=1e-6)
 
 
 def test_note_beyond_the_trained_f0_range_is_warned(trained_model):
-    """A valid MIDI note above the model's F0 range: warned, then clamped."""
+    """A valid MIDI note above the model's F0 range: warned, then sung as asked."""
     from hms.core.labels import Score, Utterance, Segment
 
     score = Score([Utterance(name="high", segments=[

@@ -8,6 +8,13 @@
         -> voicing mask from the HMM state probabilities
         -> WORLD parameters -> waveform
 
+F0 and the spectral envelope are separate all the way through. The model
+supplies the envelope (and aperiodicity) for a phoneme state; the score or the
+caller supplies the pitch; the vocoder is handed both. An F0 outside the range
+the model was trained on therefore costs you the *statistics* of that pitch, not
+the pitch itself: the boundary acoustic region is reused and the requested F0
+reaches the vocoder unchanged. See `_out_of_range_pitch_diagnostics`.
+
 Each stage is independently replaceable:
 
 * `hms.core.duration.DurationModel.allocate` decides the state sequence;
@@ -64,7 +71,7 @@ import numpy as np
 from hms.core import labels as labels_module
 from hms.core.duration import DurationModel
 from hms.core.features import (AcousticFrameSequence, FeatureSpec,
-                              hz_to_semitone)
+                              hz_to_semitone, semitone_to_hz)
 from hms.core.generation import mlpg, stack_streams
 from hms.core.model import HMSModel
 
@@ -173,9 +180,9 @@ def external_f0_to_semitones(f0, n_frames: int, spec: FeatureSpec
     Nothing is added on top of it -- no score note, no learned deviation, no
     generated vibrato -- and it is never resampled, interpolated, truncated or
     padded: a trajectory that does not line up with the frame sequence is an
-    error, not an approximation.  (Clamping into the model's analysed F0 range
-    still applies, as it does for every other F0 source; clamped frames are
-    reported through `SynthesisResult.diagnostics`.)
+    error, not an approximation. Its values are used exactly as supplied,
+    including frequencies outside the model's trained F0 range, which are
+    reported through `SynthesisResult.diagnostics` rather than altered.
 
     Raises
     ------
@@ -274,10 +281,12 @@ class Synthesizer:
         ``check_pitch_range`` (default) adds one diagnostic per utterance
         when an *effective* note -- score note + transpose, including the
         default note for unnoted segments -- is not a valid MIDI number or
-        falls outside the model's trained F0 range.  Parsed scores are
-        already within the MIDI range, so this is what catches ``--transpose``
-        and programmatic notes; it is skipped when an external F0 trajectory
-        replaces the score pitch entirely.
+        falls outside the model's trained F0 range, and normalises the former
+        to the nearest valid MIDI note (see `_valid_midi_notes`). Parsed
+        scores are already within the MIDI range, so this is what catches
+        ``--transpose`` and programmatic notes; it is skipped when an external
+        F0 trajectory replaces the score pitch entirely, because then the notes
+        are not rendered at all.
         """
         config = self.config
         spec = self.model.spec
@@ -361,8 +370,53 @@ class Synthesizer:
         note_per_frame = np.asarray(notes, dtype=np.float64)
         if self.config.transpose:
             note_per_frame = note_per_frame + float(self.config.transpose)
+        if check_pitch_range:
+            # Only meaningful when the score drives the pitch: an external F0
+            # trajectory replaces it, so the notes are not rendered at all and
+            # saying anything about them would be noise.
+            note_per_frame = self._valid_midi_notes(note_per_frame,
+                                                    diagnostics)
         return (frame_phones, state_ids, segment_ids, note_per_frame,
                 segment_frames, diagnostics)
+
+    @staticmethod
+    def _valid_midi_notes(notes: np.ndarray, diagnostics: List[str]
+                          ) -> np.ndarray:
+        """Normalise the notes that are not MIDI notes at all.
+
+        MIDI 0-127 is the *format's* range, not the model's: a note outside it
+        names no musical pitch at all and can only arrive through `transpose`,
+        a `default_note` override or a programmatic score (parsed label files
+        are already checked). Such a note is rendered at the nearest valid one
+        and reported, which keeps every rendered frequency below Nyquist.
+
+        Notes *inside* the MIDI range are never touched here, however far their
+        frequency is from the model's trained range -- see
+        `_out_of_range_pitch_diagnostics`.
+        """
+        notes = np.asarray(notes, dtype=np.float64)
+        finite = np.isfinite(notes)
+        invalid = finite & ((notes < labels_module.MIDI_NOTE_MIN)
+                            | (notes > labels_module.MIDI_NOTE_MAX))
+        if not invalid.any():
+            return notes
+        offending = np.unique(notes[invalid])
+
+        def describe(value: float) -> str:
+            nearest = float(np.clip(value, labels_module.MIDI_NOTE_MIN,
+                                    labels_module.MIDI_NOTE_MAX))
+            return (f"{value:g} -> {nearest:g} "
+                    f"(~{labels_module.midi_to_hz(nearest):.0f} Hz)")
+
+        listing = ", ".join(describe(value) for value in offending[:5])
+        if len(offending) > 5:
+            listing += f", ... ({int(invalid.sum())} frame(s))"
+        diagnostics.append(
+            f"note(s) {listing} are outside the valid MIDI range "
+            f"[{labels_module.MIDI_NOTE_MIN:g}, {labels_module.MIDI_NOTE_MAX:g}]; "
+            f"they are rendered at the nearest valid MIDI note")
+        return np.where(invalid, np.clip(notes, labels_module.MIDI_NOTE_MIN,
+                                         labels_module.MIDI_NOTE_MAX), notes)
 
     @staticmethod
     def _note_range_diagnostics(utterance_name: str,
@@ -370,17 +424,18 @@ class Synthesizer:
                                                      Optional[float]]],
                                 default_note: float, transposition: float,
                                 spec: FeatureSpec) -> List[str]:
-        """Name the notes that cannot be what they ask for.
+        """Name the notes the model has no observation for.
 
         Two distinct problems, two distinct messages:
 
         * an effective note outside the valid MIDI range 0-127 (only possible
           via transpose / default note / programmatic scores, since parsed
-          files are already checked) is clearly invalid input;
-        * a valid MIDI note whose frequency lies outside the model's analysed
-          F0 range (``f0_floor``-``f0_ceil``) is unusual but may be
-          legitimate -- it is warned about, and the existing clamping keeps
-          it audible.  Neither changes any synthesis result.
+          files are already checked) is not a musical note at all; it is
+          normalised to the nearest valid one by `_valid_midi_notes`;
+        * a *valid* MIDI note whose frequency lies outside the model's trained
+          F0 range (``f0_floor``-``f0_ceil``) is perfectly legitimate -- the
+          model simply has no observation there -- so it is warned about and
+          then rendered at exactly the requested pitch.
         """
         low_hz, high_hz = spec.f0_floor, spec.f0_ceil
         low_midi = float(labels_module.hz_to_midi(low_hz))
@@ -407,8 +462,8 @@ class Synthesizer:
                 f"transpose {transposition:+g}, incl. the default note "
                 f"{default_note:g} for unnoted segments) are outside the "
                 f"valid MIDI range [{labels_module.MIDI_NOTE_MIN:g}, "
-                f"{labels_module.MIDI_NOTE_MAX:g}]; they will be clamped "
-                f"into the model's F0 range ({low_hz:g}-{high_hz:g} Hz)")
+                f"{labels_module.MIDI_NOTE_MAX:g}]; they are not musical "
+                f"notes and are rendered at the nearest valid MIDI note")
         if beyond_range:
             listing = ", ".join(
                 f"{value:g} (~{labels_module.midi_to_hz(value):.0f} Hz)"
@@ -418,8 +473,9 @@ class Synthesizer:
             diagnostics.append(
                 f"{utterance_name}: note(s) {listing} fall outside the "
                 f"model's trained F0 range ({low_hz:g}-{high_hz:g} Hz, "
-                f"MIDI {low_midi:.0f}-{high_midi:.0f}); they will be "
-                f"clamped to the edge of that range")
+                f"MIDI {low_midi:.0f}-{high_midi:.0f}); the model has no "
+                f"observation at that pitch, so they are rendered at the "
+                f"requested F0 using the boundary acoustic statistics")
         return diagnostics
 
     # -- per-frame statistics ---------------------------------------------
@@ -555,25 +611,52 @@ class Synthesizer:
             f0 = self._smooth_nan(f0, int(config.pitch_smoothing))
         return f0
 
-    def _clamp_pitch(self, f0_semitones: np.ndarray
-                     ) -> Tuple[np.ndarray, int]:
-        """Keep F0 inside the analysed range.
+    def _out_of_range_pitch_diagnostics(self, f0_semitones: np.ndarray
+                                         ) -> List[str]:
+        """Name the frames whose F0 the model has no observation for.
 
-        Notes above the ceiling (easy to reach by transposing) would otherwise
-        be decoded as unvoiced frames -- the vocoder has no spectral envelope
-        up there and the model was never trained on them -- which sounds like
-        the top of the melody dropping out.  Clamping keeps the note audible
-        and reports it instead.
+        The model is not *queried by F0*. Its per-(phoneme, state) statistics
+        are a mel-cepstrum spectral envelope and a band aperiodicity: a
+        description of the vocal tract, not of a particular pitch, learned from
+        whatever frames the singer happened to sing that phone on. So for an
+        F0 outside the trained range there is no second, better envelope to
+        interpolate towards -- the nearest acoustic region HMS has *is* the
+        boundary one it just used, and reusing it is the Sinsy rule ("use the
+        closest observed F0's acoustic parameters") reduced to what this
+        architecture can actually express.
+
+        What is *not* reused is the F0 itself. The requested pitch is passed
+        through to `FeatureSpec.decode` and from there to the vocoder verbatim,
+        so a note above `f0_ceil` is sung at its own frequency instead of
+        sliding down to the ceiling. This reports the situation and changes
+        nothing.
         """
         spec = self.model.spec
         low = 12.0 * np.log2(max(spec.f0_floor, 1e-3) / spec.f0_ref_hz)
         high = 12.0 * np.log2(spec.f0_ceil / spec.f0_ref_hz)
         voiced = np.isfinite(f0_semitones)
-        clamped = np.where(voiced, np.clip(f0_semitones, low, high),
-                           f0_semitones)
-        count = int(np.sum(voiced & ((f0_semitones < low)
-                                     | (f0_semitones > high))))
-        return clamped, count
+        if not voiced.any():
+            return []
+        below = voiced & (f0_semitones < low)
+        above = voiced & (f0_semitones > high)
+        if not (below.any() or above.any()):
+            return []
+
+        def hz(values: np.ndarray) -> np.ndarray:
+            return semitone_to_hz(values, spec.f0_ref_hz)
+
+        reach: List[str] = []
+        if below.any():
+            reach.append(f"down to {float(hz(f0_semitones[below]).min()):.1f} Hz")
+        if above.any():
+            reach.append(f"up to {float(hz(f0_semitones[above]).max()):.1f} Hz")
+        return [
+            f"{int(below.sum() + above.sum())} of {int(voiced.sum())} voiced "
+            f"frame(s) request F0 outside the model's trained F0 range "
+            f"{spec.f0_floor:.0f}-{spec.f0_ceil:.0f} Hz ({', '.join(reach)}); "
+            f"the boundary acoustic statistics for those frames are reused "
+            f"unchanged and the requested F0 is preserved"
+        ]
 
     @staticmethod
     def _smooth_nan(values: np.ndarray, width: int) -> np.ndarray:
@@ -629,19 +712,16 @@ class Synthesizer:
         else:
             # External F0 override: the caller's trajectory is authoritative,
             # so the generated one (score note, learned deviation, vibrato) is
-            # not even computed.  Everything downstream -- clamping, decoding
-            # to WORLD parameters, the vocoder -- is untouched.
+            # not even computed. Everything downstream -- decoding to WORLD
+            # parameters, the vocoder -- is untouched, and the supplied F0 is
+            # used exactly as given, trained range or not.
             f0_semitones = external_f0_to_semitones(
                 f0, len(frame_phones), spec)
             diagnostics.append(
                 f"external F0 override: {len(f0_semitones)} frame(s) "
                 f"supplied by the caller "
                 f"({int(np.isfinite(f0_semitones).sum())} voiced)")
-        f0_semitones, clipped = self._clamp_pitch(f0_semitones)
-        if clipped:
-            diagnostics.append(
-                f"{clipped} frame(s) fell outside the model's F0 range "
-                f"({spec.f0_floor:.0f}-{spec.f0_ceil:.0f} Hz) and were clamped")
+        diagnostics.extend(self._out_of_range_pitch_diagnostics(f0_semitones))
 
         parameters = spec.decode(static, f0_semitones=f0_semitones)
         audio = self.vocoder.synthesize(parameters)

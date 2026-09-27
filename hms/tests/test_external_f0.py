@@ -203,15 +203,32 @@ def test_a_scalar_is_rejected_rather_than_broadcast(trained_model):
         render(trained_model, score, f0=220.0)
 
 
-def test_out_of_range_frames_are_clamped_and_reported(trained_model):
-    """The one thing that is *not* verbatim: the model's analysed F0 range."""
+def test_out_of_range_frames_are_sung_as_supplied_and_reported(trained_model):
+    """Outside the trained range is not a reason to alter the trajectory."""
     score = held_note_score()
     trajectory = np.full(frame_count(trained_model, score), 2000.0)
 
     result = render(trained_model, score, f0=trajectory)
 
-    assert np.allclose(result.params.f0, trained_model.spec.f0_ceil, rtol=1e-9)
+    assert np.allclose(result.params.f0, 2000.0, rtol=1e-9)
+    assert result.params.f0.max() > trained_model.spec.f0_ceil
     assert any("F0 range" in message for message in result.diagnostics)
+
+
+def test_a_malformed_trajectory_is_still_rejected_when_out_of_range(
+        trained_model):
+    """OOV handling must not weaken the validation in any direction."""
+    score = held_note_score()
+    n_frames = frame_count(trained_model, score)
+    with pytest.raises(ValueError, match=r"external F0 has \d+ frame\(s\) but "
+                                         r"the render has \d+"):
+        render(trained_model, score, f0=np.full(n_frames + 1, 5000.0))
+    with pytest.raises(ValueError, match="non-negative"):
+        render(trained_model, score,
+               f0=np.concatenate([[-1.0], np.full(n_frames - 1, 5000.0)]))
+    with pytest.raises(ValueError, match="must be finite"):
+        render(trained_model, score,
+               f0=np.concatenate([[np.nan], np.full(n_frames - 1, 5000.0)]))
 
 
 # --------------------------------------------------------------------------

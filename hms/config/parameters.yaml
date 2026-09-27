@@ -30,6 +30,10 @@ acoustic:
   use_delta: true
   use_delta2: false
   delta_window: 2
+  # Analysis search range of the F0 estimator.  These are NOT a limit on what
+  # may be synthesised: a score note (or an --f0-file value) outside this range
+  # is rendered at the frequency it asks for, using the nearest trained
+  # spectral envelope, and reported in the diagnostics.
   f0_floor: 71.0
   f0_ceil: 800.0
   f0_estimation: dio        # "dio" (fast) or "harvest" (robust, slower)
