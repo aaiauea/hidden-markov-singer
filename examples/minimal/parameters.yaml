@@ -1,0 +1,27 @@
+# Ordinary HMS configuration; omitted settings use the library defaults.
+acoustic:
+  fs: 22050
+  frame_period_ms: 5.0
+  n_mcep: 12
+  n_band: 3
+  use_delta: true
+  use_delta2: false
+  vocoder: builtin
+
+training:
+  n_iterations: 2
+  training_method: viterbi
+  min_phoneme_frames: 20
+  time_unit: seconds
+  seed: 0
+
+synthesis:
+  vocoder: builtin
+  duration_mode: score
+  f0_source: score
+  seed: 0
+
+pitch:
+  vibrato:
+    enabled: false
+  vibrato_estimate_from_data: false

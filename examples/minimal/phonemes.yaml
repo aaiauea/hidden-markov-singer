@@ -1,0 +1,7 @@
+# Small budgets for the only two phones present in this example.
+defaults:
+  vowel: {n_states: 3, n_components: 1, voiced: true, can_hold_note: true}
+  silence: {n_states: 1, n_components: 1, voiced: false, can_hold_note: false}
+phonemes:
+  a: {type: vowel}
+  sil: {type: silence}

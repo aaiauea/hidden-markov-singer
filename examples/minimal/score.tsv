@@ -1,0 +1,6 @@
+# utt_id	onset	offset	phone	note
+song	0.000	0.100	sil	-
+song	0.100	0.550	a	60
+song	0.550	0.650	sil	-
+song	0.650	1.100	a	64
+song	1.100	1.200	sil	-
