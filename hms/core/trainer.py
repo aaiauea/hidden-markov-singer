@@ -29,6 +29,23 @@ The defaults are chosen so that a handful of sung phrases trains a usable voice:
   *within* different notes, which is what makes a small pitch range generalise;
 * by default all phonemes share one covariance style and one mixture size per
   class -- no per-phoneme tuning.
+
+Optional tiers
+--------------
+Two opt-in tiers sit on top of the per-phoneme models and reuse this pipeline
+rather than adding a second one:
+
+* sparse phoneme contexts (``context_enabled``, see `hms.core.context`): extra
+  HMMs for the phone contexts the corpus actually shows;
+* pitch conditioning (``pitch_conditioning_enabled``, see
+  `hms.core.pitch_condition`): the same units additionally split by the pitch
+  bin of the note each observation was sung on.  It changes *which pool* an
+  observation trains, never how a pool is fitted, and it leaves F0 generation
+  alone -- the score still supplies the pitch.
+
+Both are off by default, both keep the corpus disk-backed (buckets hold views
+into the temporary feature cache, never copies of it), and both leave every
+other tier bit-identical when they are off.
 """
 
 from __future__ import annotations
@@ -52,6 +69,9 @@ from hms.core.hmm import LeftToRightHMM
 from hms.core.model import HMSModel, ModelStats
 from hms.core.phonemes import PhonemeSet
 from hms.core.pitch import PitchModel, PitchStats, note_relative_pitch
+from hms.core.pitch_condition import (DEFAULT_BIN_SIZE, KIND_PHONE,
+                                      PitchConditioning, bin_note_bounds,
+                                      segment_pitch_bin, validate_bin_size)
 from hms.data import wavio
 from hms.vocoder import get_vocoder
 
@@ -113,6 +133,14 @@ class TrainingConfig:
     #: train a pooled catch-all backoff HMM as the last fallback
     context_global_backoff: bool = False
 
+    # -- optional pitch-conditioned acoustic models (off by default) -------
+    #: EXPERIMENTAL: additionally train/resolve acoustic HMMs per pitch bin of
+    #: the scored note (see `hms.core.pitch_condition`).  Off by default; it
+    #: changes nothing about F0 generation, which stays score-driven.
+    pitch_conditioning_enabled: bool = False
+    #: width of a pitch bin, in semitones (6 = a tritone, two bins per octave)
+    pitch_conditioning_bin_size: int = DEFAULT_BIN_SIZE
+
     def __post_init__(self) -> None:
         numeric_values = (self.n_iterations, self.min_phoneme_frames,
                           self.var_floor_ratio, self.fs, self.frame_period,
@@ -171,6 +199,10 @@ class TrainingConfig:
             raise ValueError("context_min_occurrences must be at least 1")
         if self.context_max_models < 0:
             raise ValueError("context_max_models must be non-negative")
+        # normalises e.g. 6.0 -> 6 and rejects anything that is not a whole
+        # number of semitones inside the supported range
+        self.pitch_conditioning_bin_size = validate_bin_size(
+            self.pitch_conditioning_bin_size)
 
     @classmethod
     def from_dict(cls, data: Dict) -> "TrainingConfig":
@@ -233,6 +265,11 @@ class UtteranceData:
     phones: Optional[List[str]] = None
     notes: Optional[np.ndarray] = None
     note_semitones: Optional[np.ndarray] = None
+    #: Scored note per entry of ``phoneme_spans`` (``None`` where the label has
+    #: none).  One float per segment, so it costs nothing next to the frames;
+    #: it is what optional pitch conditioning groups observations by.  Optional
+    #: for older callers, which then simply carry no pitch condition.
+    span_notes: Optional[List[Optional[float]]] = None
 
 
 @dataclass
@@ -244,6 +281,7 @@ class _UtteranceAnalysis:
     voiced: np.ndarray
     relative_pitch: np.ndarray
     phoneme_spans: List[Tuple[str, int, int]]
+    span_notes: List[Optional[float]] = field(default_factory=list)
 
 
 @dataclass
@@ -260,6 +298,8 @@ class _CachedUtterance:
     voiced_path: Path
     phoneme_spans: List[Tuple[str, int, int]]
     n_frames: int
+    #: Scored note per entry of ``phoneme_spans`` (see `UtteranceData`).
+    span_notes: List[Optional[float]] = field(default_factory=list)
 
 
 class Trainer:
@@ -336,13 +376,18 @@ class Trainer:
         static = spec.encode(sequence.f0, sequence.sp, sequence.ap)
         # Dimension 0 carries note-relative pitch instead of absolute pitch.
         static[:, 0] = relative
-        spans = [(phone, lo, hi) for phone, lo, hi, _note
-                 in labels_module.segment_boundaries(utterance,
-                                                     spec.frame_period,
-                                                     n_frames=n_frames)]
+        boundaries = labels_module.segment_boundaries(
+            utterance, spec.frame_period, n_frames=n_frames)
+        spans = [(phone, lo, hi) for phone, lo, hi, _note in boundaries]
+        # The scored note of each segment travels with its span.  It is the
+        # only pitch condition HMS uses -- the stable musical note, never a
+        # measured per-frame F0 -- and optional pitch conditioning is the only
+        # consumer, so it costs one float per segment.
+        span_notes = [note for _phone, _lo, _hi, note in boundaries]
         return _UtteranceAnalysis(
             f0=sequence.f0, static_features=static, voiced=voiced,
-            relative_pitch=relative, phoneme_spans=spans)
+            relative_pitch=relative, phoneme_spans=spans,
+            span_notes=span_notes)
 
     def analyse_corpus(self, corpus: Corpus) -> List[UtteranceData]:
         """WORLD analysis + label alignment for every utterance.
@@ -372,6 +417,7 @@ class Trainer:
                 relative_pitch=analysis.relative_pitch,
                 features=features,
                 phoneme_spans=analysis.phoneme_spans,
+                span_notes=analysis.span_notes,
                 diagnostics=[d for d in corpus.score.diagnostics
                               if d.startswith(utterance.name)]))
             self.log(f"  analysed {utterance.name}: {n_frames} frames "
@@ -450,7 +496,8 @@ class Trainer:
             relative_pitch_path=cache_dir / f"{stem}.pitch.npy",
             voiced_path=cache_dir / f"{stem}.voiced.npy",
             phoneme_spans=analysis.phoneme_spans,
-            n_frames=n_frames)
+            n_frames=n_frames,
+            span_notes=analysis.span_notes)
 
         np.save(static_path, static)
         np.save(record.voiced_path, analysis.voiced)
@@ -880,6 +927,231 @@ class Trainer:
                  f"{total_frames} pooled frames")
         return hmm
 
+    # -- stage 3c: optional pitch-conditioned acoustic models --------------
+
+    @staticmethod
+    def _span_note(span_notes: Optional[Sequence[Optional[float]]],
+                   index: int) -> Optional[float]:
+        """The scored note of one span, or ``None`` when it carries none.
+
+        Tolerates callers that build utterance data without notes (older code
+        paths and hand-made test data), which then simply contribute no pitch
+        condition instead of an invented one.
+        """
+        if not span_notes or index >= len(span_notes):
+            return None
+        return span_notes[index]
+
+    def _pitch_span_units(self, spans: Sequence[Tuple[str, int, int]],
+                          span_notes: Optional[Sequence[Optional[float]]],
+                          features: np.ndarray, voiced: np.ndarray,
+                          context_units: Optional[Sequence[str]] = None):
+        """Yield ``(unit, kind, curr, bin, feature view, voiced view)``.
+
+        One entry per (segment, unit) pair that carries a pitch condition, in
+        label order.  ``features``/``voiced`` are whole-utterance arrays -- a
+        memory map in the cached training path -- and what is yielded are
+        *slices* of them, so grouping observations by pitch bin copies nothing.
+
+        Units are the current phone plus, when ``context_units`` is given, the
+        contexts of this occurrence that actually earned their own HMM: a
+        pitch-conditioned context bucket is a subset of that context's data, so
+        contexts the corpus did not support are not conditioned either.
+        """
+        config = self.config
+        canonical = self.phoneme_set.canonical
+        silence = self.phoneme_set.silence
+        bin_size = config.pitch_conditioning_bin_size
+        wildcard = context_wildcard(self.phoneme_set.phonemes) \
+            if context_units else None
+        indexed = [(canonical(phone), lo, hi, self._span_note(span_notes, i))
+                   for i, (phone, lo, hi) in enumerate(spans) if hi > lo]
+        for position, (curr, lo, hi, note) in enumerate(indexed):
+            # The condition is the *scored note* of the segment, never its
+            # measured F0: silence, unnoted segments and invalid notes carry no
+            # condition at all (see `hms.core.pitch_condition`).
+            pitch = segment_pitch_bin(curr, note, self.phoneme_set, bin_size)
+            if pitch is None:
+                continue
+            units = [(curr, KIND_PHONE)]
+            if context_units:
+                pre = indexed[position - 1][0] if position > 0 else silence
+                post = indexed[position + 1][0] \
+                    if position < len(indexed) - 1 else silence
+                for key, kind in context_keys(
+                        pre, curr, post, wildcard,
+                        partial=config.context_partial):
+                    if key in context_units:
+                        units.append((key, kind))
+            for unit, kind in units:
+                yield unit, kind, curr, pitch, features[lo:hi], voiced[lo:hi]
+
+    def _accumulate_pitch_occurrences(
+            self, occurrences: Dict[Tuple[str, int], Dict[str, object]],
+            spans: Sequence[Tuple[str, int, int]],
+            span_notes: Optional[Sequence[Optional[float]]],
+            features: np.ndarray, voiced: np.ndarray,
+            context_units: Optional[Sequence[str]] = None) -> None:
+        """Pool one utterance's conditioned spans into ``occurrences``."""
+        for unit, kind, curr, pitch, feature_view, voiced_view \
+                in self._pitch_span_units(spans, span_notes, features, voiced,
+                                          context_units):
+            entry = occurrences.get((unit, pitch))
+            if entry is None:
+                entry = {"kind": kind, "unit": unit, "curr": curr,
+                         "pitch_bin": pitch, "features": [], "voiced": []}
+                occurrences[(unit, pitch)] = entry
+            entry["features"].append(feature_view)
+            entry["voiced"].append(voiced_view)
+
+    def _collect_cached_pitch_data(
+            self, utterances: Sequence[_CachedUtterance],
+            context_units: Optional[Sequence[str]] = None
+            ) -> Dict[Tuple[str, int], Dict[str, object]]:
+        """Group pitch-conditioned buckets over the disk-backed cache.
+
+        One utterance is mapped at a time and only its slices are kept, so a
+        corpus is never resident in memory because it was split by pitch bin:
+        the buckets hold views into the same temporary ``.npy`` files the phone
+        and context tiers use.
+        """
+        occurrences: Dict[Tuple[str, int], Dict[str, object]] = {}
+        for data in utterances:
+            if not data.n_frames:
+                continue
+            feature_matrix = np.load(data.features_path, mmap_mode="r")
+            voiced_frames = np.load(data.voiced_path, mmap_mode="r")
+            self._accumulate_pitch_occurrences(
+                occurrences, data.phoneme_spans, data.span_notes,
+                feature_matrix, voiced_frames, context_units)
+            del feature_matrix, voiced_frames
+        return occurrences
+
+    def collect_pitch_data(self, utterances: Sequence[UtteranceData],
+                           offset: np.ndarray, scale: np.ndarray,
+                           context_units: Optional[Sequence[str]] = None
+                           ) -> Dict[Tuple[str, int], Dict[str, object]]:
+        """Group frames by ``(unit, pitch bin)`` for in-memory utterance data.
+
+        Returns a mapping ``(unit key, bin) -> entry`` where ``entry`` holds the
+        unit ``kind`` (``phone``, ``triphone``, ``left``, ``right``), the unit
+        key itself, the ``curr`` phone, the ``pitch_bin`` and the pooled raw
+        feature/voicing sequences of every occurrence.  This is the analysis
+        counterpart of `_collect_cached_pitch_data`, used wherever utterances
+        are already in memory (evaluation, tests).
+        """
+        occurrences: Dict[Tuple[str, int], Dict[str, object]] = {}
+        for data in utterances:
+            normalized = self.normalize_features(data.features, offset, scale)
+            self._accumulate_pitch_occurrences(
+                occurrences, data.phoneme_spans, data.span_notes, normalized,
+                np.asarray(data.voiced, dtype=bool), context_units)
+        return occurrences
+
+    def select_pitch_models(self, occurrences: Dict[Tuple[str, int],
+                                                    Dict[str, object]]
+                            ) -> List[Tuple[str, int]]:
+        """Pick which pitch-conditioned buckets get their own HMM.
+
+        The support philosophy of the tier each bucket conditions, unchanged: a
+        phone-conditioned bucket must clear `min_phoneme_frames` (what a
+        dedicated phone model must clear), and a context-conditioned bucket must
+        clear `context_min_frames` and `context_min_occurrences`.  A pitch bin
+        holds a *subset* of its unit's frames, so earning a conditioned model is
+        never easier than earning the unconditioned one -- and a bucket that
+        falls short is simply not created, leaving synthesis on the ordinary
+        hierarchy instead of on a model fitted to a handful of frames.
+
+        Ordering is deterministic: frames descending, occurrences descending,
+        unit key ascending, bin ascending.
+        """
+        config = self.config
+        candidates: List[Tuple[int, int, str, int]] = []
+        for (unit, pitch), entry in occurrences.items():
+            sequences = entry["features"]
+            frames = int(sum(len(s) for s in sequences))
+            count = len(sequences)
+            if entry["kind"] == KIND_PHONE:
+                if frames < config.min_phoneme_frames:
+                    continue
+            elif frames < config.context_min_frames \
+                    or count < config.context_min_occurrences:
+                continue
+            candidates.append((-frames, -count, unit, int(pitch)))
+        candidates.sort()
+        return [(unit, pitch) for _frames, _count, unit, pitch in candidates]
+
+    def train_pitch_models(self, occurrences: Dict[Tuple[str, int],
+                                                   Dict[str, object]],
+                           selected: Sequence[Tuple[str, int]], seed_base: int
+                           ) -> Tuple[Dict[Tuple[str, int], LeftToRightHMM],
+                                      Dict[Tuple[str, int], dict]]:
+        """Train one HMM per selected ``(unit, pitch bin)`` bucket.
+
+        This adds no estimator: each bucket is fitted with the same
+        `LeftToRightHMM.train` call the phone, context and backoff tiers use, so
+        iterations, variance floors, covariance tying, voicing statistics and
+        seed handling are identical -- the pitch condition only decides *which
+        pool* an observation lands in.  The state/component budget follows the
+        current phone's definition, and feature normalisation stays the single
+        corpus-wide one: a pitch bin is a model-selection condition, not a new
+        feature space, so bins remain comparable and MLPG sees one geometry.
+        """
+        config = self.config
+        models: Dict[Tuple[str, int], LeftToRightHMM] = {}
+        index: Dict[Tuple[str, int], dict] = {}
+        for position, key in enumerate(selected):
+            entry = occurrences[key]
+            sequences = entry["features"]
+            voiced = entry["voiced"]
+            total_frames = int(sum(len(s) for s in sequences))
+            curr = entry["curr"]
+            definition = self.phoneme_set.resolve(curr)
+            if definition is not None:
+                requested_states = definition.n_states
+                n_components = definition.n_components
+            else:
+                defaults = self.phoneme_set.defaults.get("unvoiced_consonant", {})
+                requested_states = int(defaults.get("n_states", 2))
+                n_components = int(defaults.get("n_components", 1))
+            n_states = min(requested_states, max(1, total_frames // 2))
+            hmm = LeftToRightHMM(
+                n_states=n_states, allow_skip=config.allow_skip,
+                covariance_type=config.covariance_type)
+            hmm.train(sequences, n_components=n_components,
+                      covariance_type=config.covariance_type,
+                      n_iterations=config.n_iterations,
+                      var_floor_ratio=config.var_floor_ratio,
+                      seed=seed_base + position,
+                      method=config.training_method, voiced=voiced)
+            unit, pitch = key
+            low, high = bin_note_bounds(pitch,
+                                        config.pitch_conditioning_bin_size)
+            models[key] = hmm
+            # The record carries the notes its bin stands for, so model.yaml
+            # describes the conditioning on its own -- no training
+            # configuration needed to read it back.
+            index[key] = {
+                "kind": entry["kind"],
+                "unit": unit,
+                "curr": curr,
+                "pitch_bin": int(pitch),
+                "note_min": low,
+                "note_max": high,
+                "frames": total_frames,
+                "occurrences": len(sequences),
+                "n_states": hmm.n_states,
+                "n_components": hmm.states[0].gmm.n_components,
+                "covariance": hmm.covariance_type,
+                "allow_skip": bool(hmm.allow_skip),
+                "n_free_params": hmm.n_free_params,
+            }
+            self.log(f"  pitch {unit:18s} bin {pitch:<3d} "
+                     f"(MIDI {low:3d}-{high:3d}) {hmm.n_states} states x "
+                     f"{hmm.states[0].gmm.n_components} comp, "
+                     f"{total_frames} frames / {len(sequences)} occ")
+        return models, index
+
     # -- stage 4: duration and pitch ---------------------------------------
 
     def build_duration_model(self, durations: Dict[str, List[float]]
@@ -1168,18 +1440,58 @@ class Trainer:
                 global_backoff = self.build_global_backoff(
                     phoneme_features, phoneme_voiced,
                     seed=seed_base + len(contexts))
+            # Only the trained context keys are needed from here on, so the
+            # pooled views go before the next (optional) pass maps the cache.
+            del context_occurrences
+            context_occurrences = None
+
+        # The next stages reopen one utterance at a time, so discard all the
+        # per-phone mmap views before anything else accumulates.
+        del phoneme_features, phoneme_voiced, context_occurrences
+
+        # Optional pitch-conditioned acoustic models (off by default).  They
+        # form a tier *above* the ones trained so far -- a bucket is a subset of
+        # its unit's frames -- and their seeds sit past the context block, so
+        # enabling the feature never perturbs the other tiers.
+        pitch_models: Dict[Tuple[str, int], LeftToRightHMM] = {}
+        pitch_index: Dict[Tuple[str, int], dict] = {}
+        pitch_conditioning = PitchConditioning(
+            enabled=bool(config.pitch_conditioning_enabled),
+            bin_size=config.pitch_conditioning_bin_size)
+        if config.pitch_conditioning_enabled:
+            pitch_seed_base = config.seed + 10_000 * (len(backoff) + 1)
+            # Contexts that never earned their own HMM are not conditioned
+            # either: their pitch buckets would hold even less data.
+            conditioned_contexts = tuple(sorted(contexts)) or None
+            pitch_occurrences = self._collect_cached_pitch_data(
+                utterances, conditioned_contexts)
+            selected_pitch = self.select_pitch_models(pitch_occurrences)
+            self.log(f"  {pitch_conditioning.describe()}; "
+                     f"{len(pitch_occurrences)} (unit, bin) buckets observed, "
+                     f"{len(selected_pitch)} selected "
+                     f"(phone buckets >= {config.min_phoneme_frames} frames, "
+                     f"context buckets >= {config.context_min_frames} frames "
+                     f"and >= {config.context_min_occurrences} occurrences)")
+            pitch_models, pitch_index = self.train_pitch_models(
+                pitch_occurrences, selected_pitch, pitch_seed_base)
+            del pitch_occurrences
+            if not pitch_models:
+                self.log(
+                    "  ! pitch conditioning is enabled but 0 pitch-conditioned "
+                    "models were created: no (phone or trained context, pitch "
+                    "bin) bucket met its support threshold, or no segment "
+                    "carried a scored note; synthesis will rely on the normal "
+                    "phone/context/backoff hierarchy")
 
         total_params = sum(h.n_free_params for h in hmms.values()) \
             + sum(h.n_free_params for h in backoff.values()) \
             + sum(h.n_free_params for h in contexts.values()) \
+            + sum(h.n_free_params for h in pitch_models.values()) \
             + (global_backoff.n_free_params if global_backoff else 0)
         self.log(f"  {len(hmms)} HMMs, {len(backoff)} backoff model(s), "
                  f"{len(contexts)} context model(s), "
+                 f"{len(pitch_models)} pitch-conditioned model(s), "
                  f"{total_params:,} total free params")
-
-        # The next stage reopens one utterance at a time, so discard all the
-        # per-phone mmap views and context indexes before computing pitch stats.
-        del phoneme_features, phoneme_voiced, context_occurrences
 
         self.log("5/5  duration, pitch and voicing models")
         duration_model = self.build_duration_model(durations)
@@ -1209,6 +1521,9 @@ class Trainer:
             contexts=contexts,
             context_index=context_index,
             global_backoff=global_backoff,
+            pitch_models=pitch_models,
+            pitch_index=pitch_index,
+            pitch_conditioning=pitch_conditioning,
             metadata={
                 "hms_version": __version__,
                 "vocoder": getattr(self.vocoder, "name", "unknown"),

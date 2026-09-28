@@ -68,6 +68,36 @@ context:
   partial: true             # also train left/right one-sided diphone contexts
   global_backoff: false     # train a pooled catch-all backoff HMM
 
+pitch_conditioning:
+  # EXPERIMENTAL optional tier, off by default (enable with
+  # `hms train --pitch-conditioning`). When enabled the acoustic HMMs are
+  # additionally split by the pitch bin of the note each observation was sung
+  # on, so a phone can be rendered from the spectral distribution learned in
+  # that pitch region instead of one averaged over the voice's whole range.
+  #
+  # What it does NOT do: F0 still comes from the score -- this is model
+  # *selection*, never a second pitch predictor -- and the feature layout,
+  # normalisation, MLPG, the vocoder and the vibrato/deviation options are all
+  # untouched.
+  #
+  # A bin is floor(MIDI note / bin_size), computed in exact integer arithmetic,
+  # so equal notes always share a bin and boundaries are deterministic: with
+  # bin_size 6 (a tritone) MIDI 60-65 is bin 10 and MIDI 66-71 is bin 11.
+  # Segments with no scored note (silence, rests, unvoiced-only spans) carry no
+  # condition, and the inventory's silence phone is never conditioned.
+  #
+  # Conditioning makes data sparse: a bucket only becomes a model when it clears
+  # the same support thresholds as the tier it conditions
+  # (training.min_phoneme_frames for a phone, context.min_frames and
+  # context.min_occurrences for a trained context). Missing buckets are not an
+  # error -- synthesis prefers a pitch-conditioned model when one exists and
+  # otherwise falls back through the ordinary hierarchy (exact context ->
+  # partial context -> phone -> class backoff -> global backoff), and says how
+  # many frames took each path. This is an experimental modelling option to
+  # evaluate on your own corpus, not a claim of better audio.
+  enabled: false
+  bin_size: 6               # semitones per pitch bin (whole number, 1-128)
+
 synthesis:
   # Scales the *delta* (dynamic) variances.  >1 trusts the deltas less, so the
   # trajectory follows the frame-by-frame means more literally (livelier, more

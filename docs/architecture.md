@@ -15,11 +15,14 @@ hms.vocoder.*                       WORLD (native | pyworld | builtin)
       ▼
 compact feature vectors            [0] note-relative F0, [1:] mcep + ap bands
       │  hms.core.trainer           normalise, collect per phoneme, train HMMs
+      │                             (+ optional tiers: phone contexts, and the
+      │                              same units per pitch bin of the scored note)
       ▼
 hms.core.hmm + hms.core.gmm        left-to-right HMM, diagonal GMMs
       │
       ├── hms.core.duration         per-phoneme log-normal durations + allocation
       ├── hms.core.pitch            optional state-mean pitch statistics + vibrato
+      ├── hms.core.pitch_condition  optional deterministic pitch bins (selection)
       ▼
 hms.core.model                     HMSModel.save / load  (model.yaml + npz)
 ```
@@ -30,9 +33,11 @@ external trajectory overrides both:
 ```
 score notes ─► target F0 ─────────────────────────────────────────────┐
 score phones ─► hms.core.synthesizer.plan ─► HMM/GMM ─► MLPG ─► sp/ap ├─► WORLD
-                                      └─ optional F0 deviation / vibrato ─► F0 ┘
-                                      └─ external F0 (synthesize(f0=…)) ─► F0 ─┘
-                                         (authoritative: replaces, not added)
+   │                          └─ optional F0 deviation / vibrato ─► F0 ┘
+   │                          └─ external F0 (synthesize(f0=…)) ─► F0 ─┘
+   │                             (authoritative: replaces, not added)
+   └─► optional pitch bin (score note, not generated F0) ─► *which* HMM/GMM
+                                                              is used
 ```
 
 ## Why HMM/GMM in 2020s terms
@@ -204,6 +209,14 @@ can be *measured* from the training data (`estimate_vibrato` finds the dominant
 3–9 Hz component of the longest sustained note). Vibrato is disabled by
 default and can be added independently of the target note.
 
+This module is everything about *what pitch is produced*. The optional
+pitch-conditioned acoustic models (§7) are the opposite direction and never
+touch it: they use the scored note to choose *which spectral HMM* a phone is
+rendered from, leave dimension 0 (note-relative F0) and the whole F0 path
+exactly as they are, and introduce no second pitch predictor. Enabling both
+together means the note still comes from the score while the envelope comes from
+the pitch region the corpus observed that note in.
+
 ### Out-of-training-range F0
 
 `f0_floor`-`f0_ceil` bound the F0 **analyser** (DIO/Harvest) that produced the
@@ -295,8 +308,10 @@ read label file → analyse every utterance (WORLD) → per-frame phoneme/note l
 → pooled per phoneme-class backoff models for phonemes with too little data
 → optional (context.enabled): sparse HMMs for the observed phone contexts,
   plus an optional pooled global backoff
+→ optional (pitch_conditioning.enabled): the same units re-bucketed by pitch
+  bin of the scored note
 → duration model (per phoneme) → pitch model (per phoneme/state) → voicing
-→ HMSModel (spec, hmms, backoff, contexts, normalisation, stats, metadata)
+→ HMSModel (spec, hmms, backoff, contexts, pitch models, normalisation, stats)
 ```
 
 `min_phoneme_frames` (default 20) is the guard rail: a phoneme below it does
@@ -305,7 +320,14 @@ feature sequences of *all* known phones in that class, including under-threshold
 phones; each frame contributes once, so a common phone naturally contributes
 more than a rare one. Backoff GMM components are never formed by averaging
 component indices from separately trained phone models. The parameter report
-shows dedicated, context, class-backoff and global-backoff budgets separately.
+shows dedicated, context, pitch-conditioned, class-backoff and global-backoff
+budgets separately.
+
+Both optional tiers are separate passes over the same disk-backed cache: one
+utterance is memory-mapped at a time and every bucket keeps *views* into it
+rather than copies, so neither splitting a corpus by phone context nor by pitch
+bin puts the corpus in RAM. The caches are released before the duration and
+pitch models reopen them.
 
 ### Optional sparse phone contexts (`context.enabled: true`)
 
@@ -350,23 +372,176 @@ With contexts disabled every code path is bit-identical to the classic
 pipeline, and models stay format-compatible (contexts are an additive format-3
 payload; format-2 models load with an empty context tier).
 
+When pitch conditioning is also enabled, three conditioned rungs are tried
+*before* this hierarchy (next subsection); with conditioning disabled
+`resolve_unit` ignores its optional `pitch_bin` argument and behaves exactly as
+above.
+
+### Optional pitch-conditioned acoustic models
+(`pitch_conditioning.enabled: true`, experimental)
+
+Off by default; `hms train --pitch-conditioning [--pitch-bin-size N]` (or the
+`pitch_conditioning:` block in `parameters.yaml`) adds a tier of acoustic HMMs
+for *(unit, pitch bin)* pairs. The motivation is that a pooled phone model mixes
+observations from every pitch the corpus contains, so the envelope it emits for
+`a` is an average across the voice's range. This feature lets the corpus say how
+`a` looked *in that pitch region*, without changing anything about how pitch is
+generated.
+
+**The condition (`hms/core/pitch_condition.py`).** A bin is
+`floor(MIDI note / bin_size)` with `bin_size` in semitones (default 6, i.e. a
+tritone — two bins per octave). The computation is exact integer arithmetic:
+the note is quantised to cents (`round(note * 100)`) before the division, so
+`pitch_bin(66.0) == 11` for every representation of that note, equal notes
+always share a bin, and bin edges never depend on floating-point rounding.
+MIDI 0-127 maps to bins `0 .. n_pitch_bins(bin_size) - 1` (0-21 at the default
+width); `bin_note_bounds` recovers each bin's note range for the parameter
+report and for `model.yaml`. A value that is not a real number (including a
+numeric string) has no condition rather than being coerced, and `bin_size` is
+validated as a whole number of semitones in 1-128 — a width wider than the MIDI
+range would silently switch the feature off, so the configuration says so
+instead.
+
+**Which frames carry a condition.** The condition is the *scored note* —
+`Segment.note` — and one function, `segment_pitch_bin`, is used at training and
+synthesis time alike:
+
+| segment | condition |
+| --- | --- |
+| note present, phone is not the inventory silence | that note's bin |
+| note present, phone *is* the silence symbol | **none** |
+| no note (`None`, a rest or an unlabelled gap) | **none** |
+| unvoiced frames inside a noted segment | the segment's bin |
+
+So a phone keeps a single condition across a note even where the frames are
+unvoiced or the pitch wobbles, silence is never pitch-conditioned, and
+`default_note` is never substituted for a missing note: `effective_note`
+distinguishes "no note" from "a note that happens to be the default", which a
+caller cannot do after the fact. Frames without a condition train and synthesise
+exactly as before. Unvoiced frames keep the note's condition deliberately — the
+condition describes the musical context, not an instantaneous measurement.
+
+**Synthesis never re-derives the condition from generated audio.** `plan()`
+computes the bin from the note it was *given* — the score note plus
+`--transpose`, clipped into MIDI range — via `segment_pitch_bin`, before any F0
+exists. With an external F0 trajectory the same scored note is used: the
+trajectory is honoured for pitch, and it is not treated as a second source of
+conditioning. There is no F0 estimator, no pitch regression and no new pitch
+predictor in this path.
+
+**Buckets are structured keys, not phonemes.** A bucket key is
+`(unit, bin)` where `unit` is a phone symbol *or* an existing context key
+(`pre^curr^post`, one-sided diphones included) and `bin` is an `int`. The
+phoneme inventory, the duration model, the note-conditioned pitch model
+(`hms/core/pitch.py`) and the feature normalisation are untouched; nothing like
+`a@60` is ever created, and a loaded model's `pitch_index` records `kind`,
+`unit`, `curr`, `pitch_bin`, `note_min`, `note_max` and support counts per
+bucket.
+
+**Training.** One extra pass after the context tier, over the same disk-backed
+cache (`_collect_cached_pitch_data` maps one utterance at a time and keeps
+views). For each labelled frame with a condition the pass accumulates the frame
+into its phone's bucket and, for every context unit that *earned* its own HMM in
+this run, into that context's bucket — contexts that fell short of the support
+thresholds are not conditioned either, because their bins would hold even less
+data. `select_pitch_models` then applies the thresholds of the tier a bucket
+conditions: `min_phoneme_frames` for a phone bucket, `context_min_frames` and
+`context_min_occurrences` for a context bucket. Because a bin holds a *subset*
+of its unit's frames, earning a conditioned model is never easier than earning
+the unconditioned one; a bucket that falls short is simply not created.
+Selection sorts by (frames desc, occurrences desc, unit, bin), so the sparse set
+is deterministic. `train_pitch_models` reuses `LeftToRightHMM.train` on the
+bucket's pooled raw sequences — the same Baum-Welch, the same budget taken from
+the *current* phone's definition, no duplication — with seeds offset past the
+context block (`seed + 10_000 * (len(backoff) + 1)`) so enabling the feature
+does not perturb any other tier. When conditioning is enabled but no bucket
+clears the thresholds, training says so explicitly (0 pitch-conditioned models,
+synthesis stays on the ordinary hierarchy) instead of force-creating models.
+
+**Resolution.** `resolve_unit(pre, curr, post, pitch_bin=None)` tries, in
+order, the conditioned rungs and then the whole classic hierarchy:
+
+```
+exact triphone + bin  →  best-supported one-sided diphone + bin (ties favour
+the left context)  →  phone + bin
+→  exact triphone  →  best diphone  →  phone  →  class backoff  →  global backoff
+```
+
+A conditioned model therefore outranks an unconditioned one *only for the same
+neighbourhood*: when a bin has no model, the frame drops to the ordinary
+hierarchy, and the tiers are named `triphone+pitch`, `left+pitch`,
+`right+pitch`, `phone+pitch` in the traces. Nothing borrows a model from a
+*different* pitch region — a wrong bin would be worse than the pooled one — so
+the fallback never fails and never misconditions. A model with no conditioned
+tier ignores the argument entirely.
+
+**F0 output is unchanged.** Conditioned HMMs emit the same full feature vector,
+including dimension 0 (note-relative F0 in semitones): conditioning selects
+*which* acoustic model is used, it does not generate absolute pitch. The
+`pitch_source`/vibrato machinery, MLPG, the vocoder, the frame shift and the
+label format are all untouched.
+
+**Reporting.** `hms synth` diagnostics say how many frames were
+pitch-conditioned, how many asked for a bin that has no trained model and which
+bins those were — and say so plainly instead when the model carries no
+conditioned models at all, or when no segment carried a scored note.
+`hms evaluate` adds `pitch_conditioned_frames` and `pitch_fallback_frames`
+(and never warns about the pitch-conditioning configuration fields, which
+describe a model rather than a corpus). `hms inspect-model` reports the pitch
+tier's parameter count separately and lists each bucket with its bin, note
+range and support.
+
+**Compatibility.** The tier is an additive format-4 payload: `model.yaml` gains
+a `pitch_conditioning:` section (the definition: `enabled`, `bin_size`,
+`bin_unit`, `n_bins`) and a `pitch_index:` section (per-bucket metadata), and
+`pitch.npz` holds the arrays under `"{unit}/{bin}/"` prefixes. All three are
+written only when conditioning produced models. Format-2 and format-3 models
+load unchanged with conditioning recorded as disabled — no migration — and a
+saved model carries its own bin width, so synthesis never needs the training
+configuration.
+
+With the default configuration nothing changes: same training, same synthesis,
+same diagnostics. A model trained with the feature off writes exactly the files
+it wrote before, with `format_version: 4` and two extra fields
+(`pitch_conditioning_enabled: false`, `pitch_conditioning_bin_size: 6`) in the
+recorded training configuration, where `context_enabled` already sits; checked
+against the previous release on one corpus, its `hmm.npz` and `backoff.npz`
+arrays, its state allocation, its F0 trajectory and its rendered audio are
+bit-identical, and its parameter report grows by two lines (`pitch models : 0`,
+`pitch HMM params : 0`).
+
+**What this is not.** Not a quality claim. Splitting a unit's observations
+across bins gives each bin less data than the pooled model it augments, so
+whether a voice benefits is a property of the corpus (its range, and how evenly
+that range is covered), measured with `hms evaluate` against an unconditioned
+baseline — the thresholds decide what is modelled, and a bin with too few frames
+is left unmodelled rather than fitted to a handful of frames.
+
 ## 7b. Model evaluation (`hms/core/evaluate.py`, `hms evaluate`)
 
 `hms evaluate` compares trained models on an evaluation corpus without
 rendering audio and **without an aggregate quality score**: it reports
 separate objective metrics per model — evaluation-corpus log-likelihood (total
-and per frame, under the units synthesis would select, contexts included),
-voicing agreement, duration prediction MAE, and backoff-routed frames — so the
-reader sees *what* differs, not just a fused number. It does not enforce that
-the evaluation corpus is disjoint from the models' training data; the metrics
-describe the corpus they were measured on, nothing more.
+and per frame, under the units synthesis would select, contexts and pitch bins
+included), voicing agreement, duration prediction MAE, backoff-routed frames,
+and (for a pitch-conditioned model) `pitch_conditioned_frames` vs.
+`pitch_fallback_frames` — so the reader sees *what* differs, not just a fused
+number. It does not enforce that the evaluation corpus is disjoint from the
+models' training data; the metrics describe the corpus they were measured on,
+nothing more.
+
+The likelihood is measured with the same note-per-segment policy as training, so
+a conditioned model is scored on the frames it actually claims. A corpus whose
+notes fall outside a model's trained bins therefore shows up as fallback frames
+rather than as a mysterious likelihood change.
 
 Because those metrics are only comparable between like-for-like models,
 evaluation first cross-checks them: the feature spec must match exactly (hard
 error), and differences in phoneme inventory, training method, seed, training
 corpus paths, and any other non-context training setting are surfaced as
-warnings. Context settings are deliberately exempt — comparing a context model
-against its baseline is the usual reason to run it.
+warnings. Context and pitch-conditioning settings are deliberately exempt —
+comparing a model against its own baseline is the usual reason to run it, and
+that is also how the experimental pitch tier is meant to be judged.
 
 ## 8. Synthesis pipeline (`hms/core/synthesizer.py`)
 
@@ -376,7 +551,11 @@ against its baseline is the usual reason to run it.
    segment's unit is resolved through the context hierarchy (exact triphone →
    best-supported diphone, ties left → phone → class backoff → global
    backoff), which changes the state allocation for that segment; the six-value
-   return signature is unchanged.
+   return signature is unchanged. With pitch-conditioned models present, each
+   segment first asks for the bin of the note it is being rendered at
+   (`_segment_pitch_bin`: score note + transpose, clipped into MIDI range, never
+   a generated F0) and the conditioned rungs are tried ahead of that hierarchy —
+   silence and unnoted segments ask for nothing.
 2. `frame_statistics` — per-state GMM means/variances stacked into per-frame
    statistics (dominant component by default, or the mixture marginal).
 3. `mlpg` — the trajectory.
@@ -399,22 +578,50 @@ decided.
 model.yaml      human readable: format version, feature spec, normalisation
                 (offset/scale), phoneme set, duration model, pitch model
                 (including vibrato), HMM index, context index (when context
-                modelling was on), parameter budget, metadata
+                modelling was on), pitch conditioning definition and pitch
+                index (when pitch conditioning was on), parameter budget,
+                metadata
 hmm.npz         arrays: GMM weights/means/variances, self-loops, durations,
                 voicing probabilities
 backoff.npz     the same for the pooled per-class models
 context.npz     the same for the sparse phone-context models and the optional
                 global backoff (only written when any of them exist)
+pitch.npz       the same for the pitch-conditioned models (only written when
+                any exist)
 ```
 
 YAML for anything a human might want to read or tweak, `.npz` for the arrays.
 `HMSModel.save/load` is the only serialisation code in the project, and the
-loader validates the format version. The current format is 3; it is additive
-over format 2 (the context tier), so format-2 models keep loading — with an
-empty context tier. Context keys are three `^`-joined phone symbols
-(`a^i^sil`); a reserved wildcard marks the unmodelled side of a one-sided
-diphone (`s^a^_` = `a` given left neighbour `s`, `_^a^i` = `a` given right
-neighbour `i`), which keeps the two diphone pools of one bigram distinct.
+loader validates the format version. The current format is 4; each version is
+additive over the previous one (2 = baseline, 3 = the context tier, 4 = the
+pitch-conditioned tier), so format-2 and format-3 models keep loading — with an
+empty tier and, for pitch conditioning, `enabled: false` recorded. Context keys
+are three `^`-joined phone symbols (`a^i^sil`); a reserved wildcard marks the
+unmodelled side of a one-sided diphone (`s^a^_` = `a` given left neighbour `s`,
+`_^a^i` = `a` given right neighbour `i`), which keeps the two diphone pools of
+one bigram distinct.
+
+Pitch-conditioned models reuse those same unit keys plus an integer bin, so the
+condition stays structured rather than encoded in a name. Two YAML sections are
+written together with `pitch.npz`, and only when the feature produced models:
+
+```yaml
+pitch_conditioning:      # the definition -- how to read a bin index
+  enabled: true
+  bin_size: 6
+  bin_unit: semitones
+  n_bins: 22
+pitch_index:             # per-bucket metadata, keyed by unit then bin
+  a:
+    10: {kind: phone, unit: a, curr: a, pitch_bin: 10, note_min: 60,
+         note_max: 65, frames: 480, occurrences: 9, ...}
+```
+
+Arrays inside `pitch.npz` are prefixed `"{unit}/{bin}/"` — e.g.
+`a/10/means` — the same shape as the other payload files. Because the model
+records its own `bin_size` (and `bin_unit`), synthesis needs no training
+configuration to interpret a bin, and a bucket can be checked against the notes
+it stands for straight from the file.
 
 ## 10. Design trade-offs (what is deliberately missing)
 
@@ -423,6 +630,8 @@ neighbour `i`), which keeps the two diphone pools of one bigram distinct.
 | per-phoneme HMMs, no state tying across phonemes | the inventory is small; backoff models cover rare phonemes with one pooled model per class |
 | phone contexts are opt-in, sparse and capped | a full triphone inventory would spend parameters on contexts the corpus never shows; observed-only contexts with thresholds and a model cap keep the budget honest, and the fixed fallback hierarchy means nothing can fall through |
 | no BOS/EOS tokens for context boundaries | the inventory's `sil` already marks utterance edges in labels and scores, so contexts reuse it instead of inventing parallel symbols |
+| pitch conditioning is opt-in, binned and off by default | the score already fixes the pitch; conditioning the *spectral* model on it is an experiment about envelope-vs-pitch, not a fix for pitch generation. Fixed semitone bins keep the condition deterministic and inspectable (no regression, no per-frame F0), and a bin that does not clear its tier's support threshold simply does not exist, so the pooled model is used instead of one fitted to a handful of frames |
+| a missing bin never borrows a neighbouring one | a model from the wrong pitch region is worse than the pooled one, so the fallback goes down the existing hierarchy rather than sideways across bins |
 | `hms evaluate` reports metrics separately, no fused quality score | collapsing likelihood, voicing and duration errors into one number would hide which part of the model a change actually moved |
 | log-normal durations, no duration HMM | the score already carries the timing; the model only fills gaps |
 | 5 aperiodicity bands | the fine structure of `ap` is perceptually unimportant compared to 1025 extra parameters |
@@ -447,3 +656,10 @@ neighbour `i`), which keeps the two diphone pools of one bigram distinct.
   replaces the generated contour. It is deliberately not a `SynthesisConfig`
   field: the trajectory is render-specific data, not a voice setting, and the
   whole override is one conversion function plus one branch in `synthesize`.
+* **A different conditioning variable** — the pitch bins are one instance of a
+  general shape: `hms/core/pitch_condition.py` owns the mapping from a scored
+  segment to an integer condition, `HMSModel.resolve_unit(…, pitch_bin=…)` owns
+  the extra rungs, and the trainer owns one collection pass plus a threshold
+  check. Conditioning on another label attribute (dynamics, phonation, speaker)
+  would mean a second such module and a second optional tier, not a rewrite of
+  the acoustic model.

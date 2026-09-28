@@ -21,6 +21,11 @@ Each stage is independently replaceable:
 * `hms.core.generation.mlpg` turns state statistics into a trajectory;
 * `hms.core.pitch.PitchModel` provides optional learned deviations and vibrato;
   the score alone supplies target F0 in the default mode;
+* `hms.core.pitch_condition` (optional, off by default) selects acoustic units
+  per *pitch bin of the requested note* before the state allocation, so a phone
+  can be rendered from the distribution learned at that pitch region.  It only
+  changes which HMM is consulted -- the F0 path above is untouched, and a bin
+  the voice was never trained on falls back to the ordinary hierarchy;
 * `hms.vocoder` turns (f0, sp, ap) into samples.
 
 F0 can also be supplied from outside.  Passing ``f0=`` to `synthesize` replaces
@@ -74,6 +79,7 @@ from hms.core.features import (AcousticFrameSequence, FeatureSpec,
                               hz_to_semitone, semitone_to_hz)
 from hms.core.generation import mlpg, stack_streams
 from hms.core.model import HMSModel
+from hms.core.pitch_condition import effective_note, is_pitch_tier
 
 
 @dataclass
@@ -287,6 +293,12 @@ class Synthesizer:
         ``--transpose`` and programmatic notes; it is skipped when an external
         F0 trajectory replaces the score pitch entirely, because then the notes
         are not rendered at all.
+
+        When the model carries pitch-conditioned HMMs, each segment's unit is
+        resolved with the pitch bin of its requested note as well (see
+        `_segment_pitch_bin`); one summary diagnostic reports how many frames
+        got a conditioned model and how many fell back to the unconditioned
+        hierarchy.  The six-value return signature is unchanged either way.
         """
         config = self.config
         spec = self.model.spec
@@ -296,12 +308,17 @@ class Synthesizer:
         notes: List[float] = []
         segment_frames: List[int] = []
         diagnostics: List[str] = []
-        #: resolved HMM per frame (context-aware models only); keeps the
-        #: public plan() return signature unchanged.
-        frame_units = [] if self.model.contexts else None
+        #: resolved HMM per frame (context- or pitch-conditioned models only);
+        #: keeps the public plan() return signature unchanged.
+        frame_units = [] if (self.model.contexts or self.model.pitch_models) \
+            else None
         self._frame_units = None
         next_segment_id = 0
         duration_rng = np.random.default_rng(config.seed)
+        #: pitch-condition bookkeeping for the summary diagnostic
+        pitch_conditioned_frames = 0
+        pitch_fallback_frames = 0
+        pitch_missing_bins: Dict[int, int] = {}
 
         for utterance in score:
             if config.duration_mode == "model" or utterance.end <= utterance.start:
@@ -340,12 +357,14 @@ class Synthesizer:
                               for phone, _frames, _note in segments]
             silence = self.model.phoneme_set.silence
             for seg_index, (phone, frames, note) in enumerate(segments):
-                if self.model.contexts:
+                pitch_bin = self._segment_pitch_bin(phone, note)
+                if self.model.contexts or self.model.pitch_models:
                     pre = segment_phones[seg_index - 1] if seg_index > 0 \
                         else silence
                     post = segment_phones[seg_index + 1] \
                         if seg_index < len(segments) - 1 else silence
-                    _key, hmm, tier = self.model.resolve_unit(pre, phone, post)
+                    _key, hmm, tier = self.model.resolve_unit(
+                        pre, phone, post, pitch_bin=pitch_bin)
                 else:
                     hmm = self.model.get_or_backoff(phone)
                     tier = None
@@ -355,6 +374,16 @@ class Synthesizer:
                         f"{utterance.name}: phoneme {phone!r} is not in the "
                         f"model; using the backoff model")
                 counts = DurationModel.allocate(frames, hmm.duration_proportions())
+                if pitch_bin is not None:
+                    allocated = int(sum(counts))
+                    if is_pitch_tier(tier):
+                        pitch_conditioned_frames += allocated
+                    else:
+                        # the requested pitch region has no trained model: this
+                        # segment is rendered from the unconditioned hierarchy
+                        pitch_fallback_frames += allocated
+                        pitch_missing_bins[pitch_bin] = \
+                            pitch_missing_bins.get(pitch_bin, 0) + allocated
                 for state, count in enumerate(counts):
                     frame_phones.extend([phone] * int(count))
                     state_ids.extend([state] * int(count))
@@ -376,8 +405,70 @@ class Synthesizer:
             # saying anything about them would be noise.
             note_per_frame = self._valid_midi_notes(note_per_frame,
                                                     diagnostics)
+        diagnostics.extend(self._pitch_conditioning_diagnostics(
+            pitch_conditioned_frames, pitch_fallback_frames,
+            pitch_missing_bins))
         return (frame_phones, state_ids, segment_ids, note_per_frame,
                 segment_frames, diagnostics)
+
+    # -- pitch conditioning --------------------------------------------------
+
+    def _segment_pitch_bin(self, phone: str, note: Optional[float]
+                           ) -> Optional[int]:
+        """The pitch condition of one scored segment, or ``None``.
+
+        The condition comes from the note the segment is *asked* for -- score
+        note plus transposition, clipped into the MIDI range exactly like the
+        pitch that will be rendered -- through the model's own recorded bin
+        size.  It is deliberately not derived from any F0: the spectral model
+        has to be chosen before a single frame of F0 exists, and the score note
+        is the stable variable (the same note keeps one condition even where the
+        generated contour scoops, vibrates or is overridden by an external
+        trajectory).  ``None`` means "no condition", so the segment resolves
+        through the ordinary hierarchy: silence, unnoted segments and models
+        trained without pitch conditioning all take that path.
+        """
+        model = self.model
+        if not model.pitch_conditioning.active or not model.pitch_models:
+            return None
+        return model.segment_pitch_bin(
+            phone, effective_note(note, self.config.transpose))
+
+    def _pitch_conditioning_diagnostics(self, conditioned: int, fallback: int,
+                                        missing_bins: Dict[int, int]
+                                        ) -> List[str]:
+        """Report how the pitch-conditioned tier was actually used.
+
+        Emitted only for a model trained with pitch conditioning, so an ordinary
+        render's diagnostics are unchanged.  Falling back is normal with sparse
+        data and is not an error -- but it should not be invisible either, since
+        it is the difference between "the pitch region was modelled" and "the
+        unconditioned model was used".
+        """
+        conditioning = self.model.pitch_conditioning
+        if not conditioning.active:
+            return []
+        if not self.model.pitch_models:
+            return ["pitch conditioning was enabled for training but the model "
+                    "carries no pitch-conditioned models (no bucket met its "
+                    "support threshold), so every frame used the unconditioned "
+                    "model hierarchy"]
+        if not conditioned and not fallback:
+            return [f"pitch conditioning (bins of {conditioning.bin_size} "
+                    f"semitones): no segment carried a scored note, so every "
+                    f"frame used the unconditioned model hierarchy"]
+        message = (f"pitch conditioning (bins of {conditioning.bin_size} "
+                   f"semitones): {conditioned} frame(s) rendered from a "
+                   f"pitch-conditioned model")
+        if fallback:
+            listing = ", ".join(str(index)
+                                for index in sorted(missing_bins)[:5])
+            if len(missing_bins) > 5:
+                listing += f", ... ({len(missing_bins)} bins)"
+            message += (f"; {fallback} frame(s) asked for a pitch bin with no "
+                        f"trained model (bin {listing}) and fell back to the "
+                        f"unconditioned hierarchy")
+        return [message]
 
     @staticmethod
     def _valid_midi_notes(notes: np.ndarray, diagnostics: List[str]
@@ -518,9 +609,12 @@ class Synthesizer:
     # -- voicing and pitch -------------------------------------------------
 
     def _active_frame_units(self, n_frames: int) -> Optional[List]:
-        """The per-frame HMMs chosen by `plan`, when context models apply.
+        """The per-frame HMMs chosen by `plan`, when conditioned models apply.
 
         ``None`` means: resolve per phoneme exactly as before (`get_or_backoff`).
+        It is set when the model carries sparse context HMMs or optional
+        pitch-conditioned HMMs, so `frame_statistics` and `voicing` use exactly
+        the units `plan` selected.
         """
         units = self._frame_units
         if units is not None and len(units) == n_frames:
