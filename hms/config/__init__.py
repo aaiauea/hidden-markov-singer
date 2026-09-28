@@ -90,6 +90,15 @@ def training_config_from_parameters(parameters: Mapping[str, Any]
             raise ValueError(f"unknown context option: {key!r}")
         if value is not None:
             values[name] = value
+    conditioning = parameters.get("pitch_conditioning") or {}
+    if not isinstance(conditioning, dict):
+        raise ValueError("the pitch_conditioning section must be a mapping")
+    for key, value in conditioning.items():
+        name = f"pitch_conditioning_{_ALIASES.get(key, key)}"
+        if name not in TrainingConfig.__dataclass_fields__:  # type: ignore[attr-defined]
+            raise ValueError(f"unknown pitch_conditioning option: {key!r}")
+        if value is not None:
+            values[name] = value
     if "vibrato" in pitch:
         values["vibrato_enabled"] = bool(
             (pitch["vibrato"] or {}).get("enabled", False))

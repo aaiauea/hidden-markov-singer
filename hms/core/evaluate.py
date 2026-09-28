@@ -4,12 +4,15 @@
 separate, objective, comparable numbers per model so a human can judge:
 
 * acoustic log-likelihood of the evaluation corpus's frames under each model's
-  own units (with context resolution, exactly as synthesis would select them),
+  own units (with context and pitch-bin resolution, exactly as synthesis would
+  select them),
 * voicing agreement between each model's state voicing probabilities and the
   analysed voicing,
 * duration prediction error (per-phoneme log-normal means vs. real segment
   lengths),
-* how many frames were routed to backoff models.
+* how many frames were routed to backoff models, and -- for a model trained
+  with the optional pitch-conditioned tier -- how many frames were served by a
+  model of their own pitch bin versus falling back from a bin with no model.
 
 The command does not check that the evaluation corpus is disjoint from any
 model's training data -- it measures whatever corpus it is given, and
@@ -31,6 +34,7 @@ import numpy as np
 
 from hms.core import labels as labels_module
 from hms.core.model import HMSModel
+from hms.core.pitch_condition import is_pitch_tier
 from hms.core.trainer import Corpus, Trainer, TrainingConfig, UtteranceData
 
 #: Training-config keys that describe the optional context feature; they are
@@ -38,6 +42,12 @@ from hms.core.trainer import Corpus, Trainer, TrainingConfig, UtteranceData
 _CONTEXT_FIELDS = ("context_enabled", "context_min_frames",
                    "context_min_occurrences", "context_max_models",
                    "context_partial", "context_global_backoff")
+
+#: Training-config keys of the optional pitch-conditioned tier, exempt for the
+#: same reason: comparing a pitch-conditioned model against its unconditioned
+#: baseline is the usual reason to run the comparison.
+_PITCH_CONDITIONING_FIELDS = ("pitch_conditioning_enabled",
+                              "pitch_conditioning_bin_size")
 
 
 def _training_config_of(model: HMSModel) -> Dict[str, object]:
@@ -94,8 +104,8 @@ def check_model_compatibility(models: Sequence[HMSModel]
         names = [model.name for model in models]
         all_keys = set().union(*(set(config) for config in configs))
         for key in sorted(all_keys):
-            if key in _CONTEXT_FIELDS:
-                continue                      # context on/off is the point
+            if key in _CONTEXT_FIELDS or key in _PITCH_CONDITIONING_FIELDS:
+                continue                      # the optional tiers are the point
             values = [config.get(key) for config in configs]
             comparable = []
             for value in values:
@@ -124,16 +134,18 @@ def _analysis_trainer(model: HMSModel, label_file: str, wav_dir: str,
                       audio_extensions: Sequence[str], log) -> Trainer:
     """A Trainer configured to analyse the corpus exactly like ``model`` was.
 
-    Non-context training settings are restored from the model's metadata so
-    the analysis matches; the feature-spec fields are then pinned to the
-    model's own spec.  Label time units follow the same precedence: an
-    explicit ``time_unit`` argument wins, then the model's recorded
-    training setting, then the configuration default.
+    Training settings are restored from the model's metadata so the analysis
+    matches -- except the ones describing the optional model tiers, which say
+    how a model was *built*, not how its corpus is analysed; the feature-spec
+    fields are then pinned to the model's own spec.  Label time units follow
+    the same precedence: an explicit ``time_unit`` argument wins, then the
+    model's recorded training setting, then the configuration default.
     """
     metadata_config = _training_config_of(model)
     known = set(TrainingConfig.__dataclass_fields__)  # type: ignore[attr-defined]
     kwargs = {key: value for key, value in metadata_config.items()
               if key in known and not key.startswith("context_")
+              and not key.startswith("pitch_conditioning_")
               and key not in ("label_file", "wav_dir")}
     try:
         config = TrainingConfig.from_dict(kwargs)
@@ -177,6 +189,8 @@ def _evaluate_single(model: HMSModel, utterances: Sequence[UtteranceData],
     duration_abs_error = 0.0
     duration_segments = 0
     backoff_frames = 0
+    pitch_conditioned_frames = 0
+    pitch_fallback_frames = 0
     per_phone_ll: Dict[str, List[float]] = {}
     per_phone_frames: Dict[str, int] = {}
     silence = model.phoneme_set.silence
@@ -184,15 +198,22 @@ def _evaluate_single(model: HMSModel, utterances: Sequence[UtteranceData],
     for data in utterances:
         normalized = trainer.normalize_features(
             data.features, model.feature_offset, model.feature_scale)
-        spans = [(phone, lo, hi) for phone, lo, hi in data.phoneme_spans
+        # The scored note travels with its span: it is the pitch condition an
+        # evaluation frame would be rendered under, exactly as in synthesis.
+        span_notes = list(data.span_notes
+                          or [None] * len(data.phoneme_spans))
+        spans = [(phone, lo, hi, span_notes[position])
+                 for position, (phone, lo, hi) in enumerate(data.phoneme_spans)
                  if hi > lo]
-        canon = [model.phoneme_set.canonical(phone) for phone, _lo, _hi
-                 in spans]
-        for index, ((phone, lo, hi), curr) in enumerate(zip(spans, canon)):
+        canon = [model.phoneme_set.canonical(phone)
+                 for phone, _lo, _hi, _note in spans]
+        for index, ((phone, lo, hi, note), curr) in enumerate(zip(spans, canon)):
             pre = canon[index - 1] if index > 0 else silence
             post = canon[index + 1] if index < len(spans) - 1 else silence
-            if model.contexts:
-                _key, hmm, tier = model.resolve_unit(pre, curr, post)
+            pitch_bin = model.segment_pitch_bin(curr, note)
+            if model.contexts or model.pitch_models:
+                _key, hmm, tier = model.resolve_unit(pre, curr, post,
+                                                     pitch_bin=pitch_bin)
             else:
                 hmm = model.get_or_backoff(curr)
                 tier = "phone" if model.get_hmm(curr) is not None else "class"
@@ -203,6 +224,11 @@ def _evaluate_single(model: HMSModel, utterances: Sequence[UtteranceData],
             total_frames += n_frames
             if tier in ("class", "global"):
                 backoff_frames += n_frames
+            if pitch_bin is not None:
+                if is_pitch_tier(tier):
+                    pitch_conditioned_frames += n_frames
+                else:
+                    pitch_fallback_frames += n_frames
             per_phone_ll.setdefault(curr, []).append(ll)
             per_phone_frames[curr] = per_phone_frames.get(curr, 0) + n_frames
 
@@ -237,6 +263,13 @@ def _evaluate_single(model: HMSModel, utterances: Sequence[UtteranceData],
         "duration_mae_frames": float(duration_abs_error / duration_segments)
         if duration_segments else 0.0,
         "backoff_frames": backoff_frames,
+        # Pitch-conditioned tier usage: how many frames were scored under a
+        # model trained for their pitch bin, and how many asked for a bin the
+        # voice has no model for and fell back.  Zero for an unconditioned
+        # model, so comparing a conditioned model against its baseline shows
+        # how much of the corpus the conditioning actually reached.
+        "pitch_conditioned_frames": pitch_conditioned_frames,
+        "pitch_fallback_frames": pitch_fallback_frames,
         "per_phone_log_likelihood_per_frame": {
             phone: float(sum(per_phone_ll[phone]) / per_phone_frames[phone])
             for phone in sorted(per_phone_ll)},

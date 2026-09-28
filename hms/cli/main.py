@@ -27,6 +27,7 @@ from hms.config import (build_feature_spec, load_parameters, load_phoneme_set,
                         training_config_from_parameters)
 from hms.core import labels as labels_module
 from hms.core.pitch import note_relative_pitch
+from hms.core.pitch_condition import validate_bin_size
 from hms.core.model import HMSModel
 from hms.core.synthesizer import Synthesizer
 from hms.core.trainer import Corpus, Trainer, TrainingConfig
@@ -94,9 +95,19 @@ def _training_config(args) -> TrainingConfig:
         overrides["vibrato_enabled"] = bool(args.vibrato)
     if getattr(args, "context", None) is not None:
         overrides["context_enabled"] = bool(args.context)
+    if getattr(args, "pitch_conditioning", None) is not None:
+        overrides["pitch_conditioning_enabled"] = bool(args.pitch_conditioning)
+    if getattr(args, "pitch_bin_size", None) is not None:
+        overrides["pitch_conditioning_bin_size"] = int(args.pitch_bin_size)
     for key, value in overrides.items():
         if value is not None:
             setattr(config, key, value)
+    # An override applied with setattr bypasses TrainingConfig's validation, so
+    # re-check the one setting whose value defines the model's pitch bins: a
+    # bad bin width is a one-line error now, not a failure after the whole
+    # corpus has been analysed.
+    config.pitch_conditioning_bin_size = validate_bin_size(
+        config.pitch_conditioning_bin_size)
     return config
 
 
@@ -421,6 +432,7 @@ def cmd_inspect_model(args) -> int:
             "parameter_breakdown": {
                 "phoneme": model.phoneme_n_free_params,
                 "context": model.context_n_free_params,
+                "pitch_conditioned": model.pitch_n_free_params,
                 "class_backoff": model.backoff_n_free_params,
                 "global_backoff": model.global_backoff_n_free_params,
             },
@@ -436,6 +448,17 @@ def cmd_inspect_model(args) -> int:
                 key: {**(model.context_index.get(key) or {}),
                       "n_free_params": hmm.n_free_params}
                 for key, hmm in sorted(model.contexts.items())},
+            "pitch_conditioning": {
+                **model.pitch_conditioning.to_dict(),
+                # a list of records, not a "phone@bin" naming scheme: the unit
+                # key and the pitch bin stay separate fields
+                "models": [
+                    {"unit": unit, "pitch_bin": pitch_bin,
+                     **(model.pitch_index.get((unit, pitch_bin)) or {}),
+                     "n_free_params": hmm.n_free_params}
+                    for (unit, pitch_bin), hmm
+                    in sorted(model.pitch_models.items())],
+            },
             "global_backoff": (
                 {"n_states": model.global_backoff.n_states,
                  "n_components":
@@ -630,6 +653,21 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--no-context", dest="context", action="store_false",
                        help="do not learn phoneme-context HMMs "
                             "(the default; context.enabled in parameters.yaml)")
+    train.add_argument("--pitch-conditioning", dest="pitch_conditioning",
+                       action="store_true", default=None,
+                       help="experimental: additionally learn acoustic HMMs "
+                            "per pitch bin of the scored note, and prefer them "
+                            "at synthesis (pitch_conditioning.enabled in "
+                            "parameters.yaml). F0 still comes from the score; "
+                            "bins with too little data fall back to the "
+                            "ordinary hierarchy")
+    train.add_argument("--no-pitch-conditioning", dest="pitch_conditioning",
+                       action="store_false",
+                       help="do not condition acoustic models on pitch "
+                            "(the default)")
+    train.add_argument("--pitch-bin-size", type=int, default=None,
+                       help="width of a pitch bin in semitones (default 6, a "
+                            "tritone; only used with pitch conditioning)")
     train.add_argument("--evaluate", action="store_true",
                        help="report the training-set log likelihood")
     train.add_argument("--resume", action="store_true",
