@@ -227,6 +227,96 @@ conditioning helps a given voice is exactly what the option lets you measure
 (`hms evaluate --model baseline --model conditioned`), and a corpus that only
 covers a narrow range will simply train few or no buckets.
 
+## Optional cross-language voice transfer (experimental)
+
+By default a voice can only sing the phones its own corpus contains. Opt in —
+`transfer.enabled: true` in `parameters.yaml`, or `hms train --transfer-model
+DIR` / `--transfer-labels …` — and a **second, independently trained voice is
+used as an auxiliary** so that the target voice can sing a language it was never
+recorded in:
+
+```
+Voice 1 (target)    : the timbre that must be kept          -- corpus in language A
+Voice 2 (auxiliary) : the phonetic coverage that is wanted  -- corpus in language B
+        |
+        v   classical statistical adaptation of Voice 2's units
+        v   into Voice 1's acoustic space
+Voice 1 singing language B (one ordinary HMS model, one HMM per unit)
+```
+
+This is deliberately *not* multilingual G2P, *not* one model trained on several
+languages, and *not* a neural method: the output is an ordinary model with a few
+extra HMMs (each a plain diagonal-covariance GMM per state), the auxiliary voice
+supplies the *phonetic* coverage, and Voice 1 keeps its acoustic identity.
+
+```bash
+# the auxiliary voice is a trained model directory ...
+hms train labels_a.tsv --wav-dir wav_a/ --language en --name voice-1 \
+    --transfer-model models/voice-2 --transfer-language de
+
+# ... or a corpus, trained on the fly with this run's acoustic settings
+hms train langA/labels.tsv --wav-dir langA/wav/ --language en --name voice-1 \
+    --transfer-labels langB/labels.tsv --transfer-wav-dir langB/wav/ \
+    --transfer-language de --transfer-speaker voice-2
+
+hms synth langB_score.tsv --model models/voice-1-in-b --out song.wav
+```
+
+The configuration names all four things explicitly — target speaker and
+language, auxiliary speaker and language (`transfer:` in `parameters.yaml`;
+`auxiliary_model` *or* `auxiliary_labels` + `auxiliary_wav_dir`, never both) —
+so nothing has to be merged into a fake speaker. An unknown key is an error
+rather than a typo that silently does nothing, and a feature-definition or
+pitch-bin-width mismatch between the two voices is refused with the reason.
+
+**How it works** (the full derivation and the exact estimators are in
+[docs/architecture.md](docs/architecture.md)):
+
+* every HMS unit lives in its *own* corpus's mean/std-normalised feature space,
+  so a unit written in Voice 1's numbers is already in Voice 1's acoustic space
+  — Voice 1's offset/scale is what denormalises it, and nothing absolute of
+  Voice 2 (loudness, average envelope, variance) crosses over;
+* phones both voices trained become **anchors**, and a MAP-shrunk affine map
+  (`matrix` + intercept, κ = `map_prior_strength`) is fitted from Voice 2's
+  anchor positions to Voice 1's, with the identity as the prior — so with no
+  anchors, no shared phone, or too few anchors to earn a deviation, the map
+  degrades gracefully to mean/variance matching instead of inventing one;
+* the map carries Voice 2's means **and** their variances, adding the
+  regression's per-dimension residual so a unit never becomes over-confident;
+* phones Voice 1 saw only a handful of frames of are additionally blended
+  towards **Voice 1's own** observations (MAP mean/variance adaptation, τ =
+  `map_adapt_frames`) — the more of its own evidence Voice 1 has, the less of
+  the auxiliary's shape survives;
+* language B's **timing and phonation** travel with the phone: state durations,
+  self-loops, voicing probabilities and the per-phone duration/voicing
+  statistics are imported (never overwriting Voice 1's own), because a
+  transferred unit whose rhythm came from language A would be a different phone;
+* the transferred units sit *below* Voice 1's own phone tier and *above* class
+  backoff in the existing resolution ladder, so a phone Voice 1 can already
+  sing is never touched; phones absent from both voices still degrade to class
+  backoff exactly as before;
+* with `pitch_conditioning.enabled: true` on both voices (same bin width), the
+  auxiliary's `(phone, bin)` units are transferred too, through the same map —
+  a bin is an absolute MIDI range, so it means the same thing in both voices,
+  and a missing bin falls back to the transferred phone rather than to the wrong
+  pitch region;
+* training logs the anchors, the map's summary, the transferred phones and pitch
+  units, and the native-vs-transferred parameter counts; `hms inspect-model`
+  prints them; `hms synth` reports how many frames took a transferred path and
+  `hms evaluate` adds `transferred_frames`, so the effect is measurable against
+  a baseline.
+
+A transfer run writes **model format 5** (a `transfer:` + `transfer_index:`
+section in `model.yaml` and a `transfer.npz` for the arrays); formats 2–4 keep
+loading with the tier disabled. With the feature off nothing runs, nothing is
+written and the files are exactly what they were.
+
+This is an **experimental research feature**, not a quality claim: whether a
+given pair of voices benefits is exactly what the option lets you measure. A
+language whose phones are unrelated to the target's, an auxiliary voice with a
+very different range, or a corpus too small to clear `min_phoneme_frames` all
+show up as warnings and fallbacks rather than as silence.
+
 ## Data format
 
 Everything is a tab-separated text file; no database, no binary labels:
@@ -356,15 +446,22 @@ model/
 ├── backoff.npz    # per phoneme-class pooled models
 ├── context.npz    # sparse phone-context HMMs + optional global backoff
 │                  # (only written when context modelling was enabled)
-└── pitch.npz      # pitch-conditioned HMMs, keyed by (unit, pitch bin)
-                   # (only written when pitch conditioning produced models)
+├── pitch.npz      # pitch-conditioned HMMs, keyed by (unit, pitch bin)
+│                  # (only written when pitch conditioning produced models)
+└── transfer.npz   # the acoustic map + transferred units, keyed by phone
+                   # (only written when cross-language transfer produced units)
 ```
+
+`model.yaml` also carries the cross-language `transfer:` record (target and
+auxiliary voices and languages, anchors, counts) and the `transfer_index:` of
+provenance and adaptation weights. On disk a transfer model is format **5**;
+formats 2, 3 and 4 keep loading (with the tiers recorded as disabled).
 
 ## Tests
 
 ```bash
 HMS_NO_AUTO_BUILD=1 python -m pytest
-# 382 tests: 374 passed, 8 optional skips without WORLD
+# 427 tests: 419 passed, 8 optional skips without WORLD
 ```
 
 The suite covers the numerical core (banded Cholesky, MLPG against a dense
@@ -380,8 +477,12 @@ reporting and the CLI), model evaluation, the CLI, out-of-training-range F0 (in
 both directions, from the score and from an external trajectory, asserted on
 the parameters handed to the vocoder), the external F0 override (trajectory
 preservation, independence from learned deviation and vibrato, and its
-validation), and an end-to-end train→synthesise run that checks the rendered
-notes really are the requested ones.
+validation), the cross-language transfer tier (the anchor regression and its
+guards, the MAP mean/variance blend, the resolution ladder and its fallbacks,
+missing phones, target/auxiliary corpus separation, pitch-conditioned transfer,
+serialisation and older formats, determinism, memory-bounded training, and an
+end-to-end language-B synthesis), and an end-to-end train→synthesise run that
+checks the rendered notes really are the requested ones.
 
 ## How it works
 
@@ -392,7 +493,9 @@ documentation tries to explain *why* each piece looks the way it does.
 
 ## Limitations
 
-* One speaker per model; no voice conversion or adaptation yet.
+* One speaker per model: there is no multi-speaker synthesiser and no voice
+  conversion. The optional cross-language tier adapts a *second* voice's units
+  for phones the target cannot sing; it does not blend voices or clone a timbre.
 * The bundled inventory is a small demo set (open vowels and the consonants
   that carry a melody) — extend `phonemes.yaml` for real lyrics.
 * No explicit duration HMM: state durations come from the score (or per-phoneme
@@ -403,8 +506,7 @@ documentation tries to explain *why* each piece looks the way it does.
 * WORLD's synthesis is returned unscaled (see `Vocoder.synthesize`); it can
   overshoot `[-1, 1]` on very periodic material and `write_wav` applies the
   headroom.  A trained model is tied to the feature definition that produced
-  it: `model.yaml` records `format_version: 4` (format-2 and format-3 models
-  still load).
+  it: `model.yaml` records `format_version: 5` (formats 2-4 still load).
 * Pitch conditioning is an optional modelling tier, not an improvement claim:
   it splits the acoustic observations of a unit across pitch bins, so each bin
   sees less data than the pooled model it augments. Whether a voice benefits

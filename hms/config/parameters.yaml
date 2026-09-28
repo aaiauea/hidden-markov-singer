@@ -98,6 +98,40 @@ pitch_conditioning:
   enabled: false
   bin_size: 6               # semitones per pitch bin (whole number, 1-128)
 
+transfer:
+  # EXPERIMENTAL cross-language voice transfer, off by default (see
+  # `hms.core.transfer`).  A *second* voice -- the "auxiliary" -- is trained on
+  # another language and lends this voice the phones its own corpus cannot
+  # cover.  The auxiliary's units are adapted into this voice's acoustic space
+  # by a classical anchor regression (an affine map in every acoustic
+  # dimension, MAP-shrunk towards the identity) plus a MAP mean/variance blend
+  # with whatever frames
+  # this corpus has of the phone, so what is sung is this voice's timbre
+  # carrying the other language's phones.  Nothing neural is involved, no
+  # native unit is ever replaced (a phone this voice has its own model for
+  # keeps it, whatever the auxiliary voice contains), and with `enabled: false`
+  # no code path changes at all.
+  #
+  # Enable it on the command line instead if you prefer:
+  #   hms train --labels langB.tsv --wav-dir langB/wav --out voice1-in-langB \
+  #       --name voice1 --language en --transfer-model voice2-langB-model \
+  #       --transfer-language de
+  # or point it at the auxiliary *corpus* (trained on the fly with this run's
+  # acoustic settings):
+  #   --transfer-labels langB.tsv --transfer-wav-dir langB/wav
+  enabled: false
+  target_language: null     # language label of the corpus above, e.g. "en"
+  auxiliary_language: null  # language label of the auxiliary voice, e.g. "de"
+  auxiliary_speaker: null   # label for the auxiliary voice (default: its name)
+  auxiliary_model: null     # trained auxiliary model directory ...
+  auxiliary_labels: null    # ... or its corpus (needs auxiliary_wav_dir)
+  auxiliary_wav_dir: null
+  adapt_pitch_bins: true    # also transfer its (phone, pitch bin) units
+                            # (only meaningful with pitch_conditioning enabled)
+  map_prior_strength: 1.0   # anchor phones the identity map is worth (kappa)
+  map_adapt_frames: 100.0   # frames of this corpus's own observations of a
+                            # phone, in the MAP blend (tau)
+
 synthesis:
   # Scales the *delta* (dynamic) variances.  >1 trusts the deltas less, so the
   # trajectory follows the frame-by-frame means more literally (livelier, more

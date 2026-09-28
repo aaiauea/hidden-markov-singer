@@ -32,7 +32,7 @@ The defaults are chosen so that a handful of sung phrases trains a usable voice:
 
 Optional tiers
 --------------
-Two opt-in tiers sit on top of the per-phoneme models and reuse this pipeline
+Three opt-in tiers sit on top of the per-phoneme models and reuse this pipeline
 rather than adding a second one:
 
 * sparse phoneme contexts (``context_enabled``, see `hms.core.context`): extra
@@ -41,10 +41,17 @@ rather than adding a second one:
   `hms.core.pitch_condition`): the same units additionally split by the pitch
   bin of the note each observation was sung on.  It changes *which pool* an
   observation trains, never how a pool is fitted, and it leaves F0 generation
-  alone -- the score still supplies the pitch.
+  alone -- the score still supplies the pitch;
+* cross-language voice transfer (``transfer_enabled``, see
+  `hms.core.transfer`): a *second* voice, trained on another language, supplies
+  the phones this corpus cannot cover.  Those units are adapted into this
+  voice's acoustic space by a classical anchor regression + MAP blend and are
+  installed as an extra tier that a native unit always outranks.  Nothing else
+  about training changes: the transferred units are derived from two ordinary
+  trained models, and the feature is off unless an auxiliary voice is named.
 
-Both are off by default, both keep the corpus disk-backed (buckets hold views
-into the temporary feature cache, never copies of it), and both leave every
+All three are off by default, all three keep the corpus disk-backed (buckets and
+moment accumulators never hold the feature cache), and all three leave every
 other tier bit-identical when they are off.
 """
 
@@ -52,7 +59,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dataclass_replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -72,6 +79,12 @@ from hms.core.pitch import PitchModel, PitchStats, note_relative_pitch
 from hms.core.pitch_condition import (DEFAULT_BIN_SIZE, KIND_PHONE,
                                       PitchConditioning, bin_note_bounds,
                                       segment_pitch_bin, validate_bin_size)
+from hms.core.transfer import (DEFAULT_MAP_ADAPT_FRAMES,
+                               DEFAULT_MAP_PRIOR_STRENGTH,
+                               CrossLanguageTransfer, PhoneMoments,
+                               TransferBuild, VoiceSource,
+                               accumulate_phone_moments, build_transfer,
+                               phone_moments_nbytes)
 from hms.data import wavio
 from hms.vocoder import get_vocoder
 
@@ -141,6 +154,36 @@ class TrainingConfig:
     #: width of a pitch bin, in semitones (6 = a tritone, two bins per octave)
     pitch_conditioning_bin_size: int = DEFAULT_BIN_SIZE
 
+    # -- optional cross-language voice transfer (off by default) -----------
+    #: EXPERIMENTAL: adapt a *second* voice's units for the phones this corpus
+    #: cannot cover, so this voice can sing another language (see
+    #: `hms.core.transfer`).  Requires an auxiliary voice and both language
+    #: labels; off unless ``--transfer-model`` / ``--transfer-labels`` is given.
+    transfer_enabled: bool = False
+    #: language label of *this* corpus (e.g. "en"); recorded in the model
+    transfer_target_language: str = ""
+    #: language label of the auxiliary voice (e.g. "de"): what is transferred
+    transfer_auxiliary_language: str = ""
+    #: speaker label of this corpus (default: the label file's name, and the
+    #: name the CLI gives the model)
+    transfer_target_speaker: str = ""
+    #: speaker label of the auxiliary voice (default: its model/dataset name)
+    transfer_auxiliary_speaker: str = ""
+    #: the auxiliary voice as a *trained model directory* ...
+    transfer_auxiliary_model: Optional[str] = None
+    #: ... or as its corpus, trained on the fly with this run's acoustic
+    #: settings (so the two voices share one feature definition by construction)
+    transfer_auxiliary_labels: Optional[str] = None
+    transfer_auxiliary_wav_dir: Optional[str] = None
+    #: also transfer the auxiliary voice's pitch-conditioned units (only takes
+    #: effect when this model is trained with pitch conditioning on)
+    transfer_adapt_pitch_bins: bool = True
+    #: ``kappa``: anchor phones the identity map is worth (see `fit_acoustic_map`)
+    transfer_map_prior_strength: float = DEFAULT_MAP_PRIOR_STRENGTH
+    #: ``tau``: frames of this corpus's own observations of a phone, in the MAP
+    #: blend that pulls a transferred unit towards them
+    transfer_map_adapt_frames: float = DEFAULT_MAP_ADAPT_FRAMES
+
     def __post_init__(self) -> None:
         numeric_values = (self.n_iterations, self.min_phoneme_frames,
                           self.var_floor_ratio, self.fs, self.frame_period,
@@ -203,6 +246,48 @@ class TrainingConfig:
         # number of semitones inside the supported range
         self.pitch_conditioning_bin_size = validate_bin_size(
             self.pitch_conditioning_bin_size)
+        if self.transfer_enabled:
+            self._validate_transfer()
+
+    def _validate_transfer(self) -> None:
+        """Cross-language transfer: the configuration must name both voices.
+
+        A transfer run has to say *what* is being transferred (the auxiliary
+        language) and *into what* (the target language), and it needs exactly
+        one source for the auxiliary voice -- a trained model directory or a
+        corpus to train one from -- because those are two different workflows
+        with different feature-definition guarantees.
+        """
+        if not str(self.transfer_target_language or "").strip():
+            raise ValueError(
+                "cross-language transfer needs the target language label "
+                "(transfer.target_language, e.g. 'en'), so the model can "
+                "record which language it was trained in")
+        if not str(self.transfer_auxiliary_language or "").strip():
+            raise ValueError(
+                "cross-language transfer needs the auxiliary language label "
+                "(transfer.auxiliary_language, e.g. 'de'), so the model can "
+                "record where each transferred unit came from")
+        sources = [self.transfer_auxiliary_model, self.transfer_auxiliary_labels]
+        if sum(1 for source in sources if source) != 1:
+            raise ValueError(
+                "cross-language transfer needs exactly one auxiliary voice "
+                "source: transfer.auxiliary_model (a trained model directory) "
+                "or transfer.auxiliary_labels (a corpus to train one from)")
+        if self.transfer_auxiliary_labels and not self.transfer_auxiliary_wav_dir:
+            raise ValueError(
+                "transfer.auxiliary_labels needs transfer.auxiliary_wav_dir: "
+                "the auxiliary corpus is a label file plus the audio it "
+                "references")
+        strength = float(self.transfer_map_prior_strength)
+        if not np.isfinite(strength) or strength <= 0:
+            raise ValueError("transfer.map_prior_strength must be finite and "
+                             "positive (it is the identity prior's weight, in "
+                             "anchor phones)")
+        frames = float(self.transfer_map_adapt_frames)
+        if not np.isfinite(frames) or frames < 0:
+            raise ValueError("transfer.map_adapt_frames must be finite and "
+                             "non-negative (it is a frame count)")
 
     @classmethod
     def from_dict(cls, data: Dict) -> "TrainingConfig":
@@ -1152,6 +1237,167 @@ class Trainer:
                      f"{total_frames} frames / {len(sequences)} occ")
         return models, index
 
+    # -- stage 3d: optional cross-language voice transfer -------------------
+
+    def _collect_cached_phone_moments(
+            self, utterances: Sequence[_CachedUtterance]
+            ) -> Dict[str, PhoneMoments]:
+        """Per-phone running moments of *this* corpus's own frames.
+
+        This is everything the transfer stage learns about the target corpus:
+        two ``static_dim`` vectors per phone, accumulated over the disk-backed
+        feature cache one utterance at a time.  The result is bounded by
+        phones x dimensions and never by corpus length -- the feature matrices
+        stay memory-mapped and are released per utterance.
+        """
+        moments: Dict[str, PhoneMoments] = {}
+        static_dim = self.spec.static_dim
+        for data in utterances:
+            if not data.n_frames:
+                continue
+            feature_matrix = np.load(data.features_path, mmap_mode="r")
+            for phone, lo, hi in data.phoneme_spans:
+                if hi <= lo:
+                    continue
+                # Basic slicing keeps a view on the .npy memory map; nothing
+                # utterance-sized is copied by this pass.
+                accumulate_phone_moments(
+                    moments, self.phoneme_set.canonical(phone),
+                    feature_matrix[lo:hi], static_dim)
+            del feature_matrix
+        return moments
+
+    def _transfer_request(self) -> CrossLanguageTransfer:
+        """The transfer configuration, as it will be recorded in the model."""
+        config = self.config
+        source = config.transfer_auxiliary_model \
+            or config.transfer_auxiliary_labels or ""
+        target_speaker = str(getattr(config, "transfer_target_speaker", "")
+                             or Path(config.label_file or "").stem)
+        return CrossLanguageTransfer(
+            enabled=True,
+            target_speaker=target_speaker,
+            target_language=config.transfer_target_language,
+            auxiliary_speaker=config.transfer_auxiliary_speaker,
+            auxiliary_language=config.transfer_auxiliary_language,
+            auxiliary_source=str(source),
+            adapt_pitch_bins=bool(config.transfer_adapt_pitch_bins),
+            map_prior_strength=float(config.transfer_map_prior_strength),
+            map_adapt_frames=float(config.transfer_map_adapt_frames))
+
+    def _auxiliary_voice(self):
+        """Voice 2: the auxiliary language's voice, loaded or trained here.
+
+        A pre-trained model is used as it is; its feature definition is checked
+        against this run's by `build_transfer`, which refuses the combination if
+        the two voices' numbers would not be comparable.  An auxiliary *corpus*
+        is trained on the fly with this run's acoustic settings -- the two
+        voices then share one feature definition by construction -- and its own
+        training keeps the disk-backed cache discipline, so only one corpus's
+        features are ever on disk at a time.
+        """
+        config = self.config
+        if config.transfer_auxiliary_model:
+            path = Path(str(config.transfer_auxiliary_model))
+            self.log(f"  loading the auxiliary voice from {path}")
+            return HMSModel.load(path)
+        labels = str(config.transfer_auxiliary_labels)
+        auxiliary_config = _dataclass_replace(
+            config,
+            label_file=labels, wav_dir=config.transfer_auxiliary_wav_dir,
+            transfer_enabled=False, transfer_auxiliary_model=None,
+            transfer_auxiliary_labels=None, transfer_auxiliary_wav_dir=None,
+            # The auxiliary voice carries its own pitch bins; without them
+            # there is nothing to transfer at the pitch-conditioned tier.
+            pitch_conditioning_enabled=bool(
+                config.pitch_conditioning_enabled
+                and config.transfer_adapt_pitch_bins))
+        self.log(f"  training the auxiliary voice from {labels}")
+        trainer = Trainer(auxiliary_config, self.phoneme_set,
+                          log=lambda message: self.log(f"  aux {message}"))
+        model = trainer.train()
+        model.name = (config.transfer_auxiliary_speaker
+                      or Path(labels).stem)
+        return model
+
+    def _build_transfer(self, utterances: Sequence[_CachedUtterance],
+                        hmms: Dict[str, LeftToRightHMM],
+                        pitch_conditioning: PitchConditioning,
+                        pitch_models: Dict[Tuple[str, int], LeftToRightHMM]
+                        ) -> Optional[TransferBuild]:
+        """Run the cross-language transfer stage, if it is enabled.
+
+        Two ordinary trained voices meet here: this run's own units (as the
+        target) and the auxiliary voice (as the coverage source).  Everything
+        the stage produces is returned for the caller to install; no native
+        model is modified.
+        """
+        config = self.config
+        if not config.transfer_enabled:
+            return None
+        self.log("  cross-language transfer (experimental):")
+        auxiliary = self._auxiliary_voice()
+        source = str(config.transfer_auxiliary_model
+                     or config.transfer_auxiliary_labels or "")
+        auxiliary_speaker = str(config.transfer_auxiliary_speaker or ""
+                                ) or str(getattr(auxiliary, "name", "")
+                                         or Path(source or "auxiliary").stem)
+        auxiliary_source = VoiceSource.from_model(
+            auxiliary, speaker=auxiliary_speaker,
+            language=config.transfer_auxiliary_language, source=source)
+        target_source = VoiceSource(
+            speaker=self._transfer_request().target_speaker,
+            language=config.transfer_target_language,
+            source=str(config.label_file or ""),
+            hmms=hmms, phoneme_set=self.phoneme_set, spec=self.spec,
+            pitch_conditioning=pitch_conditioning, pitch_models=pitch_models)
+        request = self._transfer_request()
+        if not request.auxiliary_speaker:
+            request = _dataclass_replace(request,
+                                         auxiliary_speaker=auxiliary_speaker)
+        moments = self._collect_cached_phone_moments(utterances)
+        self.log(f"  target-side statistics: {len(moments)} phone(s), "
+                 f"{phone_moments_nbytes(moments)} bytes retained")
+        build = build_transfer(
+            target=target_source, auxiliary=auxiliary_source,
+            request=request, moments=moments,
+            min_phone_frames=config.min_phoneme_frames, log=self.log)
+        del moments
+        if not build.units:
+            self.log("  ! cross-language transfer produced no units: the "
+                     "auxiliary voice has no trained phone that this voice "
+                     "lacks (or none of its phones clears its own support "
+                     "threshold); synthesis falls back exactly as before")
+        return build
+
+    def _merge_transfer(self, build: TransferBuild,
+                        duration_model: DurationModel,
+                        pitch_model: PitchModel) -> PhonemeSet:
+        """Fold a transfer build into the duration/pitch/inventory models.
+
+        Duration statistics, per-state relative-pitch statistics and voicing
+        priors are only *added*: anything this corpus measured for itself stays
+        exactly as it was (``setdefault``), which is the same "native data wins"
+        rule the unit lookup follows.  Inventory entries for transferred phones
+        are imported from the auxiliary voice so the saved model can describe
+        its own units (states, components, voiced flag); existing entries are
+        never overwritten.
+        """
+        for phone, stats in build.duration_stats.items():
+            duration_model.stats.setdefault(phone, stats)
+        for phone, stats in build.pitch_stats.items():
+            pitch_model.stats.setdefault(phone, stats)
+        for phone, prior in build.voiced_prior.items():
+            pitch_model.voiced_prior.setdefault(phone, prior)
+        if not build.phoneme_definitions:
+            return self.phoneme_set
+        phonemes = dict(self.phoneme_set.phonemes)
+        for phone, definition in build.phoneme_definitions.items():
+            phonemes.setdefault(phone, definition)
+        return PhonemeSet(phonemes, aliases=self.phoneme_set.aliases,
+                          defaults=self.phoneme_set.defaults,
+                          silence=self.phoneme_set.silence)
+
     # -- stage 4: duration and pitch ---------------------------------------
 
     def build_duration_model(self, durations: Dict[str, List[float]]
@@ -1483,20 +1729,41 @@ class Trainer:
                     "carried a scored note; synthesis will rely on the normal "
                     "phone/context/backoff hierarchy")
 
+        # Optional cross-language voice transfer (off by default): adapt a
+        # *second* voice's units for the phones this corpus cannot cover.  It
+        # reads the cache one more time (moments only, bounded by phones x
+        # dimensions), never modifies a native unit, and contributes its own
+        # tier plus the auxiliary voice's duration/pitch statistics.
+        transfer_build = self._build_transfer(
+            utterances, hmms, pitch_conditioning, pitch_models)
+        if transfer_build is not None and transfer_build.pitch_models:
+            # Transferred pitch bins join the same mapping as the native ones
+            # (and carry a ``transferred`` flag in their index records), so
+            # resolution and diagnostics need no special case for them.
+            pitch_models.update(transfer_build.pitch_models)
+            pitch_index.update(transfer_build.pitch_index)
+
+        transferred_models = transfer_build.units if transfer_build else {}
         total_params = sum(h.n_free_params for h in hmms.values()) \
             + sum(h.n_free_params for h in backoff.values()) \
             + sum(h.n_free_params for h in contexts.values()) \
             + sum(h.n_free_params for h in pitch_models.values()) \
+            + sum(h.n_free_params for h in transferred_models.values()) \
             + (global_backoff.n_free_params if global_backoff else 0)
         self.log(f"  {len(hmms)} HMMs, {len(backoff)} backoff model(s), "
                  f"{len(contexts)} context model(s), "
                  f"{len(pitch_models)} pitch-conditioned model(s), "
+                 f"{len(transferred_models)} transferred model(s), "
                  f"{total_params:,} total free params")
 
         self.log("5/5  duration, pitch and voicing models")
         duration_model = self.build_duration_model(durations)
         pitch_model = self._build_pitch_model_from_cache(
             utterances, hmms, vibrato_candidates)
+        phoneme_set = self.phoneme_set
+        if transfer_build is not None:
+            phoneme_set = self._merge_transfer(transfer_build, duration_model,
+                                               pitch_model)
 
         stats = ModelStats(
             utterances=len(utterances),
@@ -1511,7 +1778,7 @@ class Trainer:
         return HMSModel(
             name=str(config.label_file),
             spec=self.spec,
-            phoneme_set=self.phoneme_set,
+            phoneme_set=phoneme_set,
             hmms=hmms,
             duration_model=duration_model,
             pitch_model=pitch_model,
@@ -1524,6 +1791,14 @@ class Trainer:
             pitch_models=pitch_models,
             pitch_index=pitch_index,
             pitch_conditioning=pitch_conditioning,
+            transfer=(transfer_build.record if transfer_build is not None
+                      else None),
+            transfer_models=(transfer_build.units
+                             if transfer_build is not None else None),
+            transfer_index=(transfer_build.index
+                            if transfer_build is not None else None),
+            transfer_map=(transfer_build.acoustic_map
+                          if transfer_build is not None else None),
             metadata={
                 "hms_version": __version__,
                 "vocoder": getattr(self.vocoder, "name", "unknown"),

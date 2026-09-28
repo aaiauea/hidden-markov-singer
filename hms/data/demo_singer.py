@@ -446,11 +446,18 @@ def default_phrases() -> List[Tuple[str, List[SegmentSpec]]]:
 def make_dataset(out_dir, fs: int = 44100,
                  singer: Optional[SingerConfig] = None,
                  label_jitter_ms: float = 0.0,
-                 seed: int = 7) -> dict:
+                 seed: int = 7,
+                 phrases: Optional[Sequence[Tuple[str, List[SegmentSpec]]]] = None,
+                 renderer: Optional[DemoSinger] = None) -> dict:
     """Write the example corpus to ``out_dir``.
 
     Creates ``wav/<name>.wav``, ``labels.tsv`` (ground truth, for training) and
     ``score.tsv`` (the same segments, for synthesis).  Returns a summary dict.
+
+    ``phrases`` (default: :func:`default_phrases`) and ``renderer`` let callers
+    build a different corpus with the same file layout -- a second voice, or a
+    second language with a different phoneme inventory -- which is what the
+    cross-language transfer tests and examples need.
     """
     out_dir = Path(out_dir)
     wav_dir = out_dir / "wav"
@@ -458,7 +465,8 @@ def make_dataset(out_dir, fs: int = 44100,
 
     config = singer or SingerConfig(fs=fs, seed=seed)
     config.fs = fs
-    renderer = DemoSinger(config)
+    renderer = renderer if renderer is not None else DemoSinger(config)
+    phrases = list(phrases) if phrases is not None else default_phrases()
     rng = np.random.default_rng(seed + 1)
 
     label_lines: List[str] = ["# utt_id\tonset\toffset\tphone\tnote"]
@@ -466,7 +474,7 @@ def make_dataset(out_dir, fs: int = 44100,
     total_seconds = 0.0
     n_segments = 0
 
-    for name, script in default_phrases():
+    for name, script in phrases:
         audio = renderer.render(script)
         wavio.write_wav(wav_dir / f"{name}.wav", audio, fs)
 
@@ -483,7 +491,7 @@ def make_dataset(out_dir, fs: int = 44100,
     (out_dir / "score.tsv").write_text("\n".join(score_lines) + "\n",
                                        encoding="utf-8")
     return {
-        "utterances": len(default_phrases()),
+        "utterances": len(phrases),
         "segments": n_segments,
         "seconds": total_seconds,
         "wav_dir": str(wav_dir),

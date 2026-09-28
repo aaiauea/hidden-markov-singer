@@ -26,6 +26,12 @@ Each stage is independently replaceable:
   can be rendered from the distribution learned at that pitch region.  It only
   changes which HMM is consulted -- the F0 path above is untouched, and a bin
   the voice was never trained on falls back to the ordinary hierarchy;
+* `hms.core.transfer` (optional, experimental, off by default) adds *transferred*
+  units: phones adapted from a second voice trained on another language, so this
+  voice can sing a score its own corpus could not cover.  A transferred unit is
+  consulted only after this voice's own dedicated model for the phone, so
+  nothing a voice already knows is ever replaced; a render that uses one reports
+  it in `SynthesisResult.diagnostics`;
 * `hms.vocoder` turns (f0, sp, ap) into samples.
 
 F0 can also be supplied from outside.  Passing ``f0=`` to `synthesize` replaces
@@ -80,6 +86,7 @@ from hms.core.features import (AcousticFrameSequence, FeatureSpec,
 from hms.core.generation import mlpg, stack_streams
 from hms.core.model import HMSModel
 from hms.core.pitch_condition import effective_note, is_pitch_tier
+from hms.core.transfer import TIER_TRANSFERRED
 
 
 @dataclass
@@ -319,6 +326,11 @@ class Synthesizer:
         pitch_conditioned_frames = 0
         pitch_fallback_frames = 0
         pitch_missing_bins: Dict[int, int] = {}
+        #: cross-language transfer bookkeeping (only collected when the model
+        #: carries the experimental tier, so an ordinary render is unchanged)
+        transferred_frames = 0
+        transfer_fallback_frames = 0
+        transfer_units: Dict[str, int] = {}
 
         for utterance in score:
             if config.duration_mode == "model" or utterance.end <= utterance.start:
@@ -358,6 +370,7 @@ class Synthesizer:
             silence = self.model.phoneme_set.silence
             for seg_index, (phone, frames, note) in enumerate(segments):
                 pitch_bin = self._segment_pitch_bin(phone, note)
+                _key: object = None
                 if self.model.contexts or self.model.pitch_models:
                     pre = segment_phones[seg_index - 1] if seg_index > 0 \
                         else silence
@@ -367,15 +380,21 @@ class Synthesizer:
                         pre, phone, post, pitch_bin=pitch_bin)
                 else:
                     hmm = self.model.get_or_backoff(phone)
-                    tier = None
-                if self.model.get_hmm(phone) is None \
+                    if self.model.has_native_hmm(phone):
+                        tier = "phone"
+                    elif self.model.has_transfer_hmm(phone):
+                        tier = TIER_TRANSFERRED
+                    else:
+                        tier = "class"
+                if not self.model.has_native_hmm(phone) \
+                        and not self.model.has_transfer_hmm(phone) \
                         and tier in (None, "class", "global"):
                     diagnostics.append(
                         f"{utterance.name}: phoneme {phone!r} is not in the "
                         f"model; using the backoff model")
                 counts = DurationModel.allocate(frames, hmm.duration_proportions())
+                allocated = int(sum(counts))
                 if pitch_bin is not None:
-                    allocated = int(sum(counts))
                     if is_pitch_tier(tier):
                         pitch_conditioned_frames += allocated
                     else:
@@ -384,6 +403,15 @@ class Synthesizer:
                         pitch_fallback_frames += allocated
                         pitch_missing_bins[pitch_bin] = \
                             pitch_missing_bins.get(pitch_bin, 0) + allocated
+                if self.model.transfer.active:
+                    if self.model.unit_is_transferred(_key, tier):
+                        transferred_frames += allocated
+                        transfer_units[phone] = \
+                            transfer_units.get(phone, 0) + allocated
+                    elif tier in ("class", "global"):
+                        # neither this voice nor a transferred model covers the
+                        # phone: the ordinary backoff hierarchy did
+                        transfer_fallback_frames += allocated
                 for state, count in enumerate(counts):
                     frame_phones.extend([phone] * int(count))
                     state_ids.extend([state] * int(count))
@@ -408,6 +436,8 @@ class Synthesizer:
         diagnostics.extend(self._pitch_conditioning_diagnostics(
             pitch_conditioned_frames, pitch_fallback_frames,
             pitch_missing_bins))
+        diagnostics.extend(self._transfer_diagnostics(
+            transferred_frames, transfer_fallback_frames, transfer_units))
         return (frame_phones, state_ids, segment_ids, note_per_frame,
                 segment_frames, diagnostics)
 
@@ -468,6 +498,43 @@ class Synthesizer:
             message += (f"; {fallback} frame(s) asked for a pitch bin with no "
                         f"trained model (bin {listing}) and fell back to the "
                         f"unconditioned hierarchy")
+        return [message]
+
+    def _transfer_diagnostics(self, transferred: int, fallback: int,
+                              units: Dict[str, int]) -> List[str]:
+        """Report how the experimental cross-language tier was used.
+
+        Emitted only for a voice that carries transferred units, so an ordinary
+        render says exactly what it always said.  Which units are native and
+        which were adapted from another language is the central question about
+        such a voice, and a frame count per transferred phone is the cheapest
+        honest answer -- falling back to the class backoff is not an error (a
+        phone neither voice covers still has to sing something) but it should
+        not be invisible either.
+        """
+        transfer = self.model.transfer
+        if not transfer.active:
+            return []
+        if not self.model.transfer_models:
+            return [f"cross-language transfer was configured for this voice "
+                    f"({transfer.target_label} <- {transfer.auxiliary_label}) "
+                    f"but it carries no transferred units; every phone "
+                    f"resolved through the native hierarchy"]
+        if not transferred and not fallback:
+            return []
+        listing = ", ".join(f"{phone} x{frames}"
+                            for phone, frames in sorted(units.items())[:6])
+        if len(units) > 6:
+            listing += f", ... ({len(units)} phones)"
+        message = (f"cross-language transfer ({transfer.target_label} <- "
+                   f"{transfer.auxiliary_label}): {transferred} frame(s) "
+                   f"rendered from transferred units")
+        if listing:
+            message += f" ({listing})"
+        if fallback:
+            message += (f"; {fallback} frame(s) of phones with neither a "
+                        f"native nor a transferred model fell back to the "
+                        f"class/global backoff")
         return [message]
 
     @staticmethod
