@@ -310,8 +310,10 @@ read label file → analyse every utterance (WORLD) → per-frame phoneme/note l
   plus an optional pooled global backoff
 → optional (pitch_conditioning.enabled): the same units re-bucketed by pitch
   bin of the scored note
+→ optional (transfer.enabled): the auxiliary voice's units for phones this
+  corpus has no model for, adapted into this voice's space (next subsection)
 → duration model (per phoneme) → pitch model (per phoneme/state) → voicing
-→ HMSModel (spec, hmms, backoff, contexts, pitch models, normalisation, stats)
+→ HMSModel (spec, hmms, backoff, contexts, pitch models, transfer, stats)
 ```
 
 `min_phoneme_frames` (default 20) is the guard rail: a phoneme below it does
@@ -327,7 +329,10 @@ Both optional tiers are separate passes over the same disk-backed cache: one
 utterance is memory-mapped at a time and every bucket keeps *views* into it
 rather than copies, so neither splitting a corpus by phone context nor by pitch
 bin puts the corpus in RAM. The caches are released before the duration and
-pitch models reopen them.
+pitch models reopen them. Cross-language transfer adds one more pass over the
+same cache, and it keeps only *moments*: two `static_dim` vectors plus a count
+per phone, so the memory it holds is bounded by phones x dimensions and never by
+corpus length.
 
 ### Optional sparse phone contexts (`context.enabled: true`)
 
@@ -517,6 +522,225 @@ that range is covered), measured with `hms evaluate` against an unconditioned
 baseline — the thresholds decide what is modelled, and a bin with too few frames
 is left unmodelled rather than fitted to a handful of frames.
 
+### Optional cross-language voice transfer (experimental)
+(`transfer.enabled: true`, `hms train --transfer-model …`)
+
+Off by default. The problem it solves is not a language-technology problem: a
+voice trained on language A simply has no acoustic model for the phones of
+language B, so a language-B score falls back to a phone-class model — a
+plausible sound, but not that phone. Cross-language transfer combines two
+*independently trained* voices at training time:
+
+```
+Voice 1 (target)   : the timbre that must be kept         -- corpus in language A
+Voice 2 (auxiliary): the phonetic coverage that is wanted -- corpus in language B
+        |
+        v   classical adaptation of Voice 2's units into Voice 1's acoustic space
+Voice 1 singing language B (one ordinary HMS model, one HMM per unit)
+```
+
+It is **not** multilingual G2P, **not** a model trained on two languages at
+once, and **not** a neural method (no embedding, no network, no external
+framework). The output is an ordinary `HMSModel` with a few extra *transferred*
+HMMs — each one a plain left-to-right HMM with diagonal-covariance GMMs, exactly
+like every other unit — and WORLD, MLPG, F0/vibrato, contexts, class backoff,
+disk-backed training and pitch conditioning are untouched.
+
+**Interface.** The configuration names all four things explicitly, so no
+dataset ever has to be merged into a fake speaker:
+
+```yaml
+transfer:
+  enabled: true
+  target_speaker: voice-1        # the timbre to keep (defaults to the run name)
+  target_language: en            # the language Voice 1 already sings
+  auxiliary_speaker: voice-2     # the reference voice
+  auxiliary_language: de         # the language to be transferred
+  auxiliary_model: models/voice-2    # a trained model directory, or:
+  auxiliary_labels: langB/labels.tsv #   a corpus (with auxiliary_wav_dir)
+  adapt_pitch_bins: true         # also transfer (phone, pitch bin) units
+  map_prior_strength: 1.0        # kappa: anchor observations the identity is worth
+  map_adapt_frames: 100.0        # tau: frames Voice 1's own observations are worth
+```
+
+The CLI mirrors it (`hms train --transfer-model … --language en`,
+`--transfer-labels/--transfer-wav-dir`, `--transfer-speaker`,
+`--transfer-language`; `--name` sets the target speaker). Exactly one auxiliary
+source must be given; both language labels are required; an unknown key is an
+error rather than a typo that silently does nothing. A source *corpus* is
+trained on the fly with this run's acoustic settings (which guarantees the two
+voices share a feature definition) and with the disk-backed cache discipline, so
+only one corpus's features are ever on disk at a time. A source *model* is used
+as it is and its feature definition is checked against this run's; a
+pitch-bin-width mismatch is refused rather than silently reinterpreting Voice 2's
+bins.
+
+**Why the target stays the target.** HMS normalises every corpus by its own
+per-dimension mean and standard deviation before training
+(`z = (x - offset) * scale`, `Trainer._normalization_from_moments`), so a
+model's GMMs live in that model's own z-scored space, where its corpus has
+approximately zero mean and unit variance in every dimension. A transferred
+unit is therefore *expressed in Voice 1's space by construction*: its numbers
+are written in Voice 1's normalisation and are denormalised with Voice 1's
+offset/scale at synthesis. Nothing absolute of Voice 2 — its spectral envelope,
+loudness, average cepstrum, variance — survives the conversion. What is taken
+from Voice 2 is the *shape* of the phone, i.e. how it sits relative to the other
+phones of language B; the map below decides where that shape lands inside Voice
+1's space. Voice 1's own units are only ever read, never replaced: a phone Voice
+1 has a dedicated HMM for is never touched, whatever the auxiliary voice
+contains.
+
+**1. Anchors.** A phone both voices have a dedicated HMM for is an *anchor* —
+the same phonetic unit observed through two vocal tracts. Anchors are the only
+data the map is estimated from. When the two languages share no phone symbol at
+all, the map falls back to pooled *phoneme-class* anchors (both voices' vowels,
+both voices' silence, …), which are coarser — the two pools hold different
+phones — and are recorded as such in the model.
+
+**2. Anchor regression (MAP, shrunk towards the identity).** For each anchor
+phone `p`, the pooled mean of its HMM in each voice's own space
+(frame-weighted over states, mixture-weighted inside a state) gives a pair
+
+```
+x_p = pooled mean of p in Voice 2's space
+y_p = pooled mean of p in Voice 1's space
+```
+
+and the map is the MAP (ridge) affine fit of `y` on `x`:
+
+```
+theta = argmin  sum_p || y_p - Z_p theta ||^2  +  kappa ||theta - theta_0||^2
+      = (Z^T Z + kappa I)^-1 (Z^T Y + kappa [I | 0]),   Z = [x_p, 1],
+theta = [A | b]^T,   theta_0 = [I | 0]  (the identity)
+```
+
+which is the closed-form posterior mean under a Gaussian prior centred on the
+identity. `kappa` (`map_prior_strength`, default 1) is the number of anchor
+phones the identity is worth: with no anchors the map *is* the identity; with
+one anchor it is the smallest deviation from the identity that honours that
+anchor; with many, the data dominates and the prior only guards the directions
+the anchors do not span. Read in absolute units the identity is mean/variance
+matching — both voices' dimensions have zero mean and unit spread in their own
+space — so "keep Voice 2's geometry unless Voice 1's anchors show otherwise" is
+a prior, not a hack: every anchor phone has to earn its deviation.
+
+`A` is a full `static_dim x static_dim` matrix, not one slope per dimension. The
+dominant difference between two vocal tracts is a warping of the spectral
+envelope, and a warping mixes mel-cepstral coefficients: the diagonal is the
+"rescale each coefficient" approximation, the off-diagonal entries the rest of
+it. (Measured leave-one-out on a synthetic two-voice corpus: identity 0.905,
+best diagonal 0.813, full matrix 0.674 mean squared anchor error — the
+off-diagonal terms carry most of the map.) The intercept `b` is a constant
+offset, so it is applied to the static block only; the delta and delta-delta
+streams take the *linear* part of the same map, because a delta is a
+difference and has no mean to offset.
+
+**3. Variance propagation and the residual.** Mapping means also moves
+variances; since HMS covariances are diagonal, the exact diagonal form of
+`A var A^T` is used per dimension, plus the regression's own residual:
+
+```
+var'_i = sum_j A[i, j]^2 * var_aux_j + s_i^2
+s_i^2  = ( sum_p (y_pi - (A x_p + b)_i)^2 + kappa * Var(y_i) ) / (P + kappa)
+```
+
+`s^2` is the part of Voice 1's phone-to-phone variation the regression does not
+explain — a Voice 1 quantity in Voice 1's units — and the `kappa * Var(y)` term
+stops a single anchor (or an exactly determined fit) from claiming a
+zero-variance transformation. With no anchors at all the map is the identity and
+`s^2` falls back to the spread of Voice 1's own phone means, so the transferred
+unit is blurred by Voice 1's *between-phone* variance. Two documented guards
+bound degenerate cases: variance factors are clipped to `1e-3 … 1e3`, and a mean
+is never moved more than 8 normalised units (8 corpus standard deviations) by
+the map.
+
+**4. MAP mean/variance adaptation to Voice 1's own frames.** A phone Voice 1's
+corpus *does* contain — but too rarely to earn its own HMM — has observations of
+its own, and they are worth using. With `n` frames of that phone in Voice 1,
+`m_t`/`v_t` their pooled mean/variance, `m_p`/`v_p` the pooled mean/variance of
+the *mapped* Voice 2 model, and `tau` (`map_adapt_frames`, default 100) the
+prior strength in frames:
+
+```
+m = (n * m_t + tau * m_p) / (n + tau)      -> a location shift of the unit
+v = (n * v_t + tau * v_p) / (n + tau)      -> a per-dimension spread factor
+```
+
+The mean correction shifts every component of every state by the same offset
+(the mixture's shape is preserved) on the static block; the spread factor scales
+the static and dynamic streams alike. With `n = 0` — the phone is absent from
+Voice 1's corpus, the case this feature exists for — both are the identity and
+the mapped model stands alone. The more Voice 1's own frames say, the further
+the unit is pulled towards them.
+
+**5. What is copied, not adapted.** State durations, self-loop probabilities,
+per-state voicing probabilities and (when both voices carry them) the
+note-relative per-state pitch statistics and voicing priors, plus the phone's
+duration statistics, come from Voice 2 as plain HMS statistics — pitched
+statistics mapped through dimension 0 of the same acoustic map. They describe
+*how language B's phone is produced* — how long it lasts, whether it is voiced,
+how it moves around the note — not the singer's timbre; a transferred unit whose
+timing came from language A would be a different phone. The target's duration
+model, pitch model and voiced priors only gain entries the target did not
+already have (`setdefault`), so this is an *import of coverage*, not an
+overwrite.
+
+**6. Pitch-conditioned units.** When the target was trained with the
+pitch-conditioned tier and the auxiliary carries the same tier with the same bin
+width, the auxiliary's `(phone, bin)` buckets of the transferred phones go
+through the same map and the same MAP correction as their phone model and are
+installed as the target's own conditioned units. A bin is an absolute MIDI
+range, so it means the same thing in both voices; only the acoustic statistics
+have to travel. Bins the auxiliary never trained, and bins that do not clear the
+target's support threshold, are simply absent — synthesis then falls back to the
+transferred phone model rather than to a bin that does not exist, exactly as for
+native units.
+
+**Resolution order.** The transferred tier is a rung of the existing hierarchy,
+below the native phone and above class backoff:
+
+```
+exact triphone [+ bin] -> one-sided diphone [+ bin] -> dedicated phone [+ bin]
+-> transferred phone -> phone-class backoff -> global backoff
+```
+
+so a transferred unit can never shadow data the target voice actually has, and
+`resolve_unit` reports the tier `transferred` for it. The pitch-conditioned
+transferred models sit at the ordinary `phone+pitch` rung (their `pitch_index`
+entry carries a `transferred` flag), which keeps pitch resolution identical for
+native and transferred units.
+
+**Diagnostics.** Training logs the target and auxiliary voices and languages,
+the number of anchor phones (and class anchors) the map was fitted from, the map
+summary (`||A - I||`, residual rms), the transferred phones, the transferred
+pitch-conditioned units and their bins, the inventory entries imported from the
+auxiliary voice, and the number of native versus transferred units in the final
+parameter report. `hms inspect-model` prints the same transfer record, the
+per-unit index (anchor counts, adapted frames, adaptation weight, mean shift,
+spread) and the map's numbers. `hms synth` reports how many frames were rendered
+by a transferred unit, how many fell back to a class backoff and how many frames
+took each pitch-conditioned path; `hms evaluate` adds `transferred_frames` (plus
+the pitch-conditioned/fallback counters) per model, so the tier's effect is
+measurable against a baseline.
+
+**Model format.** A transfer run writes model format **5**: the same files as
+format 4 plus a `transfer:` section (the record above, including which anchors
+and which phones it used), a `transfer_index:` section (per-unit provenance and
+adaptation weights) and `transfer.npz` (the acoustic map's arrays and every
+transferred unit's GMM arrays, under `"{phone}/"` prefixes). Formats 2, 3 and 4
+keep loading with the tier recorded as disabled; a file that announces transfer
+data but has lost `transfer.npz` is reported as such instead of being loaded
+half-way; nothing is written at all when the feature is off.
+
+**What this is not.** Not a quality claim, and not a second trainer: the
+auxiliary voice is an ordinary HMS model (trained by the same code, or loaded
+from disk) and the transferred units are ordinary HMS units. What the tests
+check is that the mechanism is deterministic, that it is exactly the arithmetic
+above, that a transferred unit lives in Voice 1's acoustic space, that it is
+used exactly where the auxiliary's coverage says it should be, and that
+everything else — every other tier, every other feature — behaves exactly as it
+did before.
+
 ## 7b. Model evaluation (`hms/core/evaluate.py`, `hms evaluate`)
 
 `hms evaluate` compares trained models on an evaluation corpus without
@@ -579,8 +803,9 @@ model.yaml      human readable: format version, feature spec, normalisation
                 (offset/scale), phoneme set, duration model, pitch model
                 (including vibrato), HMM index, context index (when context
                 modelling was on), pitch conditioning definition and pitch
-                index (when pitch conditioning was on), parameter budget,
-                metadata
+                index (when pitch conditioning was on), cross-language transfer
+                record and transfer index (when the transfer tier was on),
+                parameter budget, metadata
 hmm.npz         arrays: GMM weights/means/variances, self-loops, durations,
                 voicing probabilities
 backoff.npz     the same for the pooled per-class models
@@ -588,14 +813,24 @@ context.npz     the same for the sparse phone-context models and the optional
                 global backoff (only written when any of them exist)
 pitch.npz       the same for the pitch-conditioned models (only written when
                 any exist)
+transfer.npz    the acoustic map's arrays plus every transferred unit's, under
+                "{phone}/" prefixes (only written when the transfer tier
+                produced units)
 ```
 
 YAML for anything a human might want to read or tweak, `.npz` for the arrays.
 `HMSModel.save/load` is the only serialisation code in the project, and the
-loader validates the format version. The current format is 4; each version is
+loader validates the format version. The current format is 5; each version is
 additive over the previous one (2 = baseline, 3 = the context tier, 4 = the
-pitch-conditioned tier), so format-2 and format-3 models keep loading — with an
-empty tier and, for pitch conditioning, `enabled: false` recorded. Context keys
+pitch-conditioned tier, 5 = the cross-language transfer tier), so formats 2-4
+keep loading — with an empty tier and, for the optional tiers, `enabled: false`
+recorded. Cross-language transfer is the one tier whose index is *not* keyed by
+`pitch.npz`-style unit names: `transfer_index` is keyed by phone and carries the
+provenance (source speaker/language, anchors, adapted frames, adaptation weight,
+mean shift, spread) of the unit stored under that prefix, and `transfer:` carries
+the same record the model was trained with, including the anchor phones and the
+map's summary. Nothing is written when the feature is off, so a non-transfer
+model's files are exactly what they were. Context keys
 are three `^`-joined phone symbols (`a^i^sil`); a reserved wildcard marks the
 unmodelled side of a one-sided diphone (`s^a^_` = `a` given left neighbour `s`,
 `_^a^i` = `a` given right neighbour `i`), which keeps the two diphone pools of
@@ -637,7 +872,7 @@ it stands for straight from the file.
 | 5 aperiodicity bands | the fine structure of `ap` is perceptually unimportant compared to 1025 extra parameters |
 | vibrato outside the HMM | MLPG would smooth it away; keeping it explicit makes it controllable |
 | no spectral postfilter (GV etc.) | MLPG already yields slightly over-smoothed spectra, and a postfilter is a tuning surface better added later, deliberately |
-| one speaker per model | adaptation/multi-speaker would complicate every stage; nothing in the format prevents adding it |
+| one speaker per model | the format stays one voice per model; the experimental cross-language tier adds *adaptive coverage* for phones a voice lacks (an auxiliary voice's units mapped into the target's space), not a multi-speaker synthesiser |
 
 ## 11. Extension points
 

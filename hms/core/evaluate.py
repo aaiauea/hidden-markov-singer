@@ -36,6 +36,7 @@ from hms.core import labels as labels_module
 from hms.core.model import HMSModel
 from hms.core.pitch_condition import is_pitch_tier
 from hms.core.trainer import Corpus, Trainer, TrainingConfig, UtteranceData
+from hms.core.transfer import TIER_TRANSFERRED
 
 #: Training-config keys that describe the optional context feature; they are
 #: legitimately different between a baseline and a context model.
@@ -48,6 +49,17 @@ _CONTEXT_FIELDS = ("context_enabled", "context_min_frames",
 #: baseline is the usual reason to run the comparison.
 _PITCH_CONDITIONING_FIELDS = ("pitch_conditioning_enabled",
                               "pitch_conditioning_bin_size")
+
+#: Training-config keys of the experimental cross-language transfer tier; a
+#: transferred voice is *meant* to be compared against its single-language
+#: baseline, so its settings are exempt from the "models differ" warnings (the
+#: differing unit inventories they come with are still reported).
+_TRANSFER_FIELDS = ("transfer_enabled", "transfer_target_language",
+                    "transfer_target_speaker", "transfer_auxiliary_language",
+                    "transfer_auxiliary_speaker", "transfer_auxiliary_model",
+                    "transfer_auxiliary_labels", "transfer_auxiliary_wav_dir",
+                    "transfer_adapt_pitch_bins", "transfer_map_prior_strength",
+                    "transfer_map_adapt_frames")
 
 
 def _training_config_of(model: HMSModel) -> Dict[str, object]:
@@ -104,7 +116,8 @@ def check_model_compatibility(models: Sequence[HMSModel]
         names = [model.name for model in models]
         all_keys = set().union(*(set(config) for config in configs))
         for key in sorted(all_keys):
-            if key in _CONTEXT_FIELDS or key in _PITCH_CONDITIONING_FIELDS:
+            if key in _CONTEXT_FIELDS or key in _PITCH_CONDITIONING_FIELDS \
+                    or key in _TRANSFER_FIELDS:
                 continue                      # the optional tiers are the point
             values = [config.get(key) for config in configs]
             comparable = []
@@ -146,6 +159,7 @@ def _analysis_trainer(model: HMSModel, label_file: str, wav_dir: str,
     kwargs = {key: value for key, value in metadata_config.items()
               if key in known and not key.startswith("context_")
               and not key.startswith("pitch_conditioning_")
+              and not key.startswith("transfer_")
               and key not in ("label_file", "wav_dir")}
     try:
         config = TrainingConfig.from_dict(kwargs)
@@ -189,6 +203,7 @@ def _evaluate_single(model: HMSModel, utterances: Sequence[UtteranceData],
     duration_abs_error = 0.0
     duration_segments = 0
     backoff_frames = 0
+    transferred_frames = 0
     pitch_conditioned_frames = 0
     pitch_fallback_frames = 0
     per_phone_ll: Dict[str, List[float]] = {}
@@ -215,8 +230,14 @@ def _evaluate_single(model: HMSModel, utterances: Sequence[UtteranceData],
                 _key, hmm, tier = model.resolve_unit(pre, curr, post,
                                                      pitch_bin=pitch_bin)
             else:
+                _key = None
                 hmm = model.get_or_backoff(curr)
-                tier = "phone" if model.get_hmm(curr) is not None else "class"
+                if model.get_hmm(curr) is not None:
+                    tier = "phone"
+                elif model.get_transfer_hmm(curr) is not None:
+                    tier = TIER_TRANSFERRED
+                else:
+                    tier = "class"
             segment = normalized[lo:hi]
             n_frames = len(segment)
             ll = float(hmm.log_likelihood(segment))
@@ -224,6 +245,8 @@ def _evaluate_single(model: HMSModel, utterances: Sequence[UtteranceData],
             total_frames += n_frames
             if tier in ("class", "global"):
                 backoff_frames += n_frames
+            if model.unit_is_transferred(_key, tier):
+                transferred_frames += n_frames
             if pitch_bin is not None:
                 if is_pitch_tier(tier):
                     pitch_conditioned_frames += n_frames
@@ -263,6 +286,10 @@ def _evaluate_single(model: HMSModel, utterances: Sequence[UtteranceData],
         "duration_mae_frames": float(duration_abs_error / duration_segments)
         if duration_segments else 0.0,
         "backoff_frames": backoff_frames,
+        # Cross-language transfer tier usage: frames scored under a unit
+        # adapted from another voice.  Zero for every model trained without the
+        # experimental feature, so it reads the same as it always did.
+        "transferred_frames": transferred_frames,
         # Pitch-conditioned tier usage: how many frames were scored under a
         # model trained for their pitch bin, and how many asked for a bin the
         # voice has no model for and fell back.  Zero for an unconditioned

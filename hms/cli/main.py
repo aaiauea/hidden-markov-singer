@@ -18,6 +18,7 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -86,6 +87,16 @@ def _training_config(args) -> TrainingConfig:
         "f0_estimation": getattr(args, "f0_estimation", None),
         "pitch_variation": getattr(args, "pitch_variation", None),
         "fs": getattr(args, "fs", None),
+        # experimental cross-language voice transfer (see `hms.core.transfer`):
+        # nothing here is set unless the user names an auxiliary voice
+        "transfer_target_language": getattr(args, "language", None),
+        "transfer_auxiliary_language": getattr(args, "transfer_language", None),
+        "transfer_auxiliary_speaker": getattr(args, "transfer_speaker", None),
+        "transfer_auxiliary_model": getattr(args, "transfer_model", None),
+        "transfer_auxiliary_labels": getattr(args, "transfer_labels", None),
+        "transfer_auxiliary_wav_dir": getattr(args, "transfer_wav_dir", None),
+        "transfer_map_prior_strength": getattr(args, "transfer_map_prior", None),
+        "transfer_map_adapt_frames": getattr(args, "transfer_adapt_frames", None),
     }
     if getattr(args, "delta2", None) is not None:
         overrides["use_delta2"] = bool(args.delta2)
@@ -99,15 +110,28 @@ def _training_config(args) -> TrainingConfig:
         overrides["pitch_conditioning_enabled"] = bool(args.pitch_conditioning)
     if getattr(args, "pitch_bin_size", None) is not None:
         overrides["pitch_conditioning_bin_size"] = int(args.pitch_bin_size)
+    if getattr(args, "transfer_pitch_bins", None) is not None:
+        overrides["transfer_adapt_pitch_bins"] = bool(args.transfer_pitch_bins)
+    transfer_model = getattr(args, "transfer_model", None)
+    transfer_labels = getattr(args, "transfer_labels", None)
+    if transfer_model or transfer_labels:
+        # Naming an auxiliary voice is what turns the feature on -- `--language`
+        # alone only labels the target, so an ordinary single-language run can
+        # carry a language tag without opting into transfer.  `setattr`
+        # bypasses TrainingConfig's validation, so an incomplete pair is
+        # re-checked by the constructor below.
+        overrides["transfer_enabled"] = True
     for key, value in overrides.items():
         if value is not None:
             setattr(config, key, value)
     # An override applied with setattr bypasses TrainingConfig's validation, so
-    # re-check the one setting whose value defines the model's pitch bins: a
-    # bad bin width is a one-line error now, not a failure after the whole
-    # corpus has been analysed.
+    # every setting the CLI can change is re-checked once, now: a bad pitch bin
+    # width or an incomplete transfer pair is a one-line error instead of a
+    # failure after the whole corpus has been analysed.
     config.pitch_conditioning_bin_size = validate_bin_size(
         config.pitch_conditioning_bin_size)
+    if config.transfer_enabled:
+        config._validate_transfer()
     return config
 
 
@@ -235,6 +259,12 @@ def cmd_extract(args) -> int:
 def cmd_train(args) -> int:
     config = _training_config(args)
     phoneme_set = load_phoneme_set(getattr(args, "phonemes", None))
+    if args.name and config.transfer_enabled \
+            and not config.transfer_target_speaker:
+        # Record the target speaker under the name the model will get, so the
+        # transfer record and every per-unit index entry agree with the model
+        # name from the start (the trainer writes them during training).
+        config = replace(config, transfer_target_speaker=str(args.name))
 
     if args.resume:
         _log("resuming from an existing model is not supported yet; "
@@ -448,6 +478,26 @@ def cmd_inspect_model(args) -> int:
                 key: {**(model.context_index.get(key) or {}),
                       "n_free_params": hmm.n_free_params}
                 for key, hmm in sorted(model.contexts.items())},
+            "transfer": {
+                **model.transfer.to_dict(),
+                # whether the native or the transferred tier answered is a
+                # lookup-time question; the index says which units exist
+                "models": [
+                    {"phone": phone, "native": phone in model.hmms,
+                     **(model.transfer_index.get(phone) or {}),
+                     "n_free_params": hmm.n_free_params}
+                    for phone, hmm in sorted(model.transfer_models.items())],
+                "acoustic_map": (None if model.transfer_map is None else {
+                    "anchor_phones": list(
+                        model.transfer_map.anchor_phones),
+                    "anchor_classes": list(
+                        model.transfer_map.anchor_classes),
+                    "identity": bool(model.transfer_map.identity),
+                    "linear_deviation": model.transfer_map.linear_deviation,
+                    "residual_rms": float(
+                        model.transfer_map.residual_variance.mean() ** 0.5),
+                }),
+            },
             "pitch_conditioning": {
                 **model.pitch_conditioning.to_dict(),
                 # a list of records, not a "phone@bin" naming scheme: the unit
@@ -668,6 +718,45 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--pitch-bin-size", type=int, default=None,
                        help="width of a pitch bin in semitones (default 6, a "
                             "tritone; only used with pitch conditioning)")
+    train.add_argument(
+        "--language", default=None,
+        help="language label of this corpus (e.g. 'en'); recorded in the "
+             "model and required by cross-language transfer")
+    train.add_argument(
+        "--transfer-model", default=None,
+        help="EXPERIMENTAL cross-language voice transfer: a trained model "
+             "directory of the *auxiliary* voice, whose language covers the "
+             "phones this corpus lacks. Its units are adapted into this "
+             "voice's acoustic space (never copied as they are, and never "
+             "used where this voice has its own model)")
+    train.add_argument(
+        "--transfer-labels", default=None,
+        help="... or the auxiliary voice's label file, trained on the fly with "
+             "this run's acoustic settings (see --transfer-wav-dir)")
+    train.add_argument("--transfer-wav-dir", default=None,
+                       help="audio directory of the --transfer-labels corpus")
+    train.add_argument("--transfer-language", default=None,
+                       help="language label of the auxiliary voice (e.g. "
+                            "'de'): what is being transferred")
+    train.add_argument("--transfer-speaker", default=None,
+                       help="speaker label of the auxiliary voice (default: "
+                            "its model or dataset name)")
+    train.add_argument("--transfer-pitch-bins", dest="transfer_pitch_bins",
+                       action="store_true", default=None,
+                       help="also transfer the auxiliary voice's "
+                            "pitch-conditioned (phone, pitch bin) units "
+                            "(default on; only takes effect when this model is "
+                            "trained with --pitch-conditioning)")
+    train.add_argument("--no-transfer-pitch-bins", dest="transfer_pitch_bins",
+                       action="store_false",
+                       help="transfer the auxiliary voice's phones without "
+                            "their pitch conditions")
+    train.add_argument("--transfer-map-prior", type=float, default=None,
+                       help="anchor phones the identity map is worth (kappa, "
+                            "default 1.0; larger = more conservative transfer)")
+    train.add_argument("--transfer-adapt-frames", type=float, default=None,
+                       help="frames this corpus's own observations of a phone "
+                            "are worth in the MAP blend (tau, default 100)")
     train.add_argument("--evaluate", action="store_true",
                        help="report the training-set log likelihood")
     train.add_argument("--resume", action="store_true",

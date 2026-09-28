@@ -99,6 +99,15 @@ def training_config_from_parameters(parameters: Mapping[str, Any]
             raise ValueError(f"unknown pitch_conditioning option: {key!r}")
         if value is not None:
             values[name] = value
+    transfer = parameters.get("transfer") or {}
+    if not isinstance(transfer, dict):
+        raise ValueError("the transfer section must be a mapping")
+    for key, value in transfer.items():
+        name = f"transfer_{_ALIASES.get(key, key)}"
+        if name not in TrainingConfig.__dataclass_fields__:  # type: ignore[attr-defined]
+            raise ValueError(f"unknown transfer option: {key!r}")
+        if value is not None:
+            values[name] = value
     if "vibrato" in pitch:
         values["vibrato_enabled"] = bool(
             (pitch["vibrato"] or {}).get("enabled", False))

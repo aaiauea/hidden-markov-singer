@@ -30,6 +30,20 @@ condition stays structured metadata and never enters the phoneme inventory.
 is what lets synthesis compute the same bins without the training
 configuration; ``pitch_index`` lists the units that actually earned a
 conditioned model, with their bin, the notes it stands for and their support.
+
+Transferred models (``transfer`` + ``transfer_index`` sections in the YAML,
+``transfer.npz``) are the optional experimental tier of `hms.core.transfer`:
+acoustic units adapted from a *second* voice trained on another language, so
+this voice can sing phones its own corpus never contained.  They are ordinary
+HMMs stored in their own file, never mixed into ``hmms``: a transferred unit is
+looked up only after the native dedicated-phone tier failed
+(``exact context -> ... -> native phone -> transferred phone -> class backoff``)
+and it can never shadow a unit this voice has data for.  ``transfer`` records
+who the two voices were and how many units moved; ``transfer_index`` documents
+each transferred phone (source voice/language, anchor count, how many of the
+target's own frames were blended in, geometry).  ``transfer.npz`` also stores
+the acoustic map itself (per-dimension slope / intercept / residual variance),
+so a saved model documents the exact transformation that produced its units.
 """
 
 from __future__ import annotations
@@ -52,6 +66,8 @@ from hms.core.pitch import PitchModel
 from hms.core.pitch_condition import (KIND_PHONE, PitchConditioning,
                                       bin_note_bounds, pitch_tier,
                                       segment_pitch_bin)
+from hms.core.transfer import (AcousticMap, CrossLanguageTransfer,
+                               TIER_TRANSFERRED)
 
 #: Bumped when the on-disk layout changes incompatibly.
 #: 2 -- the spectral envelope is sampled on `2 * n_mcep` mel bands instead of
@@ -64,16 +80,22 @@ from hms.core.pitch_condition import (KIND_PHONE, PitchConditioning,
 #:      `pitch_conditioning` section in the YAML and a `pitch.npz` array file.
 #:      Format-2 and format-3 files carry no pitch conditioning and still load
 #:      (with the feature recorded as disabled), so no migration is needed.
-MODEL_FORMAT_VERSION = 4
+#: 5 -- adds the optional experimental cross-language voice-transfer tier: a
+#:      `transfer` + `transfer_index` section in the YAML and a `transfer.npz`
+#:      array file (transferred HMMs plus the acoustic map that produced them).
+#:      A format-2/3/4 file carries no transfer tier and still loads with the
+#:      feature recorded as disabled, exactly like the previous additions.
+MODEL_FORMAT_VERSION = 5
 
 #: Format versions this build can read.
-SUPPORTED_FORMAT_VERSIONS = (2, 3, 4)
+SUPPORTED_FORMAT_VERSIONS = (2, 3, 4, 5)
 
 _MODEL_YAML = "model.yaml"
 _HMM_NPZ = "hmm.npz"
 _BACKOFF_NPZ = "backoff.npz"
 _CONTEXT_NPZ = "context.npz"
 _PITCH_NPZ = "pitch.npz"
+_TRANSFER_NPZ = "transfer.npz"
 
 #: What `resolve_unit` returns as a unit identity: a context key, a
 #: ``(context key, pitch bin)`` pair for the pitch-conditioned tiers, or
@@ -144,7 +166,11 @@ class HMSModel:
                  pitch_models: Optional[Dict[Tuple[str, int],
                                              LeftToRightHMM]] = None,
                  pitch_index: Optional[Dict[Tuple[str, int], dict]] = None,
-                 pitch_conditioning: Optional[PitchConditioning] = None
+                 pitch_conditioning: Optional[PitchConditioning] = None,
+                 transfer: Optional[CrossLanguageTransfer] = None,
+                 transfer_models: Optional[Dict[str, LeftToRightHMM]] = None,
+                 transfer_index: Optional[Dict[str, dict]] = None,
+                 transfer_map: Optional[AcousticMap] = None
                  ) -> None:
         self.name = name
         self.spec = spec
@@ -174,6 +200,21 @@ class HMSModel:
         self.pitch_index = pitch_index or {}
         #: how this model's pitch bins are defined (see `hms.core.pitch_condition`)
         self.pitch_conditioning = pitch_conditioning or PitchConditioning()
+        #: optional experimental cross-language voice-transfer tier (see
+        #: `hms.core.transfer`).  The transferred units live in their own
+        #: mapping -- never in `hmms` -- so they can only ever *add* a unit:
+        #: the native dedicated-phone tier keeps precedence, and disabling the
+        #: feature leaves every other lookup exactly as it was.
+        self.transfer = transfer or CrossLanguageTransfer()
+        #: phone -> transferred HMM, keyed by the target inventory's symbol
+        self.transfer_models = transfer_models or {}
+        #: per transferred phone (and per transferred pitch unit): source
+        #: voice/language, anchors, how much of the target's own data was
+        #: blended in, geometry
+        self.transfer_index = transfer_index or {}
+        #: the acoustic map (per-dimension affine + residual) that produced the
+        #: transferred units, so the transformation stays auditable
+        self.transfer_map = transfer_map
         #: format version the model was read from (set by `load`)
         self.loaded_format_version: Optional[int] = None
 
@@ -212,16 +253,66 @@ class HMSModel:
     # -- lookup ------------------------------------------------------------
 
     def get_hmm(self, phoneme: str) -> Optional[LeftToRightHMM]:
-        """The HMM for a phoneme, following aliases, else ``None``."""
+        """The *native* HMM for a phoneme, following aliases, else ``None``.
+
+        Only units this voice was trained on.  Transferred units are reported
+        separately by `get_transfer_hmm`, so a caller can always tell the two
+        apart -- and so nothing that iterates `hmms` starts treating an
+        adapted unit as this voice's own.
+        """
         canonical = self.phoneme_set.canonical(phoneme)
         hmm = self.hmms.get(canonical)
         if hmm is not None:
             return hmm
         return None
 
+    def get_transfer_hmm(self, phoneme: str) -> Optional[LeftToRightHMM]:
+        """The transferred HMM for a phoneme, else ``None``.
+
+        Empty (and therefore free) for every model trained without the
+        cross-language transfer tier.
+        """
+        if not self.transfer_models:
+            return None
+        canonical = self.phoneme_set.canonical(phoneme)
+        return self.transfer_models.get(canonical)
+
+    def has_native_hmm(self, phoneme: str) -> bool:
+        """Whether this voice has its own dedicated HMM for the phoneme."""
+        return self.get_hmm(phoneme) is not None
+
+    def has_transfer_hmm(self, phoneme: str) -> bool:
+        """Whether a transferred HMM covers the phoneme."""
+        return self.get_transfer_hmm(phoneme) is not None
+
+    def unit_is_transferred(self, unit_key: UnitKey, tier: Optional[str]
+                            ) -> bool:
+        """Whether a `resolve_unit` result came from the transfer tier.
+
+        Tier names alone cannot say it: a transferred pitch-conditioned unit
+        resolves at the ordinary ``phone+pitch`` tier, exactly like a native
+        one.  The provenance is the ``transferred`` flag its `pitch_index`
+        record carries, so diagnostics and evaluation can count native and
+        transferred frames separately without changing the tier vocabulary.
+        """
+        if tier == TIER_TRANSFERRED:
+            return True
+        if isinstance(unit_key, tuple) and len(unit_key) == 2:
+            return bool((self.pitch_index.get(unit_key) or {})
+                        .get("transferred"))
+        return False
+
     def get_or_backoff(self, phoneme: str) -> LeftToRightHMM:
-        """HMM for a phoneme, falling back to its class model when unknown."""
+        """HMM for a phoneme, falling back to its class model when unknown.
+
+        The tier order is: this voice's own dedicated model, then a transferred
+        model (when the cross-language tier exists), then the phone-class
+        backoff.  With no transfer tier this is exactly what it always was.
+        """
         hmm = self.get_hmm(phoneme)
+        if hmm is not None:
+            return hmm
+        hmm = self.get_transfer_hmm(phoneme)
         if hmm is not None:
             return hmm
         definition = self.phoneme_set.resolve(phoneme)
@@ -347,16 +438,18 @@ class HMSModel:
                 -> best-supported one-sided diphone (ties favour the left
                    context)
                 -> dedicated current-phone HMM
+                -> transferred current-phone HMM (cross-language tier, if any)
                 -> phone-class backoff
                 -> optional global backoff
 
         A missing pitch-conditioned model therefore never fails and never
         borrows another pitch bin's model: it falls through to the same unit
         the unconditioned model would have chosen.  ``unit_key`` is a context
-        key for the context tiers, ``None`` for phone/class/global tiers, and
-        a ``(unit key, bin)`` pair for the pitch-conditioned tiers, which keeps
-        the phoneme identity distinguishable from the pitch condition.  With no
-        trained contexts and no ``pitch_bin`` this is exactly `get_or_backoff`.
+        key for the context tiers, ``None`` for phone/class/global/transferred
+        tiers, and a ``(unit key, bin)`` pair for the pitch-conditioned tiers,
+        which keeps the phoneme identity distinguishable from the pitch
+        condition.  With no trained contexts, no transfer tier and no
+        ``pitch_bin`` this is exactly `get_or_backoff`.
         """
         key, hmm, tier = self.resolve_pitch_unit(pre, curr, post, pitch_bin)
         if hmm is not None:
@@ -381,6 +474,13 @@ class HMSModel:
         hmm = self.get_hmm(curr)
         if hmm is not None:
             return None, hmm, "phone"
+        # Cross-language transfer: a unit this voice cannot sing itself but
+        # that was adapted from another voice's language.  Deliberately below
+        # the native phone tier -- an adapted unit never replaces data the
+        # target voice actually has.
+        hmm = self.get_transfer_hmm(curr)
+        if hmm is not None:
+            return None, hmm, TIER_TRANSFERRED
         definition = self.phoneme_set.resolve(curr)
         klass = definition.type if definition else "unvoiced_consonant"
         for key in (klass, "unvoiced_consonant"):
@@ -419,12 +519,18 @@ class HMSModel:
         return sum(h.n_free_params for h in self.pitch_models.values())
 
     @property
+    def transfer_n_free_params(self) -> int:
+        """Free parameters in the optional cross-language transferred HMMs."""
+        return sum(h.n_free_params for h in self.transfer_models.values())
+
+    @property
     def n_free_params(self) -> int:
         """Total free parameters across every model tier."""
         return (self.phoneme_n_free_params + self.context_n_free_params
                 + self.backoff_n_free_params
                 + self.global_backoff_n_free_params
-                + self.pitch_n_free_params)
+                + self.pitch_n_free_params
+                + self.transfer_n_free_params)
 
     def parameter_report(self) -> List[str]:
         lines = [
@@ -439,6 +545,7 @@ class HMSModel:
             f"  phoneme HMM params: {self.phoneme_n_free_params:,}",
             f"  context HMM params: {self.context_n_free_params:,}",
             f"  pitch HMM params  : {self.pitch_n_free_params:,}",
+            f"  transfer HMM params: {self.transfer_n_free_params:,}",
             f"  backoff HMM params: {self.backoff_n_free_params:,}",
             f"  global HMM params : {self.global_backoff_n_free_params:,}",
             f"  total HMM params  : {self.n_free_params:,}",
@@ -448,6 +555,11 @@ class HMSModel:
         if self.stats.frames:
             lines.append(f"  params per frame  : "
                          f"{self.n_free_params / self.stats.frames:.2f}")
+        if self.transfer.active:
+            # Only a voice that carries the experimental tier says so, so the
+            # report of an ordinary model reads exactly as it always did.
+            lines.insert(3, f"  transferred models: {len(self.transfer_models)}"
+                            f" from {self.transfer.auxiliary_label}")
         return lines
 
     # -- serialisation -----------------------------------------------------
@@ -522,6 +634,18 @@ class HMSModel:
             pitch_section = self.pitch_conditioning.to_dict()
             pitch_index_document = self._pitch_index_document()
 
+        # Optional cross-language transfer tier: the adapted units and the
+        # acoustic map that produced them, in their own file.  A model without
+        # the tier writes exactly what it wrote before this feature existed.
+        transfer_arrays: Dict[str, np.ndarray] = {}
+        if self.transfer_map is not None:
+            transfer_arrays.update(self.transfer_map.to_arrays())
+        for phone, hmm in sorted(self.transfer_models.items()):
+            for name, value in hmm.to_arrays().items():
+                transfer_arrays[f"{phone}/{name}"] = value
+        if transfer_arrays:
+            np.savez_compressed(directory / _TRANSFER_NPZ, **transfer_arrays)
+
         document = {
             "format_version": MODEL_FORMAT_VERSION,
             "name": self.name,
@@ -551,6 +675,10 @@ class HMSModel:
             document["pitch_conditioning"] = pitch_section
         if pitch_index_document:
             document["pitch_index"] = pitch_index_document
+        if self.transfer_models or self.transfer.enabled:
+            document["transfer"] = self.transfer.to_dict()
+        if self.transfer_models:
+            document["transfer_index"] = dict(sorted(self.transfer_index.items()))
         with open(directory / _MODEL_YAML, "w", encoding="utf-8") as handle:
             yaml.safe_dump(document, handle, sort_keys=False, allow_unicode=True)
         return directory
@@ -700,6 +828,43 @@ class HMSModel:
                                 info.get("covariance", "diag")))
             pitch_index = {key: declared[key] for key in pitch_models}
 
+        # Optional cross-language transfer tier.  A format-2/3/4 model (or a
+        # format-5 model trained with the feature off) simply has no sections,
+        # which load as "disabled" -- no migration, no reinterpretation.
+        transfer = CrossLanguageTransfer.from_dict(document.get("transfer") or {})
+        transfer_models: Dict[str, LeftToRightHMM] = {}
+        transfer_index: Dict[str, dict] = {}
+        transfer_map: Optional[AcousticMap] = None
+        declared_transfer = dict(document.get("transfer_index") or {})
+        if transfer.enabled or declared_transfer:
+            transfer_path = directory / _TRANSFER_NPZ
+            if not transfer_path.exists():
+                raise ValueError(
+                    f"{directory} declares cross-language transfer but "
+                    f"{_TRANSFER_NPZ} is missing")
+            with np.load(transfer_path) as handle:
+                transfer_arrays = {key: handle[key] for key in handle.files}
+            map_keys = ("map_matrix", "map_intercept",
+                        "map_residual_variance", "map_static_dim",
+                        "map_identity")
+            if all(key in transfer_arrays for key in map_keys):
+                transfer_map = AcousticMap.from_arrays(
+                    transfer_arrays, transfer.anchor_phones,
+                    transfer.anchor_classes)
+            for phone, info in declared_transfer.items():
+                prefix = f"{phone}/"
+                subset = {k[len(prefix):]: v
+                          for k, v in transfer_arrays.items()
+                          if k.startswith(prefix)}
+                if not subset:
+                    continue
+                transfer_models[phone] = LeftToRightHMM.from_arrays(
+                    subset,
+                    allow_skip=bool(info.get("allow_skip", False)),
+                    covariance_type=str(info.get("covariance", "diag")))
+            transfer_index = {phone: dict(declared_transfer[phone])
+                              for phone in transfer_models}
+
         normalization = document.get("normalization") or {}
         model = cls(
             name=str(document.get("name", directory.name)),
@@ -726,6 +891,10 @@ class HMSModel:
             pitch_models=pitch_models,
             pitch_index=pitch_index,
             pitch_conditioning=pitch_conditioning,
+            transfer=transfer,
+            transfer_models=transfer_models,
+            transfer_index=transfer_index,
+            transfer_map=transfer_map,
         )
         model.loaded_format_version = version
         return model
@@ -786,6 +955,7 @@ class HMSModel:
                 info = self.pitch_index.get((unit_key, pitch_bin)) or {}
                 low, high = bin_note_bounds(
                     pitch_bin, self.pitch_conditioning.bin_size)
+                origin = " transferred" if info.get("transferred") else ""
                 lines.append(
                     f"  {unit_key:18s} bin {pitch_bin:<3d} "
                     f"(MIDI {low:3d}-{high:3d}) "
@@ -793,7 +963,39 @@ class HMSModel:
                     f"{hmm.n_states} x {hmm.states[0].gmm.n_components:<2d} "
                     f"{hmm.n_free_params:7,d} params "
                     f"({info.get('frames', '?')} frames, "
-                    f"{info.get('occurrences', '?')} occ)")
+                    f"{info.get('occurrences', '?')} occ){origin}")
+        if self.transfer_models or self.transfer.active:
+            lines.append("")
+            lines.append("cross-language transfer (experimental; transferred "
+                         "HMMs, never used while a native unit exists):")
+            lines.append(f"  {self.transfer.describe()}")
+            if self.transfer_map is not None:
+                lines.append(f"  {self.transfer_map.describe()}")
+            if self.transfer.anchor_phones or self.transfer.anchor_classes:
+                lines.append(
+                    "  anchors            : "
+                    + (", ".join(self.transfer.anchor_phones[:12])
+                       + (" ..." if len(self.transfer.anchor_phones) > 12
+                          else "") if self.transfer.anchor_phones else "none")
+                    + (f" + classes {', '.join(self.transfer.anchor_classes)}"
+                       if self.transfer.anchor_classes else "")
+                    + f" ({self.transfer_map.n_anchors} observation(s))"
+                    if self.transfer_map is not None else "")
+            for phone, hmm in sorted(self.transfer_models.items()):
+                info = self.transfer_index.get(phone) or {}
+                bins = sum(1 for (unit, _bin_index) in self.pitch_models
+                           if unit == phone
+                           and (self.pitch_index.get((unit, _bin_index)) or {})
+                           .get("transferred"))
+                lines.append(
+                    f"  {phone:18s} {'transferred':11s} "
+                    f"{hmm.n_states} x {hmm.states[0].gmm.n_components:<2d} "
+                    f"{hmm.n_free_params:7,d} params "
+                    f"(from {info.get('source_speaker') or '?'} / "
+                    f"{info.get('source_language') or '?'}, "
+                    f"{info.get('anchors', '?')} anchors, "
+                    f"{info.get('adapted_frames', 0)} target frame(s) blended"
+                    + (f", {bins} pitch bin(s)" if bins else "") + ")")
         lines.append("")
         lines.append("training:")
         for key, value in self.stats.to_dict().items():
