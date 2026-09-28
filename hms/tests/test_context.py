@@ -604,9 +604,12 @@ def test_cli_train_context_flag_and_inspection(tmp_path, demo_dataset,
     assert payload["context_models"], "context models must be inspected"
     assert payload["global_backoff"] is not None
     breakdown = payload["parameter_breakdown"]
-    assert set(breakdown) == {"phoneme", "context", "class_backoff",
-                              "global_backoff"}
+    # one entry per model tier, including the optional pitch-conditioned one
+    # (zero here: this model was trained without pitch conditioning)
+    assert set(breakdown) == {"phoneme", "context", "pitch_conditioned",
+                              "class_backoff", "global_backoff"}
     assert breakdown["context"] > 0 and breakdown["global_backoff"] > 0
+    assert breakdown["pitch_conditioned"] == 0
     assert sum(breakdown.values()) == payload["parameter_budget"]
 
     # a context model synthesises through the CLI too
