@@ -81,6 +81,55 @@ def test_batched_banded_cholesky_matches_featurewise_factors(n, bandwidth, dim):
     assert np.allclose(batched, np.stack(expected, axis=-1), rtol=0.0, atol=1e-14)
 
 
+@pytest.mark.parametrize("n,bandwidth,dim", [
+    (1, 4, 3), (5, 9, 3), (12, 2, 5), (40, 4, 36),
+])
+def test_batched_banded_cholesky_repeats_the_scalar_arithmetic_exactly(
+        n, bandwidth, dim):
+    """The batched kernel must reproduce each feature's rounding bit for bit.
+
+    The batched path factors the feature axis together (one NumPy call per
+    panel of short-band products), so it is not obviously the same arithmetic
+    as the per-feature scalar path: this pins the terms and their descending
+    offset order for the boundary shapes, a bandwidth wider than the sequence,
+    and the production ``dim = 36`` case.
+    """
+    rng = np.random.default_rng(n * 100 + bandwidth * 10 + dim)
+    packed = np.empty((n, bandwidth + 1, dim))
+    expected = np.empty_like(packed)
+    for d in range(dim):
+        matrix = random_banded_spd(n, bandwidth, rng)
+        feature_band = pack_lower_band(matrix, bandwidth)
+        packed[:, :, d] = feature_band
+        expected[:, :, d] = banded_cholesky(feature_band, bandwidth)
+
+    assert np.array_equal(banded_cholesky(packed, bandwidth), expected)
+
+
+def test_batched_banded_cholesky_floors_only_dead_pivots():
+    """A small positive pivot is kept; only a dead one hits the 1e-6 floor.
+
+    The batched kernel tests the pivot against the floor instead of always
+    evaluating the ``where``, which must not change which pivots are floored.
+    """
+    band = np.zeros((3, 2, 2))
+    band[0, 0] = 1e-9
+    assert np.allclose(banded_cholesky(band, 1)[0, 0], np.sqrt(1e-9))
+    band[0, 0] = -1.0
+    assert np.allclose(banded_cholesky(band, 1)[0, 0], 1e-3)
+
+
+def test_batched_banded_cholesky_keeps_unused_packed_slots_zero():
+    """Packed slots above the diagonal hold no entry and must stay zero."""
+    band = np.zeros((6, 3, 2))
+    band[0, 1] = 7.0                    # row 0 has no entry at offset 1
+    band[1, 2] = 7.0
+    factor = banded_cholesky(band, 2)
+    assert np.array_equal(factor, banded_cholesky(np.zeros_like(band), 2))
+    assert np.array_equal(factor[0, 1], np.zeros(2))
+    assert np.array_equal(factor[1, 2], np.zeros(2))
+
+
 @pytest.mark.parametrize("n,bandwidth", [(6, 1), (20, 2), (50, 3)])
 def test_banded_solve_matches_dense_solve(n, bandwidth):
     rng = np.random.default_rng(n + bandwidth)
