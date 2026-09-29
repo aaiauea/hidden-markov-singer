@@ -96,6 +96,11 @@ def test_banded_solve_handles_non_positive_definite_gracefully():
     assert np.isfinite(banded_solve(factor, np.ones(3), 1)).all()
 
 
+def test_batched_banded_cholesky_uses_the_scalar_pivot_floor():
+    factor = banded_cholesky(np.zeros((3, 2, 2)), 1)
+    assert np.allclose(factor[:, 0, :], 1e-3)  # sqrt(1e-6), as in 2-D
+
+
 def test_banded_cholesky_rejects_malformed_packed_bands():
     with pytest.raises(ValueError):
         banded_cholesky(np.zeros((3, 1)), 1)          # needs bandwidth + 1 cols

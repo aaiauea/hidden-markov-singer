@@ -194,7 +194,7 @@ def banded_cholesky(a_band: np.ndarray, bandwidth: int) -> np.ndarray:
             value -= lower[i, offset] * lower[i, offset]
         # Match the scalar path's finite fallback for a non-positive (or NaN)
         # pivot without branching once per feature.
-        lower[i, 0] = np.sqrt(np.where(value > 0, value, 1e-12))
+        lower[i, 0] = np.sqrt(np.where(value > 0, value, 1e-6))
     return lower
 
 
