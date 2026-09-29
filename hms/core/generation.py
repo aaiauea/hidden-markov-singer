@@ -32,6 +32,7 @@ from __future__ import annotations
 from typing import Sequence, Tuple
 
 import numpy as np
+from numpy.lib.stride_tricks import as_strided
 
 from hms.core.features import delta_coeffs
 
@@ -184,49 +185,166 @@ def banded_cholesky(a_band: np.ndarray, bandwidth: int) -> np.ndarray:
         raise ValueError(f"packed band must have {bandwidth + 1} columns, "
                          f"got {a_band.shape}")
     n = a_band.shape[0]
+
+    if a_band.ndim == 3:
+        return _batched_banded_cholesky(a_band, bandwidth)
+
+    # Preserve the scalar packed-band path for callers using the original
+    # public representation.  The batched helper above is for MLPG's D-axis.
     lower = np.zeros_like(a_band)
-
-    if a_band.ndim == 2:
-        # Preserve the scalar packed-band path for callers using the original
-        # public representation.  The batched path below is for MLPG's D-axis.
-        for i in range(n):
-            max_d = min(bandwidth, i)
-            # Walk left-to-right inside the row (descending offset): L[i, j]
-            # needs the already-computed entries further left in the same row.
-            for d in range(max_d, -1, -1):
-                j = i - d
-                value = a_band[i, d]
-                # subtract sum_k L[i, k] * L[j, k] over the columns k < j
-                # where both factors are inside the band (k >= i - bandwidth)
-                for k in range(max(0, i - bandwidth), j):
-                    value -= lower[i, i - k] * lower[j, j - k]
-                if i == j:
-                    lower[i, 0] = np.sqrt(value) if value > 0 else 1e-6
-                else:
-                    lower[i, d] = value / lower[j, 0]
-        return lower
-
-    # The factor entries in one packed row still depend on each other, so the
-    # frame and (tiny) bandwidth loops remain serial.  Their arithmetic is
-    # independent over feature dimensions, however.  `value` is a D-vector,
-    # and preserving the scalar loop's descending offset order also preserves
-    # its rounding behaviour for each feature.
     for i in range(n):
         max_d = min(bandwidth, i)
-        for d in range(max_d, 0, -1):
-            value = a_band[i, d].copy()
+        # Walk left-to-right inside the row (descending offset): L[i, j] needs
+        # the already-computed entries further left in the same row.
+        for d in range(max_d, -1, -1):
             j = i - d
-            for offset in range(max_d, d, -1):
-                value -= lower[i, offset] * lower[j, offset - d]
-            lower[i, d] = value / lower[j, 0]
-
-        value = a_band[i, 0].copy()
-        for offset in range(max_d, 0, -1):
-            value -= lower[i, offset] * lower[i, offset]
-        # Match the scalar path's finite fallback for a non-positive (or NaN)
-        # pivot without branching once per feature.
-        lower[i, 0] = np.sqrt(np.where(value > 0, value, 1e-6))
+            value = a_band[i, d]
+            # subtract sum_k L[i, k] * L[j, k] over the columns k < j
+            # where both factors are inside the band (k >= i - bandwidth)
+            for k in range(max(0, i - bandwidth), j):
+                value -= lower[i, i - k] * lower[j, j - k]
+            if i == j:
+                lower[i, 0] = np.sqrt(value) if value > 0 else 1e-6
+            else:
+                lower[i, d] = value / lower[j, 0]
     return lower
+
+
+def _sqrt_diagonal(diagonal: np.ndarray) -> None:
+    """In-place square root of a diagonal, flooring non-positive entries.
+
+    This is exactly ``np.sqrt(np.where(diagonal > 0, diagonal, 1e-6))``, the
+    scalar path's finite fallback for a non-positive (or NaN) pivot.  A band
+    that is numerically positive definite clears the floor everywhere, and
+    then the expression is a plain square root; testing that once per column
+    is much cheaper than evaluating ``where`` over every column, and it never
+    changes a result.
+    """
+    if diagonal.size and diagonal.min() > 1e-6:
+        np.sqrt(diagonal, out=diagonal)
+    else:
+        np.sqrt(np.where(diagonal > 0, diagonal, 1e-6), out=diagonal)
+
+
+def _batched_banded_cholesky(a_band: np.ndarray, bandwidth: int) -> np.ndarray:
+    """Cholesky factor of an ``(n, bandwidth + 1, D)`` packed band.
+
+    Same arithmetic as the 2-D path above, feature by feature, but the serial
+    frame loop is reorganised around whole factor *columns*.  Column `j`'s
+    diagonal and off-diagonal entries are ``lower[j + t, t]`` for
+    ``t = 0..bandwidth``, and row `i`'s entry at offset `d` needs the band
+    products ``lower[i, offset] * lower[i - d, offset - d]`` for
+    ``offset = max_d..d + 1``.  Written per column (``i = j + t``, ``d = t``)
+    they become ``lower[j + t, w] * lower[j, w - t]`` for
+    ``w = bandwidth..t + 1``: the same terms, in the same order, but a whole
+    ``(bandwidth + 1)^2`` panel of them can be formed with one NumPy call,
+    and the per-feature loops over `offset` disappear.
+
+    The frame loop itself stays serial: a column's diagonal is the divisor of
+    its off-diagonal entries, so column `j` must be scaled before column
+    `j + 1` starts.  Only the first `bandwidth` columns (whose terms reach
+    above the first packed row) are still walked entry by entry, with the
+    scalar path's arithmetic.
+
+    The panel is built from zero-padded strided views of the working copy and
+    never from views that reach outside it: the copy carries `bandwidth`
+    padding frames in front (the negative packed offsets of the `t > w` half)
+    and `bandwidth` slack frames behind (the `j + t` rows), so every element
+    `np.multiply` reads - the discarded half included - is inside the
+    allocation.
+    """
+    n, _, dim = a_band.shape
+    bw = bandwidth
+    # Working copy, padded on *both* sides.  The strided views below reach
+    # outside the factor column they belong to in two directions:
+    #
+    #   * `lower[j + t, w]` with `t <= bw` - up to `bandwidth` frames past the
+    #     current column, so the copy carries `bandwidth` slack frames behind
+    #     the last real one;
+    #   * `lower[j, w - t]` with `w - t >= -bandwidth` - up to `bandwidth`
+    #     packed *columns* before the current one, which is a negative packed
+    #     offset for the `t > w` half of the panel.  `np.multiply` evaluates
+    #     that half too, so the copy also carries `bandwidth` padding rows in
+    #     front (the negative offsets land in them: one row is `bandwidth + 1`
+    #     packed columns, and `bandwidth` columns fit inside one row).
+    #
+    # So the layout is
+    #
+    #   rows [0, bw)             front padding  (the `w - t < 0` reads)
+    #   rows [bw, bw + n)        the packed band being factored
+    #   rows [bw + n, n + 2 * bw) slack frames  (the `j + t` reads)
+    #
+    # Every element of every view lies in `[lower, lower + nbytes)`, and the
+    # padding is zeroed, so no read is out of bounds or uninitialised either.
+    lower = np.empty((n + 2 * bw, bw + 1, dim), dtype=np.float64)
+    lower[:bw] = 0.0
+    lower[bw:bw + n] = a_band
+    lower[bw + n:] = 0.0
+    # Packed slots above the diagonal of the first `bw` rows hold no matrix
+    # entry.  The scalar path leaves them at zero and the panel view below
+    # multiplies (and then discards) them, so keep them zero as well.
+    for d in range(1, bw + 1):
+        lower[bw:bw + d, d] = 0.0
+
+    # The band starts `bw` rows into the copy; the returned factor is the `n`
+    # frames of `mat` that hold it.
+    mat = lower[bw:]
+    if bw == 0:
+        _sqrt_diagonal(mat[:, 0])
+        return mat[:n]
+
+    # First `bw` columns: every entry is formed in the scalar path's order.
+    for j in range(min(bw, n)):
+        value = mat[j, 0].copy()
+        for u in range(min(bw, j), 0, -1):
+            value -= mat[j, u] * mat[j, u]
+        _sqrt_diagonal(value)
+        mat[j, 0] = value
+        for t in range(1, min(bw, n - 1 - j) + 1):
+            i = j + t
+            value = mat[i, t].copy()
+            for u in range(min(bw, i), t, -1):
+                value -= mat[i, u] * mat[j, u - t]
+            mat[i, t] = value / mat[j, 0]
+    if n <= bw:
+        return mat[:n]
+
+    s0, s1, s2 = mat.strides
+    # column[j, t] = mat[j + t, t]: factor column j (diagonal at t = 0).
+    column = as_strided(mat, shape=(n, bw + 1, dim),
+                        strides=(s0, s0 + s1, s2))
+    # left[j, w, t] = mat[j + t, w] and right[j, w, t] = mat[j, w - t], so
+    # their product is the term to subtract from the entry at (row j + t,
+    # offset t) for each w.  Only the `t < w` half is ever subtracted, but the
+    # multiply reads both halves: the `t > w` entries read up to `bandwidth`
+    # packed columns before row `j` (front padding at `j == 0`, earlier band
+    # rows otherwise), and the `j + t` rows read up to `bandwidth` frames past
+    # the last one (slack frames).  Both are inside the copy by construction.
+    left = as_strided(mat, shape=(n, bw + 1, bw + 1, dim),
+                      strides=(s0, s1, s0, s2))
+    right = as_strided(mat, shape=(n, bw + 1, bw + 1, dim),
+                       strides=(s0, s1, -s1, s2))
+    panel = np.empty((bw + 1, bw + 1, dim), dtype=np.float64)
+    terms = [panel[w, :w] for w in range(bw, 0, -1)]
+
+    # The column being finished.  Keeping it contiguous makes every update a
+    # strided-free NumPy call; the subtraction order (descending offset) still
+    # matches the scalar path exactly.
+    scratch = np.empty((bw + 1, dim), dtype=np.float64)
+    rows = [scratch[:w] for w in range(bw, 0, -1)]
+    diagonal = scratch[0]
+    off_diagonal = scratch[1:]
+
+    for j in range(bw, n):
+        entries = column[j]
+        scratch[:] = entries
+        np.multiply(left[j], right[j], out=panel)
+        for row, term in zip(rows, terms):
+            np.subtract(row, term, out=row)
+        _sqrt_diagonal(diagonal)
+        np.divide(off_diagonal, diagonal, out=off_diagonal)
+        entries[:] = scratch
+    return mat[:n]
 
 
 def banded_solve(lower: np.ndarray, b: np.ndarray, bandwidth: int) -> np.ndarray:
