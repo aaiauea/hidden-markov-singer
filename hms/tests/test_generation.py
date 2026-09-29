@@ -106,6 +106,64 @@ def test_batched_banded_cholesky_repeats_the_scalar_arithmetic_exactly(
     assert np.array_equal(banded_cholesky(packed, bandwidth), expected)
 
 
+@pytest.mark.parametrize("strided", [False, True],
+                         ids=["contiguous", "strided"])
+@pytest.mark.parametrize("n,bandwidth,dim", [
+    (1, 0, 3),              # single frame, no band at all
+    (1, 1, 3),              # single frame, band wider than the sequence
+    (3, 3, 4),              # n == bandwidth: only the boundary columns run
+    (4, 3, 4),              # n == bandwidth + 1: first full column
+    (5, 3, 4),              # n == bandwidth + 2: one column of slack to read
+    (2400, 4, 36),          # production shape, static + delta (S = 2)
+    (1200, 8, 36),          # production shape, static + delta + delta-delta
+])
+def test_batched_banded_cholesky_at_view_boundaries(
+        n, bandwidth, dim, strided):
+    """Boundary shapes for the batched kernel's strided column/panel views.
+
+    The batched path reads a factor column ``lower[j + t, t]`` through an
+    ``as_strided`` window that reaches `bandwidth` frames past the current
+    one, so a wrong stride or a mistreated slack frame shows up at the shapes
+    where the band runs off the last row: ``n == bandwidth``, ``n ==
+    bandwidth + 1``, ``n == bandwidth + 2``, and the single-frame cases.  The
+    factor must stay bit-exact against the per-feature scalar path (which
+    touches no view at all), keep exactly ``n`` frames, and leave the packed
+    slots above the diagonal zero.
+    """
+    rng = np.random.default_rng(n * 1000 + bandwidth * 10 + dim)
+    if strided:
+        # A skimming view: same logical band, deliberately non-contiguous.
+        packed = np.zeros((n, bandwidth + 1, 2 * dim))[:, :, ::2]
+    else:
+        packed = np.empty((n, bandwidth + 1, dim))
+    expected = np.empty((n, bandwidth + 1, dim))
+    for d in range(dim):
+        matrix = random_banded_spd(n, bandwidth, rng)
+        feature_band = pack_lower_band(matrix, bandwidth)
+        packed[:, :, d] = feature_band
+        expected[:, :, d] = banded_cholesky(feature_band, bandwidth)
+    # Junk in the packed slots that hold no matrix entry (offset > row).  The
+    # scalar path never reads them and returns zeros there; the batched panel
+    # does read them, so they must not leak into the factor.
+    for row in range(min(bandwidth, n)):
+        packed[row, row + 1:] = rng.normal(size=(bandwidth - row, dim))
+    assert packed.flags["C_CONTIGUOUS"] is not strided
+
+    factor = banded_cholesky(packed, bandwidth)
+
+    # Same frames, same numbers as the scalar path: the last `bandwidth`
+    # frames are exactly the ones whose panel reads reach the slack frames.
+    assert factor.shape == (n, bandwidth + 1, dim)
+    assert factor.nbytes == packed.dtype.itemsize * packed.size
+    assert np.array_equal(factor, expected)
+
+    # Packed slots above the diagonal are not matrix entries.  The panel
+    # multiplies them and discards the products, so they must still be zero.
+    for row in range(min(bandwidth, n)):
+        for offset in range(row + 1, bandwidth + 1):
+            assert np.array_equal(factor[row, offset], np.zeros(dim))
+
+
 def test_batched_banded_cholesky_floors_only_dead_pivots():
     """A small positive pivot is kept; only a dead one hits the 1e-6 floor.
 
