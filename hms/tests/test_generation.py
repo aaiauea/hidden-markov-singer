@@ -168,6 +168,45 @@ def test_batched_banded_cholesky_at_view_boundaries(
     (1, 0, 3), (1, 1, 3), (3, 3, 4), (4, 3, 4), (5, 3, 4), (40, 4, 36),
     (16, 8, 36), (2400, 4, 36),
 ])
+def _owner_of(array, roots=None):
+    """The ndarray whose memory `array` borrows (metadata only).
+
+    A strided view's own ``.base`` is a ``numpy.lib.stride_tricks`` helper
+    object rather than an ndarray, so the walk must start from a real ndarray,
+    and a view recorded as built by ``as_strided`` must be resolved through the
+    buffer it was built on.  Otherwise the search stops at the view itself and
+    every window looks trivially in bounds.
+    """
+    node = array
+    while isinstance(node.base, np.ndarray):
+        node = node.base
+    if roots is not None and id(node) in roots:
+        node = roots[id(node)]
+        while isinstance(node.base, np.ndarray):
+            node = node.base
+    return node
+
+
+def _element_window(array, roots=None):
+    """Byte range of the elements `array` can address, and the owning array.
+
+    The extremes are the sums of the per-axis reaches ``stride * (size - 1)``,
+    which real elements attain.  Nothing is dereferenced: only the array
+    interface (shape, strides, pointers) is inspected.
+    """
+    owner = _owner_of(array, roots)
+    base = owner.__array_interface__["data"][0]
+    start = array.__array_interface__["data"][0]
+    reach = [stride * (size - 1)
+             for stride, size in zip(array.strides, array.shape)]
+    return (start + sum(min(0, value) for value in reach) - base,
+            start + sum(max(0, value) for value in reach) - base, owner)
+
+
+@pytest.mark.parametrize("n,bandwidth,dim", [
+    (1, 0, 3), (1, 1, 3), (3, 3, 4), (4, 3, 4), (5, 3, 4), (40, 4, 36),
+    (16, 8, 36), (2400, 4, 36),
+])
 def test_batched_banded_cholesky_views_stay_inside_their_buffer(
         monkeypatch, n, bandwidth, dim):
     """Every strided view must fit inside the buffer it is built from.
@@ -175,36 +214,32 @@ def test_batched_banded_cholesky_views_stay_inside_their_buffer(
     The panel view reads ``mat[j + t, w]`` (up to `bandwidth` frames *behind*
     the current column) and ``mat[j, w - t]`` (down to `bandwidth` packed
     *columns before* it, i.e. a negative packed offset), and ``np.multiply``
-    evaluates that whole panel, not just the ``t < w`` half that is
+    evaluates that whole panel, not just the ``t < w`` half whose results are
     subtracted.  Both directions must therefore be covered by padding of the
     working copy.  This checks the element-address window of every view the
-    kernel builds against the buffer it was built from - using array metadata
-    only (shape, strides, base pointers), never reading memory.
+    kernel builds against the buffer it was built from - array metadata only,
+    never reading memory - and pins the exact negative reach of the one view
+    that addresses below its buffer.
     """
     real_as_strided = generation.as_strided
+    roots = {}
+    live = []
     windows = []
 
     def recording_as_strided(buffer, *args, **kwargs):
         view = real_as_strided(buffer, *args, **kwargs)
+        roots[id(view)] = buffer
+        live.extend([view, buffer])
         if view.size:                      # empty views read nothing
-            owner = buffer                 # the allocation the view borrows
-            while isinstance(owner.base, np.ndarray):
-                owner = owner.base
-            assert owner.flags["C_CONTIGUOUS"]
-            base = owner.__array_interface__["data"][0]
-            limit = base + owner.nbytes
-            start = buffer.__array_interface__["data"][0]
-            # Exact element range of an as_strided view: the extremes each
-            # axis can reach (they are attained by real elements).
-            low = start + sum(min(0, st * (size - 1))
-                              for st, size in zip(view.strides, view.shape))
-            high = start + sum(max(0, st * (size - 1))
-                               for st, size in zip(view.strides, view.shape))
-            windows.append((owner, low - base, high - base))
-            assert low >= base, (n, bandwidth, dim, "reads before the buffer",
-                                 low - base)
-            assert high < limit, (n, bandwidth, dim, "reads past the buffer",
-                                  high - limit + 1)
+            assert not isinstance(view.base, np.ndarray)   # DummyArray
+            low, high, owner = _element_window(view, roots)
+            windows.append((owner, low, high, view.strides, view.shape,
+                            buffer))
+            assert low >= 0, (n, bandwidth, dim, "reads before the buffer",
+                              low)
+            assert high < owner.nbytes, (n, bandwidth, dim,
+                                         "reads past the buffer",
+                                         high - owner.nbytes)
         return view
 
     monkeypatch.setattr(generation, "as_strided", recording_as_strided)
@@ -223,16 +258,127 @@ def test_batched_banded_cholesky_views_stay_inside_their_buffer(
 
     if bandwidth and n > bandwidth:        # bandwidth 0 has no views at all
         # The hot path did build views (guards against a silent rename), all of
-        # them over the same working copy, and the factor starts at least
-        # `bandwidth` packed columns into that copy - exactly the front padding
-        # the negative `w - t` reads need.
+        # them over the same working copy.
         assert windows
         owner = windows[0][0]
         assert all(entry[0] is owner for entry in windows)
+
+        # The factor starts `bandwidth` frames into that copy, with everything
+        # before it as front padding for the negative panel reads.
         base = owner.__array_interface__["data"][0]
         offset = factor.__array_interface__["data"][0] - base
-        assert offset >= bandwidth * dim * np.dtype(np.float64).itemsize
+        assert offset == bandwidth * owner.strides[0]
         assert offset + n * factor.strides[0] <= owner.nbytes
+
+        # Exactly one view has a negative stride - the `mat[j, w - t]` panel -
+        # and its reach below the buffer it was built on is exactly
+        # `bandwidth` packed columns, which the front padding covers.
+        negative = [entry for entry in windows
+                    if any(stride < 0 for stride in entry[3])]
+        assert len(negative) == 1
+        _, low, _, _, _, buffer = negative[0]
+        assert low == (buffer.__array_interface__["data"][0] - base
+                       - bandwidth * owner.strides[1])
+        assert low >= 0
+
+        # The padding the negative view addresses is allocated, zeroed, and
+        # never written by the factorisation: a stray write would show here.
+        padding_elements = offset // owner.itemsize
+        assert np.array_equal(owner.reshape(-1)[:padding_elements],
+                              np.zeros(padding_elements))
+
+
+@pytest.mark.parametrize("n,bandwidth,dim", [
+    (5, 3, 4), (40, 4, 36), (16, 8, 36), (2400, 4, 36),
+])
+def test_batched_banded_cholesky_accesses_only_allocated_memory(
+        monkeypatch, n, bandwidth, dim):
+    """Every NumPy operand must be inside its allocation and initialised.
+
+    Three properties, all about memory rather than about arithmetic:
+
+    * every array argument (and ``out``) of every NumPy call the kernel makes
+      is checked against the allocation it borrows from, resolving strided
+      views through the buffer they were built on - an operand reaching
+      outside the working copy fails here even though its result is discarded;
+    * every allocation the kernel makes is pre-filled with a sentinel, so a
+      read of uninitialised memory changes the factor and fails the
+      bit-exactness check, and no sentinel may survive in the working copy;
+    * the front padding - the region the negative panel strides address - must
+      still be exactly zero afterwards, which fails if anything writes it.
+    """
+    sentinel = 1e150
+    allocations = []
+    checked = []
+    roots = {}
+    live = []
+    real_as_strided = generation.as_strided
+
+    def recording_as_strided(buffer, *args, **kwargs):
+        view = real_as_strided(buffer, *args, **kwargs)
+        roots[id(view)] = buffer
+        live.extend([view, buffer])
+        allocations.append(_owner_of(buffer))
+        return view
+
+    def check(where, args, kwargs):
+        for operand in list(args) + list(kwargs.values()):
+            if not isinstance(operand, np.ndarray) or operand.size == 0:
+                continue
+            low, high, owner = _element_window(operand, roots)
+            assert low >= 0, (where, "operand before its allocation", low,
+                              operand.shape, operand.strides)
+            assert high < owner.nbytes, (where, "operand past its allocation",
+                                         high - owner.nbytes, operand.shape)
+        checked.append(where)
+
+    class Proxy:
+        """numpy, with `empty` pre-filled and the kernel's ufuncs checked."""
+
+        def __getattr__(self, name):
+            target = getattr(np, name)
+            if name == "empty":
+                def empty(shape, *args, **kwargs):
+                    out = np.full(shape, sentinel, *args, **kwargs)
+                    allocations.append(out)
+                    return out
+                return empty
+            if name in ("multiply", "subtract", "divide", "sqrt", "fmax"):
+                def wrapper(*args, **kwargs):
+                    check(name, args, kwargs)
+                    return target(*args, **kwargs)
+                return wrapper
+            return target
+
+    rng = np.random.default_rng(n * 1000 + bandwidth * 10 + dim)
+    packed = np.empty((n, bandwidth + 1, dim))
+    expected = np.empty_like(packed)
+    for d in range(dim):
+        feature_band = pack_lower_band(random_banded_spd(n, bandwidth, rng),
+                                       bandwidth)
+        packed[:, :, d] = feature_band
+        expected[:, :, d] = banded_cholesky(feature_band, bandwidth)
+
+    monkeypatch.setattr(generation, "as_strided", recording_as_strided)
+    monkeypatch.setattr(generation, "np", Proxy())
+    factor = banded_cholesky(packed, bandwidth)
+
+    # No uninitialised read may affect the result, and every operand of the
+    # hot path must have been checked.
+    assert np.array_equal(factor, expected)
+    assert "multiply" in checked and "divide" in checked
+
+    # The allocation behind the factor is the working copy.  Whatever front
+    # padding it carries (test_batched_banded_cholesky_views_stay_inside_
+    # their_buffer pins the amount) must be zeroed and must never be written
+    # by the factorisation.
+    owner = _owner_of(factor, roots)
+    assert any(block is owner for block in allocations)
+    padding_elements = (factor.__array_interface__["data"][0]
+                        - owner.__array_interface__["data"][0]) // owner.itemsize
+    assert np.array_equal(owner.reshape(-1)[:padding_elements],
+                          np.zeros(padding_elements))
+    assert sentinel not in owner          # nothing left uninitialised
 
 
 def test_batched_banded_cholesky_floors_only_dead_pivots():
