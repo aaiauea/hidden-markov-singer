@@ -61,6 +61,25 @@ def test_banded_cholesky_matches_dense_factorisation(n, bandwidth):
     assert np.allclose(factor @ factor.T, matrix, atol=1e-8)
 
 
+@pytest.mark.parametrize("n,bandwidth,dim", [
+    (0, 4, 3), (1, 4, 3), (7, 0, 4), (12, 2, 5), (40, 4, 36),
+])
+def test_batched_banded_cholesky_matches_featurewise_factors(n, bandwidth, dim):
+    """The MLPG D-axis batch must match independent packed factors tightly."""
+    rng = np.random.default_rng(n * 100 + bandwidth * 10 + dim)
+    packed = np.empty((n, bandwidth + 1, dim))
+    expected = []
+    for d in range(dim):
+        matrix = random_banded_spd(n, bandwidth, rng)
+        feature_band = pack_lower_band(matrix, bandwidth)
+        packed[:, :, d] = feature_band
+        expected.append(banded_cholesky(feature_band, bandwidth))
+
+    batched = banded_cholesky(packed, bandwidth)
+    assert batched.shape == packed.shape
+    assert np.allclose(batched, np.stack(expected, axis=-1), rtol=0.0, atol=1e-14)
+
+
 @pytest.mark.parametrize("n,bandwidth", [(6, 1), (20, 2), (50, 3)])
 def test_banded_solve_matches_dense_solve(n, bandwidth):
     rng = np.random.default_rng(n + bandwidth)
@@ -75,6 +94,11 @@ def test_banded_solve_handles_non_positive_definite_gracefully():
     """A degenerate matrix must not produce NaN/inf (it is variance-floored)."""
     factor = banded_cholesky(np.zeros((3, 2)), 1)
     assert np.isfinite(banded_solve(factor, np.ones(3), 1)).all()
+
+
+def test_batched_banded_cholesky_uses_the_scalar_pivot_floor():
+    factor = banded_cholesky(np.zeros((3, 2, 2)), 1)
+    assert np.allclose(factor[:, 0, :], 1e-3)  # sqrt(1e-6), as in 2-D
 
 
 def test_banded_cholesky_rejects_malformed_packed_bands():
