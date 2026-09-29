@@ -61,6 +61,25 @@ def test_banded_cholesky_matches_dense_factorisation(n, bandwidth):
     assert np.allclose(factor @ factor.T, matrix, atol=1e-8)
 
 
+@pytest.mark.parametrize("n,bandwidth,dim", [
+    (0, 4, 3), (1, 4, 3), (7, 0, 4), (12, 2, 5), (40, 4, 36),
+])
+def test_batched_banded_cholesky_matches_featurewise_factors(n, bandwidth, dim):
+    """The MLPG D-axis batch must match independent packed factors tightly."""
+    rng = np.random.default_rng(n * 100 + bandwidth * 10 + dim)
+    packed = np.empty((n, bandwidth + 1, dim))
+    expected = []
+    for d in range(dim):
+        matrix = random_banded_spd(n, bandwidth, rng)
+        feature_band = pack_lower_band(matrix, bandwidth)
+        packed[:, :, d] = feature_band
+        expected.append(banded_cholesky(feature_band, bandwidth))
+
+    batched = banded_cholesky(packed, bandwidth)
+    assert batched.shape == packed.shape
+    assert np.allclose(batched, np.stack(expected, axis=-1), rtol=0.0, atol=1e-14)
+
+
 @pytest.mark.parametrize("n,bandwidth", [(6, 1), (20, 2), (50, 3)])
 def test_banded_solve_matches_dense_solve(n, bandwidth):
     rng = np.random.default_rng(n + bandwidth)

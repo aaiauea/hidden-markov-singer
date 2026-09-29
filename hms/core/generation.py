@@ -138,31 +138,63 @@ def window_matrix(n_frames: int, stream_sizes: Sequence[int],
 def banded_cholesky(a_band: np.ndarray, bandwidth: int) -> np.ndarray:
     """Cholesky factor of a symmetric positive definite banded matrix.
 
-    ``a_band`` has shape (n, bandwidth + 1) with ``a_band[i, d] = A[i - d, i]``
-    (LAPACK "lower" packed band storage).  Returns ``L`` in the same layout with
-    ``L[i, d] = L_factor[i - d, i]``.
+    ``a_band`` has shape ``(n, bandwidth + 1)`` with
+    ``a_band[i, d] = A[i - d, i]`` (LAPACK "lower" packed band storage).
+    Returns ``L`` in the same layout with ``L[i, d] = L_factor[i - d, i]``.
+
+    MLPG may also pass independent feature dimensions together as
+    ``(n, bandwidth + 1, D)``.  Each final-axis slice uses the same packed
+    representation and is factored independently.  Keeping that axis together
+    lets the short band operations run in NumPy across all features instead of
+    repeating the Python loops once per feature.
     """
     a_band = np.asarray(a_band, dtype=np.float64)
-    if a_band.ndim != 2 or a_band.shape[1] != bandwidth + 1:
+    if a_band.ndim not in (2, 3) or a_band.shape[1] != bandwidth + 1:
         raise ValueError(f"packed band must have {bandwidth + 1} columns, "
                          f"got {a_band.shape}")
     n = a_band.shape[0]
     lower = np.zeros_like(a_band)
+
+    if a_band.ndim == 2:
+        # Preserve the scalar packed-band path for callers using the original
+        # public representation.  The batched path below is for MLPG's D-axis.
+        for i in range(n):
+            max_d = min(bandwidth, i)
+            # Walk left-to-right inside the row (descending offset): L[i, j]
+            # needs the already-computed entries further left in the same row.
+            for d in range(max_d, -1, -1):
+                j = i - d
+                value = a_band[i, d]
+                # subtract sum_k L[i, k] * L[j, k] over the columns k < j
+                # where both factors are inside the band (k >= i - bandwidth)
+                for k in range(max(0, i - bandwidth), j):
+                    value -= lower[i, i - k] * lower[j, j - k]
+                if i == j:
+                    lower[i, 0] = np.sqrt(value) if value > 0 else 1e-6
+                else:
+                    lower[i, d] = value / lower[j, 0]
+        return lower
+
+    # The factor entries in one packed row still depend on each other, so the
+    # frame and (tiny) bandwidth loops remain serial.  Their arithmetic is
+    # independent over feature dimensions, however.  `value` is a D-vector,
+    # and preserving the scalar loop's descending offset order also preserves
+    # its rounding behaviour for each feature.
     for i in range(n):
         max_d = min(bandwidth, i)
-        # Walk left-to-right inside the row (descending offset): L[i, j] needs
-        # the already-computed entries further left in the same row.
-        for d in range(max_d, -1, -1):
+        for d in range(max_d, 0, -1):
+            value = a_band[i, d].copy()
             j = i - d
-            value = a_band[i, d]
-            # subtract sum_k L[i, k] * L[j, k] over the columns k < j where
-            # both factors are inside the band (k >= i - bandwidth)
-            for k in range(max(0, i - bandwidth), j):
-                value -= lower[i, i - k] * lower[j, j - k]
-            if i == j:
-                lower[i, 0] = np.sqrt(value) if value > 0 else 1e-6
-            else:
-                lower[i, d] = value / lower[j, 0]
+            for offset in range(max_d, d, -1):
+                value -= lower[i, offset] * lower[j, offset - d]
+            lower[i, d] = value / lower[j, 0]
+
+        value = a_band[i, 0].copy()
+        for offset in range(max_d, 0, -1):
+            value -= lower[i, offset] * lower[i, offset]
+        # Match the scalar path's finite fallback for a non-positive (or NaN)
+        # pivot without branching once per feature.
+        lower[i, 0] = np.sqrt(np.where(value > 0, value, 1e-12))
     return lower
 
 
@@ -277,14 +309,23 @@ def mlpg(means: np.ndarray, variances: np.ndarray,
                           (p * product)[upper])
 
     # ---- solve per feature dimension
+    # Pack all independent feature bands together, then factor their shared
+    # frame/band structure in one vectorised Cholesky call.  Assembly is done,
+    # so reuse its linear-size buffer rather than keep both layouts in memory.
+    # Each final-axis slice is exactly the packed representation previously
+    # built per feature.
+    packed = band
+    # short utterances may be narrower than the nominal bandwidth
+    for offset in range(1, min(bandwidth, n_frames - 1) + 1):
+        # The source/destination overlap while shifting this diagonal.  Copy
+        # once per (tiny) band offset so the packed values are not clobbered.
+        packed[offset:, offset, :] = packed[:n_frames - offset, offset, :].copy()
+        packed[:offset, offset, :] = 0.0
+    lower = banded_cholesky(packed, bandwidth)
+
     trajectory = np.zeros((n_frames, dim), dtype=np.float64)
     for d in range(dim):
-        packed = np.zeros((n_frames, bandwidth + 1), dtype=np.float64)
-        # short utterances may be narrower than the nominal bandwidth
-        for offset in range(min(bandwidth, n_frames - 1) + 1):
-            packed[offset:, offset] = band[:n_frames - offset, offset, d]
-        lower = banded_cholesky(packed, bandwidth)
-        trajectory[:, d] = banded_solve(lower, rhs[:, d], bandwidth)
+        trajectory[:, d] = banded_solve(lower[:, :, d], rhs[:, d], bandwidth)
     return trajectory
 
 
