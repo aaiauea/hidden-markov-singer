@@ -106,6 +106,37 @@ def stream_taps(n_frames: int, derivative: int, window: int
     return pairs
 
 
+def _coalesced_stream_taps(n_frames: int, derivative: int, window: int
+                           ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Combine taps that clip to the same target in each derivative row.
+
+    The returned ``offsets``, ``targets`` and ``weights`` have shapes
+    ``(S,)``, ``(T, S)`` and ``(T, S)``.  Each row's target indices are ordered
+    by offset; duplicate clipped targets are represented once, with the
+    remaining slots assigned zero weight.  Coefficients are still obtained
+    from :func:`stream_taps`, so repeated clipping at each derivative stage
+    (especially for delta-delta at utterance boundaries) is preserved.
+
+    This is an assembly-only representation: it coalesces taps from the same
+    source frame before they are multiplied by that frame's statistics.
+    """
+    radius = derivative * window
+    offsets = np.arange(-radius, radius + 1)
+    frames = np.arange(n_frames)
+    targets = np.clip(frames[:, None] + offsets[None, :], 0, n_frames - 1)
+
+    # Clipping makes targets non-decreasing in offset.  Only the first slot for
+    # a repeated boundary target is active; its coefficient receives every
+    # stream_taps contribution that landed on that target.
+    active = np.ones(targets.shape, dtype=bool)
+    if targets.shape[1] > 1:
+        active[:, 1:] = targets[:, 1:] != targets[:, :-1]
+    weights = np.zeros(targets.shape, dtype=np.float64)
+    for target, weight in stream_taps(n_frames, derivative, window):
+        weights += (target[:, None] == targets) * active * weight
+    return offsets, targets, weights
+
+
 def window_matrix(n_frames: int, stream_sizes: Sequence[int],
                   window: int = 2) -> np.ndarray:
     """Dense ``W``, shape (n_frames * n_streams * D, n_frames * D).
@@ -325,10 +356,7 @@ def mlpg(means: np.ndarray, variances: np.ndarray,
         prec = np.concatenate([prec[:n_frames],
                                prec[n_frames:] / variance_scale])
 
-    coeffs = delta_coeffs(window)
-    n_taps = 2 * window + 1
     bandwidth = window_bandwidth(stream_sizes, window)
-    frames = np.arange(n_frames)
 
     # ---- assemble the packed band of M = W^T R^-1 W and the rhs = W^T R^-1 mu
     band = np.zeros((n_frames, bandwidth + 1, dim), dtype=np.float64)
@@ -338,29 +366,61 @@ def mlpg(means: np.ndarray, variances: np.ndarray,
     band[:, 0, :] += prec[:n_frames]
     rhs += prec[:n_frames] * means[:n_frames]
 
-    # derivative streams: each stacked row t is a weighted sum over the taps of
-    # that derivative (see `stream_taps`), so it contributes to the band at
-    # (min(i, j), |i - j|) for every pair of taps, including i == j.
+    # Derivative rows can have repeated tap targets at utterance boundaries.
+    # Coalesce those taps per source frame, then accumulate the unique local
+    # targets with contiguous slices.  Interior source-to-target mappings are
+    # one-to-one, so ordinary slice += is safe there; only the small clipped
+    # boundary regions need scalar-frame accumulation.
     for derivative in range(1, n_streams):
         sl = slice(derivative * n_frames, (derivative + 1) * n_frames)
         p = prec[sl]                                   # (T, D)
         mu = means[sl]
-        taps = stream_taps(n_frames, derivative, window)
-        for target, weight in taps:                    # rhs = W^T R^-1 mu
-            np.add.at(rhs, target, p * mu * weight)
-        for target_i, weight_i in taps:
-            for target_j, weight_j in taps:
-                product = weight_i * weight_j
-                if product == 0.0:
-                    continue
-                # Only fill the upper triangle: M is symmetric, and iterating
-                # every ordered pair would count off-diagonal entries twice
-                # (while diagonal entries genuinely need both orders).
-                upper = target_i <= target_j
-                if not upper.any():
-                    continue
-                np.add.at(band, (target_i[upper], target_j[upper] - target_i[upper]),
-                          (p * product)[upper])
+        offsets, targets, weights = _coalesced_stream_taps(
+            n_frames, derivative, window)
+        pmu = p * mu
+
+        # rhs = W^T R^-1 mu.  Offsets are ordered, and each interior slice maps
+        # distinct source frames to distinct targets.  At a clipped edge, loop
+        # over source frames so repeated targets still accumulate correctly.
+        for slot, offset in enumerate(offsets):
+            offset = int(offset)
+            start = min(n_frames, max(0, -offset))
+            stop = max(0, min(n_frames, n_frames - offset))
+            if start < stop:
+                rhs[start + offset:stop + offset] += (
+                    pmu[start:stop] * weights[start:stop, slot, None])
+                boundary = tuple(range(start)) + tuple(range(stop, n_frames))
+            else:
+                boundary = range(n_frames)
+            for t in boundary:
+                weight = weights[t, slot]
+                if weight != 0.0:
+                    rhs[targets[t, slot]] += pmu[t] * weight
+
+        # M = W^T R^-1 W is symmetric, so pairing unique targets with
+        # left <= right fills its packed upper triangle once.  A diagonal entry
+        # uses the square of its coalesced coefficient, including every
+        # ordered tap-pair term and the cross terms between clipped taps.
+        for left in range(len(offsets)):
+            shift_left = int(offsets[left])
+            for right in range(left, len(offsets)):
+                shift_right = int(offsets[right])
+                band_offset = shift_right - shift_left
+                product = weights[:, left] * weights[:, right]
+                start = min(n_frames, max(0, -shift_left))
+                stop = max(0, min(n_frames, n_frames - shift_right))
+                if start < stop:
+                    band[start + shift_left:stop + shift_left, band_offset, :] += (
+                        p[start:stop] * product[start:stop, None])
+                    boundary = tuple(range(start)) + tuple(range(stop, n_frames))
+                else:
+                    boundary = range(n_frames)
+                for t in boundary:
+                    value = product[t]
+                    if value != 0.0:
+                        target_i = targets[t, left]
+                        target_j = targets[t, right]
+                        band[target_i, target_j - target_i, :] += p[t] * value
 
     # ---- solve per feature dimension
     # Pack all independent feature bands together, then factor their shared
