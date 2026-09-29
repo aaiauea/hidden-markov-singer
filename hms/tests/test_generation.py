@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from hms.core.features import add_dynamic_features, delta_coeffs
+from hms.core import generation
 from hms.core.generation import (banded_cholesky, banded_solve, mlpg,
                                  stack_state_statistics, stack_streams,
                                  unstack_streams, window_bandwidth,
@@ -94,6 +95,90 @@ def test_banded_solve_handles_non_positive_definite_gracefully():
     """A degenerate matrix must not produce NaN/inf (it is variance-floored)."""
     factor = banded_cholesky(np.zeros((3, 2)), 1)
     assert np.isfinite(banded_solve(factor, np.ones(3), 1)).all()
+
+
+@pytest.mark.parametrize("n,bandwidth,dim", [
+    (0, 4, 3), (1, 4, 3), (1, 0, 2), (7, 0, 4), (5, 9, 3), (12, 2, 5),
+    (40, 4, 36),
+])
+def test_batched_banded_solve_matches_featurewise_solves(n, bandwidth, dim):
+    """The MLPG D-axis batch must reproduce per-feature solves bit for bit.
+
+    The batched path repeats the single-feature arithmetic in the same
+    accumulation order, so the solutions must be exactly equal (not merely
+    close) for every supported shape: empty and single-frame sequences, zero
+    bandwidth, bandwidth wider than the sequence, and the production
+    ``D = 36``, bandwidth-4 shape.
+    """
+    rng = np.random.default_rng(n * 100 + bandwidth * 10 + dim)
+    packed = np.empty((n, bandwidth + 1, dim))
+    rhs = rng.normal(size=(n, dim))
+    expected = np.empty((n, dim))
+    for d in range(dim):
+        matrix = random_banded_spd(n, bandwidth, rng)
+        factor = banded_cholesky(pack_lower_band(matrix, bandwidth), bandwidth)
+        packed[:, :, d] = factor
+        expected[:, d] = banded_solve(factor, rhs[:, d], bandwidth)
+
+    batched = banded_solve(packed, rhs, bandwidth)
+    assert batched.shape == (n, dim)
+    assert np.array_equal(batched, expected)
+
+
+def test_batched_banded_solve_handles_non_positive_definite_gracefully():
+    """A degenerate batch must not produce NaN/inf (it is variance-floored)."""
+    factor = banded_cholesky(np.zeros((3, 2, 2)), 1)
+    solved = banded_solve(factor, np.ones((3, 2)), 1)
+    assert solved.shape == (3, 2)
+    assert np.isfinite(solved).all()
+
+
+def test_banded_solve_rejects_malformed_factors_and_rhs():
+    factor = banded_cholesky(np.zeros((6, 3)), 2)
+    with pytest.raises(ValueError):
+        banded_solve(np.zeros(6), np.ones(6), 2)         # 1-D factor
+    with pytest.raises(ValueError):
+        banded_solve(np.zeros((6, 2)), np.ones(6), 2)    # narrower than band
+    with pytest.raises(ValueError):
+        banded_solve(factor, np.ones(5), 2)              # short rhs
+    with pytest.raises(ValueError):
+        banded_solve(factor, np.ones((6, 1)), 2)         # 2-D rhs, 2-D factor
+    batched = banded_cholesky(np.zeros((6, 3, 4)), 2)
+    with pytest.raises(ValueError):
+        banded_solve(batched, np.ones(6), 2)             # 1-D rhs, 3-D factor
+    with pytest.raises(ValueError):
+        banded_solve(batched, np.ones((6, 3)), 2)        # wrong feature count
+
+
+def test_mlpg_solve_matches_per_feature_scalar_solves(monkeypatch):
+    """mlpg's batched solve must equal feature-by-feature scalar solves.
+
+    Records the factor and right-hand sides mlpg actually passes to
+    `banded_solve`, then re-solves each feature with the single-feature
+    (2-D packed-band) path: the production trajectory must match exactly.
+    """
+    rng = np.random.default_rng(21)
+    n_frames, dim = 120, 36
+    means = rng.normal(size=(n_frames * 2, dim))
+    variances = np.exp(rng.normal(-4.0, 1.0, size=means.shape))
+
+    captured = {}
+    real_solve = generation.banded_solve
+
+    def recording_solve(lower, b, bandwidth):
+        captured.update(lower=lower, b=b, bandwidth=bandwidth)
+        return real_solve(lower, b, bandwidth)
+
+    monkeypatch.setattr(generation, "banded_solve", recording_solve)
+    trajectory = generation.mlpg(means, variances, (dim, dim))
+
+    lower, rhs, bandwidth = captured["lower"], captured["b"], captured["bandwidth"]
+    assert lower.shape == (n_frames, bandwidth + 1, dim)   # batched (3-D) form
+    assert rhs.shape == (n_frames, dim)
+    expected = np.stack(
+        [banded_solve(lower[:, :, d], rhs[:, d], bandwidth)
+         for d in range(dim)], axis=-1)
+    assert np.array_equal(trajectory, expected)
 
 
 def test_batched_banded_cholesky_uses_the_scalar_pivot_floor():

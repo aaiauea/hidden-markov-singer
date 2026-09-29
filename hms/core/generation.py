@@ -199,21 +199,75 @@ def banded_cholesky(a_band: np.ndarray, bandwidth: int) -> np.ndarray:
 
 
 def banded_solve(lower: np.ndarray, b: np.ndarray, bandwidth: int) -> np.ndarray:
-    """Solve ``A x = b`` given ``A``'s packed-banded Cholesky factor."""
+    """Solve ``A x = b`` given ``A``'s packed-banded Cholesky factor.
+
+    ``lower`` has shape ``(n, bandwidth + 1)`` with ``lower[i, d] =
+    L[i - d, i]`` (the layout `banded_cholesky` returns), and ``b`` has shape
+    ``(n,)``; the result is the length-``n`` solution ``x``.
+
+    MLPG may also pass independent feature dimensions together as
+    ``(n, bandwidth + 1, D)`` with right-hand sides ``(n, D)``.  Each final-axis
+    slice is solved independently.  Keeping that axis together lets the short
+    band operations run in NumPy across all features instead of repeating the
+    Python loops once per feature.
+    """
+    lower = np.asarray(lower, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if lower.ndim not in (2, 3):
+        raise ValueError(f"packed factor must be 2-D or 3-D, "
+                         f"got {lower.shape}")
+    if lower.shape[1] < bandwidth + 1:
+        raise ValueError(f"packed factor must have at least {bandwidth + 1} "
+                         f"columns, got {lower.shape}")
     n = lower.shape[0]
-    y = np.zeros(n, dtype=np.float64)
-    for i in range(n):                              # L y = b
-        acc = 0.0
+
+    if lower.ndim == 2:
+        if b.ndim != 1 or b.shape[0] != n:
+            raise ValueError(f"right-hand side must have shape {(n,)}, "
+                             f"got {b.shape}")
+        # Preserve the single-feature path for callers using the original
+        # public representation.  The batched path below is for MLPG's D-axis.
+        y = np.zeros(n, dtype=np.float64)
+        for i in range(n):                              # L y = b
+            acc = 0.0
+            for d in range(1, min(bandwidth, i) + 1):
+                acc += lower[i, d] * y[i - d]
+            y[i] = (b[i] - acc) / lower[i, 0]
+        x = np.zeros(n, dtype=np.float64)
+        for i in range(n - 1, -1, -1):                  # L^T x = y
+            acc = 0.0
+            for d in range(1, min(bandwidth, n - 1 - i) + 1):
+                acc += lower[i + d, d] * x[i + d]
+            x[i] = (y[i] - acc) / lower[i, 0]
+        return x
+
+    dim = lower.shape[2]
+    if b.ndim != 2 or b.shape != (n, dim):
+        raise ValueError(f"right-hand side must have shape {(n, dim)}, "
+                         f"got {b.shape}")
+
+    # A triangular substitution is serial along the frames (y[i] needs
+    # y[i - 1], ...), so the frame and (tiny) bandwidth loops stay in Python.
+    # The arithmetic is independent over feature dimensions, however: `acc` is
+    # a D-vector, and accumulating the band products in the same ascending
+    # offset order as the single-feature loop above preserves its rounding
+    # exactly, feature by feature.
+    y = np.zeros((n, dim), dtype=np.float64)
+    for i in range(n):                                  # L y = b
+        acc = np.zeros(dim, dtype=np.float64)
         for d in range(1, min(bandwidth, i) + 1):
             acc += lower[i, d] * y[i - d]
         y[i] = (b[i] - acc) / lower[i, 0]
-    x = np.zeros(n, dtype=np.float64)
-    for i in range(n - 1, -1, -1):                  # L^T x = y
-        acc = 0.0
+
+    # L^T x = y, in place: each y[i] is read exactly once more (by x[i]) and is
+    # dead afterwards, so the solution overwrites the forward result instead
+    # of allocating a second (n, D) buffer.
+    for i in range(n - 1, -1, -1):
+        acc = np.zeros(dim, dtype=np.float64)
         for d in range(1, min(bandwidth, n - 1 - i) + 1):
-            acc += lower[i + d, d] * x[i + d]
-        x[i] = (y[i] - acc) / lower[i, 0]
-    return x
+            acc += lower[i + d, d] * y[i + d]
+        y[i] = (y[i] - acc) / lower[i, 0]
+    return y
 
 
 def mlpg(means: np.ndarray, variances: np.ndarray,
@@ -323,10 +377,10 @@ def mlpg(means: np.ndarray, variances: np.ndarray,
         packed[:offset, offset, :] = 0.0
     lower = banded_cholesky(packed, bandwidth)
 
-    trajectory = np.zeros((n_frames, dim), dtype=np.float64)
-    for d in range(dim):
-        trajectory[:, d] = banded_solve(lower[:, :, d], rhs[:, d], bandwidth)
-    return trajectory
+    # Solve every feature dimension together: the substitutions share their
+    # frame/band structure, and `banded_solve` vectorises the band arithmetic
+    # over the feature axis (bit-identical to solving each feature on its own).
+    return banded_solve(lower, rhs, bandwidth)
 
 
 def stack_state_statistics(stream_means: Sequence[np.ndarray],
