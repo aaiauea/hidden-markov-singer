@@ -245,54 +245,84 @@ def _batched_banded_cholesky(a_band: np.ndarray, bandwidth: int) -> np.ndarray:
     `j + 1` starts.  Only the first `bandwidth` columns (whose terms reach
     above the first packed row) are still walked entry by entry, with the
     scalar path's arithmetic.
+
+    The panel is built from zero-padded strided views of the working copy and
+    never from views that reach outside it: the copy carries `bandwidth`
+    padding frames in front (the negative packed offsets of the `t > w` half)
+    and `bandwidth` slack frames behind (the `j + t` rows), so every element
+    `np.multiply` reads - the discarded half included - is inside the
+    allocation.
     """
     n, _, dim = a_band.shape
     bw = bandwidth
-    # Working copy: the packed band followed by `bw` slack frames, because the
-    # panel view below reads ``lower[j + t, w]`` for ``t <= bw``.  Only the
-    # first `n` frames are returned; the slack frames absorb the tail of the
-    # last updates.
-    lower = np.empty((n + bw, bw + 1, dim), dtype=np.float64)
-    lower[:n] = a_band
-    lower[n:] = 0.0
+    # Working copy, padded on *both* sides.  The strided views below reach
+    # outside the factor column they belong to in two directions:
+    #
+    #   * `lower[j + t, w]` with `t <= bw` - up to `bandwidth` frames past the
+    #     current column, so the copy carries `bandwidth` slack frames behind
+    #     the last real one;
+    #   * `lower[j, w - t]` with `w - t >= -bandwidth` - up to `bandwidth`
+    #     packed *columns* before the current one, which is a negative packed
+    #     offset for the `t > w` half of the panel.  `np.multiply` evaluates
+    #     that half too, so the copy also carries `bandwidth` padding rows in
+    #     front (the negative offsets land in them: one row is `bandwidth + 1`
+    #     packed columns, and `bandwidth` columns fit inside one row).
+    #
+    # So the layout is
+    #
+    #   rows [0, bw)             front padding  (the `w - t < 0` reads)
+    #   rows [bw, bw + n)        the packed band being factored
+    #   rows [bw + n, n + 2 * bw) slack frames  (the `j + t` reads)
+    #
+    # Every element of every view lies in `[lower, lower + nbytes)`, and the
+    # padding is zeroed, so no read is out of bounds or uninitialised either.
+    lower = np.empty((n + 2 * bw, bw + 1, dim), dtype=np.float64)
+    lower[:bw] = 0.0
+    lower[bw:bw + n] = a_band
+    lower[bw + n:] = 0.0
     # Packed slots above the diagonal of the first `bw` rows hold no matrix
     # entry.  The scalar path leaves them at zero and the panel view below
     # multiplies (and then discards) them, so keep them zero as well.
     for d in range(1, bw + 1):
-        lower[:d, d] = 0.0
+        lower[bw:bw + d, d] = 0.0
 
+    # The band starts `bw` rows into the copy; the returned factor is the `n`
+    # frames of `mat` that hold it.
+    mat = lower[bw:]
     if bw == 0:
-        _sqrt_diagonal(lower[:, 0])
-        return lower[:n]
+        _sqrt_diagonal(mat[:, 0])
+        return mat[:n]
 
     # First `bw` columns: every entry is formed in the scalar path's order.
     for j in range(min(bw, n)):
-        value = lower[j, 0].copy()
+        value = mat[j, 0].copy()
         for u in range(min(bw, j), 0, -1):
-            value -= lower[j, u] * lower[j, u]
+            value -= mat[j, u] * mat[j, u]
         _sqrt_diagonal(value)
-        lower[j, 0] = value
+        mat[j, 0] = value
         for t in range(1, min(bw, n - 1 - j) + 1):
             i = j + t
-            value = lower[i, t].copy()
+            value = mat[i, t].copy()
             for u in range(min(bw, i), t, -1):
-                value -= lower[i, u] * lower[j, u - t]
-            lower[i, t] = value / lower[j, 0]
+                value -= mat[i, u] * mat[j, u - t]
+            mat[i, t] = value / mat[j, 0]
     if n <= bw:
-        return lower[:n]
+        return mat[:n]
 
-    s0, s1, s2 = lower.strides
-    # column[j, t] = lower[j + t, t]: factor column j (diagonal at t = 0).
-    column = as_strided(lower, shape=(n, bw + 1, dim),
+    s0, s1, s2 = mat.strides
+    # column[j, t] = mat[j + t, t]: factor column j (diagonal at t = 0).
+    column = as_strided(mat, shape=(n, bw + 1, dim),
                         strides=(s0, s0 + s1, s2))
-    # left[j, w, t] = lower[j + t, w] and right[j, w, t] = lower[j, w - t], so
+    # left[j, w, t] = mat[j + t, w] and right[j, w, t] = mat[j, w - t], so
     # their product is the term to subtract from the entry at (row j + t,
-    # offset t) for each w.  Only `t < w` terms are used; the others read
-    # further packed band entries and are never subtracted, which keeps every
-    # read inside the buffer.
-    left = as_strided(lower, shape=(n, bw + 1, bw + 1, dim),
+    # offset t) for each w.  Only the `t < w` half is ever subtracted, but the
+    # multiply reads both halves: the `t > w` entries read up to `bandwidth`
+    # packed columns before row `j` (front padding at `j == 0`, earlier band
+    # rows otherwise), and the `j + t` rows read up to `bandwidth` frames past
+    # the last one (slack frames).  Both are inside the copy by construction.
+    left = as_strided(mat, shape=(n, bw + 1, bw + 1, dim),
                       strides=(s0, s1, s0, s2))
-    right = as_strided(lower, shape=(n, bw + 1, bw + 1, dim),
+    right = as_strided(mat, shape=(n, bw + 1, bw + 1, dim),
                        strides=(s0, s1, -s1, s2))
     panel = np.empty((bw + 1, bw + 1, dim), dtype=np.float64)
     terms = [panel[w, :w] for w in range(bw, 0, -1)]
@@ -314,7 +344,7 @@ def _batched_banded_cholesky(a_band: np.ndarray, bandwidth: int) -> np.ndarray:
         _sqrt_diagonal(diagonal)
         np.divide(off_diagonal, diagonal, out=off_diagonal)
         entries[:] = scratch
-    return lower[:n]
+    return mat[:n]
 
 
 def banded_solve(lower: np.ndarray, b: np.ndarray, bandwidth: int) -> np.ndarray:

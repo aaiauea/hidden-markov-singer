@@ -164,6 +164,77 @@ def test_batched_banded_cholesky_at_view_boundaries(
             assert np.array_equal(factor[row, offset], np.zeros(dim))
 
 
+@pytest.mark.parametrize("n,bandwidth,dim", [
+    (1, 0, 3), (1, 1, 3), (3, 3, 4), (4, 3, 4), (5, 3, 4), (40, 4, 36),
+    (16, 8, 36), (2400, 4, 36),
+])
+def test_batched_banded_cholesky_views_stay_inside_their_buffer(
+        monkeypatch, n, bandwidth, dim):
+    """Every strided view must fit inside the buffer it is built from.
+
+    The panel view reads ``mat[j + t, w]`` (up to `bandwidth` frames *behind*
+    the current column) and ``mat[j, w - t]`` (down to `bandwidth` packed
+    *columns before* it, i.e. a negative packed offset), and ``np.multiply``
+    evaluates that whole panel, not just the ``t < w`` half that is
+    subtracted.  Both directions must therefore be covered by padding of the
+    working copy.  This checks the element-address window of every view the
+    kernel builds against the buffer it was built from - using array metadata
+    only (shape, strides, base pointers), never reading memory.
+    """
+    real_as_strided = generation.as_strided
+    windows = []
+
+    def recording_as_strided(buffer, *args, **kwargs):
+        view = real_as_strided(buffer, *args, **kwargs)
+        if view.size:                      # empty views read nothing
+            owner = buffer                 # the allocation the view borrows
+            while isinstance(owner.base, np.ndarray):
+                owner = owner.base
+            assert owner.flags["C_CONTIGUOUS"]
+            base = owner.__array_interface__["data"][0]
+            limit = base + owner.nbytes
+            start = buffer.__array_interface__["data"][0]
+            # Exact element range of an as_strided view: the extremes each
+            # axis can reach (they are attained by real elements).
+            low = start + sum(min(0, st * (size - 1))
+                              for st, size in zip(view.strides, view.shape))
+            high = start + sum(max(0, st * (size - 1))
+                               for st, size in zip(view.strides, view.shape))
+            windows.append((owner, low - base, high - base))
+            assert low >= base, (n, bandwidth, dim, "reads before the buffer",
+                                 low - base)
+            assert high < limit, (n, bandwidth, dim, "reads past the buffer",
+                                  high - limit + 1)
+        return view
+
+    monkeypatch.setattr(generation, "as_strided", recording_as_strided)
+
+    rng = np.random.default_rng(n * 1000 + bandwidth * 10 + dim)
+    packed = np.empty((n, bandwidth + 1, dim))
+    expected = np.empty_like(packed)
+    for d in range(dim):
+        matrix = random_banded_spd(n, bandwidth, rng)
+        feature_band = pack_lower_band(matrix, bandwidth)
+        packed[:, :, d] = feature_band
+        expected[:, :, d] = banded_cholesky(feature_band, bandwidth)
+
+    factor = banded_cholesky(packed, bandwidth)
+    assert np.array_equal(factor, expected)
+
+    if bandwidth and n > bandwidth:        # bandwidth 0 has no views at all
+        # The hot path did build views (guards against a silent rename), all of
+        # them over the same working copy, and the factor starts at least
+        # `bandwidth` packed columns into that copy - exactly the front padding
+        # the negative `w - t` reads need.
+        assert windows
+        owner = windows[0][0]
+        assert all(entry[0] is owner for entry in windows)
+        base = owner.__array_interface__["data"][0]
+        offset = factor.__array_interface__["data"][0] - base
+        assert offset >= bandwidth * dim * np.dtype(np.float64).itemsize
+        assert offset + n * factor.strides[0] <= owner.nbytes
+
+
 def test_batched_banded_cholesky_floors_only_dead_pivots():
     """A small positive pivot is kept; only a dead one hits the 1e-6 floor.
 
