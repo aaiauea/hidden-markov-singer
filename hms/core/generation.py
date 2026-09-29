@@ -347,6 +347,61 @@ def _batched_banded_cholesky(a_band: np.ndarray, bandwidth: int) -> np.ndarray:
     return mat[:n]
 
 
+def _substitute_forward(band: np.ndarray, diag: np.ndarray,
+                        rhs: np.ndarray, out: np.ndarray,
+                        tile: np.ndarray) -> None:
+    """Banded forward substitution, in place into ``out``.
+
+    Computes ``out[i] = (rhs[i] - sum_k band[i, k] * out[i - 1 - k]) /
+    diag[i]``, for the strictly-lower band ``band`` of shape ``(n, bw, D)``
+    (``band[i, k]`` couples row ``i`` to row ``i - 1 - k``).  ``rhs`` may
+    alias ``out`` (the backward pass overwrites its own right-hand side, one
+    row at a time, exactly like the scalar loop).
+
+    The per-frame band sum keeps the scalar loop's association order
+    bit for bit.  ``tile`` is a scratch array of shape ``(bw + 1, D)`` whose
+    row 0 is a permanent ``+0.0``: the products are written to rows ``1..d``
+    and scanned with `np.add.accumulate` along the rows, so the last row is
+    ``((0 + p1) + p2) + ... + pd`` - the scalar ``acc = 0.0; acc += ...``
+    accumulation, including its signed-zero behaviour.  `add.accumulate` is
+    an inclusive scan: its association order is part of the operation, not
+    an implementation detail of a reduction.
+
+    Rows are iterated (no per-frame fancy indexing) and every temporary is
+    the preallocated ``tile``; the substitution allocates nothing per frame.
+    """
+    n = diag.shape[0]
+    bw = band.shape[1]
+    mult = np.multiply
+    accum = np.add.accumulate
+    sub = np.subtract
+    div = np.divide
+    full = tile[:bw + 1]          # seed row 0 + product rows 1..bw
+    prod = tile[1:]
+    acc_full = tile[bw]           # scan result when every row is active
+
+    # Ramp-up region: row i couples to rows < i only, so row i uses the
+    # first i product slots (d = 1..i).
+    for i in range(min(bw, n)):
+        d = i
+        if d:
+            mult(band[i, :d], out[i - d:i][::-1], out=prod[:d])
+            accum(full[:d + 1], axis=0, out=full[:d + 1])
+        sub(rhs[i], tile[d], out=out[i])
+        div(out[i], diag[i], out=out[i])
+
+    # Full-band region: fixed shapes and prebuilt row views, so the frame
+    # loop is a bare sequence of ufunc calls with no indexing or slicing.
+    if n > bw:
+        wins = [out[i - bw:i][::-1] for i in range(bw, n)]
+        for bi, wi, ri, oi, di in zip(band[bw:], wins, rhs[bw:],
+                                      out[bw:], diag[bw:]):
+            mult(bi, wi, out=prod)
+            accum(full, axis=0, out=full)
+            sub(ri, acc_full, out=oi)
+            div(oi, di, out=oi)
+
+
 def banded_solve(lower: np.ndarray, b: np.ndarray, bandwidth: int) -> np.ndarray:
     """Solve ``A x = b`` given ``A``'s packed-banded Cholesky factor.
 
@@ -359,6 +414,18 @@ def banded_solve(lower: np.ndarray, b: np.ndarray, bandwidth: int) -> np.ndarray
     slice is solved independently.  Keeping that axis together lets the short
     band operations run in NumPy across all features instead of repeating the
     Python loops once per feature.
+
+    Both substitutions are serial along the frames (row ``i`` needs rows
+    ``< i``), so the frame loop stays in Python, but each frame now runs a
+    fixed sequence of whole-band ufunc calls over the feature axis instead
+    of one Python-level multiply-add per band entry, and nothing is allocated
+    per frame.  The arithmetic - including the accumulation order of every
+    band sum - is bit for bit the scalar loop's arithmetic, so the batched
+    and single-feature paths agree exactly.  The backward substitution is a
+    forward pass over the system reversed in time, sharing the same kernel;
+    its band is gathered once per call into an explicit zero-padded
+    ``(n, bandwidth, D)`` scratch buffer (no stride tricks, every read is an
+    ordinary slice of either input or scratch).
     """
     lower = np.asarray(lower, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
@@ -395,27 +462,42 @@ def banded_solve(lower: np.ndarray, b: np.ndarray, bandwidth: int) -> np.ndarray
         raise ValueError(f"right-hand side must have shape {(n, dim)}, "
                          f"got {b.shape}")
 
-    # A triangular substitution is serial along the frames (y[i] needs
-    # y[i - 1], ...), so the frame and (tiny) bandwidth loops stay in Python.
-    # The arithmetic is independent over feature dimensions, however: `acc` is
-    # a D-vector, and accumulating the band products in the same ascending
-    # offset order as the single-feature loop above preserves its rounding
-    # exactly, feature by feature.
     y = np.zeros((n, dim), dtype=np.float64)
-    for i in range(n):                                  # L y = b
-        acc = np.zeros(dim, dtype=np.float64)
-        for d in range(1, min(bandwidth, i) + 1):
-            acc += lower[i, d] * y[i - d]
-        y[i] = (b[i] - acc) / lower[i, 0]
+    bw = int(bandwidth)
+    if bw <= 0:
+        # No band terms: both passes are plain divides (subtracting the empty
+        # sum is the identity, b[i] - 0.0 == b[i] bitwise).
+        np.divide(b, lower[:, 0, :], out=y)
+        np.divide(y, lower[:, 0, :], out=y)
+        return y
+
+    # Product tile for the band sums; row 0 is a permanent +0.0 seed (see
+    # `_substitute_forward`).
+    tile = np.zeros((bw + 1, dim), dtype=np.float64)
+
+    # L y = b: lower[i, d] couples row i to row i - d, i.e. band slot
+    # band[i, d - 1] of the strictly-lower band.
+    _substitute_forward(lower[:, 1:bw + 1, :], lower[:, 0, :], b, y, tile)
 
     # L^T x = y, in place: each y[i] is read exactly once more (by x[i]) and is
-    # dead afterwards, so the solution overwrites the forward result instead
-    # of allocating a second (n, D) buffer.
-    for i in range(n - 1, -1, -1):
-        acc = np.zeros(dim, dtype=np.float64)
-        for d in range(1, min(bandwidth, n - 1 - i) + 1):
-            acc += lower[i + d, d] * y[i + d]
-        y[i] = (y[i] - acc) / lower[i, 0]
+    # dead afterwards, so the solution overwrites the forward result instead of
+    # allocating a second (n, D) buffer.  Reversed in time (j = n - 1 - i),
+    # L^T x = y is another forward substitution: x'[j] = (y'[j] -
+    # sum_k stripe[j, k] * x'[j - 1 - k]) / diag'[j] with
+    # stripe[i, k] = lower[i + 1 + k, 1 + k] and diag'[j] = lower[n - 1 - j, 0].
+    # The stripe is the diagonal lanes of the packed factor; gather it once
+    # into an explicit zero-padded (n, bw, D) scratch band.  The padded rows
+    # (stripe[i, k] with i + 1 + k >= n) are never read - the kernel couples
+    # row j only to rows j - 1 - k, which map back to real lower[i + d, d]
+    # entries - but carrying them as ordinary zero rows keeps every view a
+    # plain slice of an allocation it fits inside.  No stride tricks.
+    stripe = np.zeros((n, bw, dim), dtype=np.float64)
+    for k in range(bw):
+        m = n - 1 - k
+        if m > 0:
+            stripe[:m, k] = lower[1 + k:1 + k + m, 1 + k]
+    z = y[::-1]
+    _substitute_forward(stripe[::-1], lower[::-1, 0, :], z, z, tile)
     return y
 
 

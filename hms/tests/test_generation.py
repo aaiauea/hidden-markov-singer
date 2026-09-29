@@ -474,6 +474,173 @@ def test_banded_solve_rejects_malformed_factors_and_rhs():
         banded_solve(batched, np.ones((6, 3)), 2)        # wrong feature count
 
 
+def reference_batched_banded_solve(lower, b, bandwidth):
+    """Frozen copy of the pre-optimization batched (3-D) solver.
+
+    The optimised `_substitute_forward` kernel must reproduce this loop bit
+    for bit - same products, same accumulation order, same divide - for every
+    supported shape.  Kept here as the numerical oracle for the batched path.
+    """
+    lower = np.asarray(lower, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    n, _, dim = lower.shape
+    y = np.zeros((n, dim), dtype=np.float64)
+    for i in range(n):
+        acc = np.zeros(dim, dtype=np.float64)
+        for d in range(1, min(bandwidth, i) + 1):
+            acc += lower[i, d] * y[i - d]
+        y[i] = (b[i] - acc) / lower[i, 0]
+    for i in range(n - 1, -1, -1):
+        acc = np.zeros(dim, dtype=np.float64)
+        for d in range(1, min(bandwidth, n - 1 - i) + 1):
+            acc += lower[i + d, d] * y[i + d]
+        y[i] = (y[i] - acc) / lower[i, 0]
+    return y
+
+
+def assert_same_bits(actual, expected):
+    """Bitwise identity, with NaN counted as equal to NaN.
+
+    ``np.array_equal`` treats +0.0 == -0.0 as equal and NaN as unequal; the
+    solver's contract is stronger on both counts: identical bits wherever the
+    reference is not NaN, and identical NaN-ness everywhere.
+    """
+    assert actual.shape == expected.shape
+    same = actual.view(np.uint64) == expected.view(np.uint64)
+    assert bool((same | (np.isnan(actual) & np.isnan(expected))).all())
+
+
+@pytest.mark.parametrize("n,bandwidth,dim", [
+    (0, 0, 2), (0, 4, 3),        # empty sequences
+    (1, 0, 2), (1, 5, 4),        # single frame
+    (2, 1, 2), (3, 2, 3),        # tiny
+    (4, 4, 3), (5, 4, 3),        # n == bw, n == bw + 1
+    (3, 4, 3), (7, 9, 3),        # n < bw
+    (6, 4, 2), (9, 8, 3),        # n == bw + 2, production bandwidth 8
+    (7, 0, 4), (40, 4, 36),      # zero bandwidth, production D
+    (257, 8, 5), (1000, 4, 30),  # long sequences
+])
+def test_batched_banded_solve_is_bit_identical_to_the_reference_loop(
+        n, bandwidth, dim):
+    """The vectorised kernel must repeat the scalar arithmetic exactly.
+
+    Covers tiny and single-frame sequences, bw = 0, bw = 1, several larger
+    bandwidths, n below / at / above the bandwidth, and long sequences.
+    """
+    rng = np.random.default_rng(n * 100 + bandwidth * 10 + dim)
+    lower = rng.normal(size=(n, bandwidth + 1, dim))
+    lower[:, 0, :] = np.abs(lower[:, 0, :]) + 1.0
+    b = rng.normal(size=(n, dim))
+    assert_same_bits(banded_solve(lower, b, bandwidth),
+                     reference_batched_banded_solve(lower, b, bandwidth))
+
+
+def test_batched_banded_solve_matches_the_reference_at_production_scale():
+    """The 2400 x 36 x bw-8 workload, bit for bit."""
+    rng = np.random.default_rng(2400)
+    n, bandwidth, dim = 2400, 8, 36
+    lower = rng.normal(size=(n, bandwidth + 1, dim))
+    lower[:, 0, :] = np.abs(lower[:, 0, :]) + 1.0
+    b = rng.normal(size=(n, dim))
+    assert_same_bits(banded_solve(lower, b, bandwidth),
+                     reference_batched_banded_solve(lower, b, bandwidth))
+
+
+@pytest.mark.parametrize("label", ["signed-zero rhs", "signed-zero band",
+                                   "zero diagonal", "nan diagonal",
+                                   "nan rhs", "inf offdiag", "inf rhs",
+                                   "tiny pivot"])
+def test_batched_banded_solve_edge_values_match_the_reference(label):
+    """NaN/inf propagation and degenerate pivots must behave as before."""
+    ones = np.ones((5, 3, 2))
+    if label == "signed-zero rhs":
+        lower, b, bw = ones, np.full((5, 2), -0.0), 1
+    elif label == "signed-zero band":
+        lower = ones.copy()
+        lower[:, 1, :] = -0.0
+        b, bw = np.full((5, 2), -0.0), 1
+    elif label == "zero diagonal":
+        lower, b, bw = np.zeros((5, 3, 2)), np.ones((5, 2)), 1
+    elif label == "nan diagonal":
+        lower, b, bw = np.full((5, 3, 2), np.nan), np.ones((5, 2)), 1
+    elif label == "nan rhs":
+        lower, b, bw = ones, np.full((5, 2), np.nan), 1
+    elif label == "inf offdiag":
+        lower = np.stack([np.ones(5), np.full(5, np.inf)], 1)[:, :, None]
+        lower = np.broadcast_to(lower, (5, 2, 2)).copy()
+        b, bw = np.ones((5, 2)), 1
+    elif label == "inf rhs":
+        lower, b, bw = ones, np.full((5, 2), np.inf), 1
+    else:
+        lower = np.stack([np.full(5, 1e-300), np.ones(5)], 1)[:, :, None]
+        lower = np.broadcast_to(lower, (5, 2, 2)).copy()
+        b, bw = np.ones((5, 2)), 1
+    with np.errstate(all="ignore"):
+        expected = reference_batched_banded_solve(lower, b, bw)
+        actual = banded_solve(lower, b, bw)
+    assert_same_bits(actual, expected)
+
+
+def test_batched_banded_solve_accepts_non_contiguous_inputs():
+    """Views with arbitrary strides (as produced inside mlpg) are supported."""
+    rng = np.random.default_rng(21)
+    n, bandwidth, dim = 40, 4, 5
+    wide_lower = rng.normal(size=(n, bandwidth + 1, 2 * dim))
+    wide_b = rng.normal(size=(n, 2 * dim))
+    lower = wide_lower[:, :, ::2]                    # non-contiguous feature axis
+    b = wide_b[:, ::2]
+    expected = reference_batched_banded_solve(
+        np.ascontiguousarray(lower), np.ascontiguousarray(b), bandwidth)
+    assert_same_bits(banded_solve(lower, b, bandwidth), expected)
+    assert_same_bits(banded_solve(np.asfortranarray(lower), b, bandwidth),
+                     expected)
+    # same values behind genuinely strided (non-contiguous) buffers
+    strided_lower_buf = np.empty((n, bandwidth + 1, 2 * dim))
+    strided_lower_buf[:, :, ::2] = lower
+    strided_b_buf = np.empty((n, 2 * dim))
+    strided_b_buf[:, ::2] = b
+    assert_same_bits(banded_solve(strided_lower_buf[:, :, ::2],
+                                  strided_b_buf[:, ::2], bandwidth), expected)
+
+
+def test_batched_banded_solve_does_not_touch_inputs_or_guard_regions():
+    """Memory-boundary regression: no read or write outside the inputs.
+
+    The factor and rhs sit inside sentinel-filled backing buffers, as views.
+    A solver that reached past the view into the backing store would either
+    pick up sentinel values (the result stops matching the reference) or
+    overwrite them (the sentinels change).  Both are checked.  The solver
+    constructs no stride-computed views - only ordinary slices of its inputs
+    and of explicit padded scratch - so this pins the property down.
+    """
+    rng = np.random.default_rng(23)
+    n, bandwidth, dim = 33, 8, 3          # n = 3 * bw + 9: every lane is used
+    guard = 5
+    sentinel = 123456789.0
+
+    lower_back = np.full((n + 2 * guard, bandwidth + 1, dim), sentinel)
+    lower_back[guard:guard + n] = rng.normal(size=(n, bandwidth + 1, dim))
+    lower_back[guard:guard + n, 0, :] = np.abs(lower_back[guard:guard + n, 0]) + 1
+    lower = lower_back[guard:guard + n]
+
+    b_back = np.full((n + 2 * guard, dim), sentinel)
+    b_back[guard:guard + n] = rng.normal(size=(n, dim))
+    b = b_back[guard:guard + n]
+
+    expected = reference_batched_banded_solve(lower, b, bandwidth)
+    lower_saved = lower.copy()
+    b_saved = b.copy()
+    assert_same_bits(banded_solve(lower, b, bandwidth), expected)
+
+    assert (lower_back[:guard] == sentinel).all()
+    assert (lower_back[guard + n:] == sentinel).all()
+    assert (b_back[:guard] == sentinel).all()
+    assert (b_back[guard + n:] == sentinel).all()
+    # the solved-for rows themselves must be untouched too
+    assert_same_bits(lower, lower_saved)
+    assert_same_bits(b, b_saved)
+
+
 def test_mlpg_solve_matches_per_feature_scalar_solves(monkeypatch):
     """mlpg's batched solve must equal feature-by-feature scalar solves.
 
