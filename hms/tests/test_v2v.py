@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from hms.core.dsp import frame_signal
 from hms.core.v2v import (V2VAnalysisConfig, V2VFrontend,
                           _lpc_cepstral_coefficients, analyze_v2v)
 from hms.vocoder import get_vocoder
@@ -87,6 +88,43 @@ def test_silence_has_finite_zero_shape_features_and_unvoiced_f0():
     assert not result.lpc_cepstra.any()
     assert not result.lpc_log_spectrum.any()
     assert_finite_analysis(result)
+
+
+def test_trailing_silence_holds_spectral_shape_not_other_features():
+    settings = config()
+    voice = harmonic_signal(frequency=220.0, duration=0.3)
+    audio = np.concatenate((voice, np.zeros(int(0.2 * FS))))
+    result = analyze_v2v(audio, FS, settings)
+
+    voiced_active = np.flatnonzero(result.voiced & (result.energy_rms > 0.0))
+    assert voiced_active.size
+    last_voice = int(voiced_active[-1])
+    silent_tail = np.flatnonzero(
+        (np.arange(len(result)) > last_voice) & (result.energy_rms == 0.0))
+    assert silent_tail.size
+
+    candidate = result.candidate_features
+    cepstral_slice = slice(0, settings.cepstral_order)
+    assert np.allclose(candidate[silent_tail, cepstral_slice],
+                       candidate[last_voice, cepstral_slice])
+    # Only spectral shape is edge-held; source voicing, energy and the true
+    # silent-frame LPC identity solution are retained as observations.
+    assert np.allclose(result.lpc_cepstra[silent_tail],
+                       result.lpc_cepstra[last_voice])
+    assert np.allclose(result.lpc_log_spectrum[silent_tail],
+                       result.lpc_log_spectrum[last_voice])
+    assert not result.f0_hz[silent_tail].any()
+    expected_identity = np.zeros((len(silent_tail), result.lpc_order + 1))
+    expected_identity[:, 0] = 1.0
+    assert np.array_equal(result.lpc_coefficients[silent_tail],
+                          expected_identity)
+    assert not candidate[silent_tail, settings.cepstral_order].any()
+    assert not candidate[silent_tail, settings.cepstral_order + 1].any()
+    assert np.all(candidate[silent_tail, -1] == -240.0)
+
+    # Without a valid voiced frame there is no edge value to carry forward.
+    all_silence = analyze_v2v(np.zeros(int(0.2 * FS)), FS, settings)
+    assert not all_silence.candidate_features[:, cepstral_slice].any()
 
 
 def test_noisy_unvoiced_input_keeps_stable_finite_lpc_parameters():
@@ -173,6 +211,35 @@ def test_f0_and_lpc_share_the_backend_frame_count_and_time_grid():
                     & (result.frame_times_s < 0.53))
     assert not result.voiced[noisy_region].any()
     assert_finite_analysis(result)
+
+
+@pytest.mark.parametrize(
+    ("fundamental_hz", "partial_amplitudes"),
+    [(110.0, (0.05, 0.8, 0.3, 0.1)),
+     (165.0, (1.0, 0.5, 0.2, 0.1)),
+     (220.0, (1.0, 0.5, 0.2, 0.1))])
+def test_builtin_tracker_follows_110_hz_fundamental_without_harming_midrange(
+        fundamental_hz, partial_amplitudes):
+    time = np.arange(int(0.6 * FS), dtype=np.float64) / FS
+    audio = 0.2 * sum(
+        amplitude * np.sin(2.0 * np.pi * fundamental_hz * harmonic * time)
+        for harmonic, amplitude in enumerate(partial_amplitudes, start=1))
+    result = analyze_v2v(audio, FS, config(f0_floor=71.0, f0_ceil=800.0))
+    hop = int(round(FS * FRAME_PERIOD_MS / 1000.0))
+    original_f0_frames = len(frame_signal(audio, 4 * hop, hop))
+    assert len(result) == original_f0_frames
+
+    interior = ((result.frame_times_s >= 0.12)
+                & (result.frame_times_s <= 0.48)
+                & result.voiced)
+    estimates = result.f0_hz[interior]
+    assert estimates.size > 0
+    median_f0 = float(np.median(estimates))
+    assert median_f0 == pytest.approx(fundamental_hz, rel=0.04)
+    if fundamental_hz == 110.0:
+        # The strong second harmonic makes the former short-window tracker
+        # settle near 220 Hz; keep this an explicit octave-error regression.
+        assert median_f0 < 165.0
 
 
 def test_lpc_shape_features_are_separate_from_overall_loudness():

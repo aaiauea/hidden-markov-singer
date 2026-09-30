@@ -34,19 +34,35 @@ def frame_signal(x: np.ndarray, frame_length: int, hop: int) -> np.ndarray:
 def autocorrelation_f0(x: np.ndarray, fs: int, frame_length: int, hop: int,
                        f0_floor: float = 71.0, f0_ceil: float = 800.0,
                        threshold: float = 0.30) -> np.ndarray:
-    """F0 track by normalised autocorrelation with a voicing decision."""
-    frames = frame_signal(x, frame_length, hop) * np.hanning(frame_length)
-    n_fft = 1 << int(np.ceil(np.log2(2 * frame_length)))
+    """Normalized-autocorrelation F0 with enough cycles for its low end.
+
+    Keep at least 2.5 periods of the requested floor in each analysis frame.
+    This helps distinguish a low fundamental from its strong second harmonic;
+    the hop and output frame count remain those of the caller's original grid.
+    """
+    frames = frame_signal(x, frame_length, hop)
+    analysis_length = frame_length
+    if f0_floor > 0.0:
+        minimum_length = int(np.ceil(2.5 * fs / f0_floor))
+        if minimum_length > analysis_length:
+            analysis_length = minimum_length
+            if analysis_length % 2 == 0:
+                analysis_length += 1
+            frame_count = len(frames)
+            del frames
+            frames = frame_signal(x, analysis_length, hop)[:frame_count]
+    frames = frames * np.hanning(analysis_length)
+    n_fft = 1 << int(np.ceil(np.log2(2 * analysis_length)))
     spec = np.fft.rfft(frames, n_fft, axis=1)
-    acf = np.fft.irfft(np.abs(spec) ** 2, n_fft, axis=1)[:, :frame_length]
+    acf = np.fft.irfft(np.abs(spec) ** 2, n_fft, axis=1)[:, :analysis_length]
     acf = acf / np.maximum(acf[:, :1], 1e-12)
 
-    lags = np.arange(1, frame_length + 1)
+    lags = np.arange(1, analysis_length + 1)
     mean_abs = np.cumsum(np.abs(acf), axis=1) / lags
     cmnd = acf / np.maximum(mean_abs, 1e-12)
 
     lag_min = max(1, int(fs / max(f0_ceil, 1.0)))
-    lag_max = min(frame_length - 2, int(fs / max(f0_floor, 1.0)))
+    lag_max = min(analysis_length - 2, int(fs / max(f0_floor, 1.0)))
     segment = cmnd[:, lag_min:lag_max + 1]
     best = np.argmax(segment, axis=1) + lag_min
     peak = cmnd[np.arange(len(cmnd)), best]

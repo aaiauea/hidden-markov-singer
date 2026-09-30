@@ -87,9 +87,13 @@ autocorrelation and batched Levinson-Durbin recursion. Coefficients are scaled
 from normalized autocorrelation, so their shape does not depend on signal gain.
 Reflection clipping plus an early stop when residual power collapses avoids
 continuing a numerically ill-conditioned recursion on nearly periodic or silent
-frames. Silent/near-silent frames retain the identity polynomial and zero shape
-features. The log spectral envelope is mean-centred, so energy remains in the
-separate RMS feature.
+frames. Silent frames retain the identity LPC polynomial. With no voiced
+history, shape features remain zero. If valid voiced material precedes a
+terminal unvoiced suffix, the last cepstral and log-spectrum shape is edge-held
+across that suffix to avoid a synthetic drop in downstream sequences. The raw
+LPC coefficients, F0, voicing and RMS remain measured; empty or all-unvoiced
+inputs have no edge value to hold and remain unchanged. The log spectral
+envelope is mean-centred, so energy remains in the separate RMS feature.
 
 The frontend asks the current `Vocoder.analyze` interface for F0 and discards
 its returned source `sp`/`ap` arrays. This keeps source WORLD spectral
@@ -97,7 +101,9 @@ parameters out of the candidate target path, but the present vocoder interface
 still computes those arrays internally; see the memory result and limitations
 below. Use `vocoder="native"` or `"pyworld"` for real WORLD F0 where available.
 `"builtin"` is the existing NumPy fallback: useful for portable tests, but not
-real WORLD and less accurate for pitch.
+real WORLD and less accurate for pitch. The fallback autocorrelation window now
+covers at least 2.5 periods at the configured F0 floor while retaining the
+original hop and output frame count; this reduces octave errors for low F0.
 
 ## Reproducible experiment
 
@@ -130,9 +136,9 @@ ctypes C-API WORLD backend; `builtin` selected the NumPy fallback.
 | Measurement | Native WORLD backend | Builtin fallback |
 |---|---:|---:|
 | Backend frames for 2.000 s | 401 (0.000–2.000 s) | 405 (0.000–2.020 s) |
-| Median frontend extraction time | 168.6 ms | 112.6 ms |
-| Throughput | 11.9x real time | 17.8x real time |
-| `tracemalloc` peak | 12.52 MiB | 32.02 MiB |
+| Median frontend extraction time | 161.9 ms | 103.6 ms |
+| Throughput | 12.4x real time | 19.3x real time |
+| `tracemalloc` peak | 12.52 MiB | 34.42 MiB |
 | Retained output arrays | 0.57 MiB | 0.58 MiB |
 | Candidate feature matrix | 72.1 KiB | 72.8 KiB |
 | Known 220 Hz tone, median estimated F0 | 219.75 Hz (-2.0 cents) | 225.0 Hz (+38.9 cents) |
@@ -140,6 +146,12 @@ ctypes C-API WORLD backend; `builtin` selected the NumPy fallback.
 | Median LPC log-envelope / periodogram correlation | 0.878 | 0.878 |
 | Median centred log-power envelope RMSE (natural-log units) | 5.40 | 5.40 |
 | Synthetic vowel probe | 16/20 (80%) | 16/20 (80%) |
+
+A separate builtin autocorrelation stress signal with a 110 Hz fundamental and
+an eight-times-stronger second partial tracked at 110.8 Hz (instead of the
+former short-window octave estimate near 220 Hz). The same test setup tracked
+165 Hz and 220 Hz signals at 167.0 Hz and 222.7 Hz, respectively. These are
+steady synthetic signals, not natural-voice pitch accuracy results.
 
 Timings are a small local run, not a hardware-independent performance claim.
 The builtin backend's 405-frame grid extends 20 ms past the 2 s input because
