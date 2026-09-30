@@ -15,6 +15,11 @@ On-disk format (a directory, both halves human-readable):
     array set per phoneme keeps it inspectable with ``numpy.load`` and any
     ``.npz`` tool.
 
+The optional ``global_variance`` section in ``model.yaml`` holds one target
+variance per *normalized static* feature (never per delta stream), estimated
+from the training utterances. Models without this section continue to load and
+synthesize normally. GV generation itself is always opt-in.
+
 Backoff models (``backoff`` section in the YAML, ``backoff.npz``) are aggregated
 models per phoneme class, used when a score asks for a symbol the model has
 never seen.  That is what lets a new phoneme be added to `phonemes.yaml`
@@ -46,6 +51,7 @@ from hms.core.context import (GLOBAL_KEY, KIND_LEFT, KIND_RIGHT, KIND_TRIPHONE,
                               right_diphone_key, triphone_key)
 from hms.core.duration import DurationModel
 from hms.core.features import FeatureSpec
+from hms.core.gv import GlobalVarianceStats
 from hms.core.hmm import LeftToRightHMM
 from hms.core.phonemes import PhonemeSet
 from hms.core.pitch import PitchModel
@@ -64,6 +70,8 @@ from hms.core.pitch_condition import (KIND_PHONE, PitchConditioning,
 #:      `pitch_conditioning` section in the YAML and a `pitch.npz` array file.
 #:      Format-2 and format-3 files carry no pitch conditioning and still load
 #:      (with the feature recorded as disabled), so no migration is needed.
+#: GV is an optional YAML section in format 4, not a change to feature geometry
+#: or the existing payload. Older files have no GV target; no bump is needed.
 MODEL_FORMAT_VERSION = 4
 
 #: Format versions this build can read.
@@ -144,7 +152,8 @@ class HMSModel:
                  pitch_models: Optional[Dict[Tuple[str, int],
                                              LeftToRightHMM]] = None,
                  pitch_index: Optional[Dict[Tuple[str, int], dict]] = None,
-                 pitch_conditioning: Optional[PitchConditioning] = None
+                 pitch_conditioning: Optional[PitchConditioning] = None,
+                 gv_stats: Optional[GlobalVarianceStats] = None
                  ) -> None:
         self.name = name
         self.spec = spec
@@ -174,6 +183,10 @@ class HMSModel:
         self.pitch_index = pitch_index or {}
         #: how this model's pitch bins are defined (see `hms.core.pitch_condition`)
         self.pitch_conditioning = pitch_conditioning or PitchConditioning()
+        #: optional per-static-feature, normalized-space GV targets
+        if gv_stats is not None and gv_stats.target_variance.shape != (spec.static_dim,):
+            raise ValueError("GV targets must match FeatureSpec.static_dim")
+        self.gv_stats = gv_stats
         #: format version the model was read from (set by `load`)
         self.loaded_format_version: Optional[int] = None
 
@@ -448,6 +461,9 @@ class HMSModel:
         if self.stats.frames:
             lines.append(f"  params per frame  : "
                          f"{self.n_free_params / self.stats.frames:.2f}")
+        if self.gv_stats is not None:
+            lines.append(f"  GV targets        : {self.static_dim} static features "
+                         f"({self.gv_stats.utterances} utterances; optional)")
         return lines
 
     # -- serialisation -----------------------------------------------------
@@ -551,6 +567,8 @@ class HMSModel:
             document["pitch_conditioning"] = pitch_section
         if pitch_index_document:
             document["pitch_index"] = pitch_index_document
+        if self.gv_stats is not None:
+            document["global_variance"] = self.gv_stats.to_dict()
         with open(directory / _MODEL_YAML, "w", encoding="utf-8") as handle:
             yaml.safe_dump(document, handle, sort_keys=False, allow_unicode=True)
         return directory
@@ -726,6 +744,8 @@ class HMSModel:
             pitch_models=pitch_models,
             pitch_index=pitch_index,
             pitch_conditioning=pitch_conditioning,
+            gv_stats=(GlobalVarianceStats.from_dict(document["global_variance"])
+                      if "global_variance" in document else None),
         )
         model.loaded_format_version = version
         return model

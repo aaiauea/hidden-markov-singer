@@ -14,7 +14,7 @@ maximum-likelihood parameter generation (MLPG) over static + delta features.
 ```
 score (phones, notes, times) ──► duration/state plan ──► HMM state sequence
                                   │                          │
-                                  │                          └─► GMM statistics ─► MLPG ─► sp/ap
+                                  │                          └─► GMM statistics ─► MLPG ─► optional GV ─► sp/ap
                                   │                                                       │
                                   └─► target musical F0 ────────────────────────────────┤
                                       optional learned deviation / vibrato ─► F0 ────────┤
@@ -114,9 +114,11 @@ fewer parameters for very small corpora), `hms train --iterations 10 --evaluate`
 `hms train --context` (optional sparse phoneme-context models, see below),
 `hms train --pitch-conditioning --pitch-bin-size 6` (optional pitch-binned
 acoustic models, experimental — see below),
-`hms synth --transpose 5 --vibrato --variance-scale 2`, `hms synth --trace
-trace.tsv` (frame-by-frame phoneme/state/note/F0 table), `hms synth --f0-file
-contour.txt` (sing with your own F0 trajectory instead of the generated one).
+`hms synth --transpose 5 --vibrato --variance-scale 2`,
+`hms synth --gv --gv-weight 2 --gv-iterations 20` (experimental static GV;
+see below), `hms synth --trace trace.tsv` (frame-by-frame phoneme/state/note/F0
+table), `hms synth --f0-file contour.txt` (sing with your own F0 trajectory
+instead of the generated one).
 
 ## Comparing models: `hms evaluate`
 
@@ -226,6 +228,63 @@ This is an **experimental modelling option**, not a quality claim: whether
 conditioning helps a given voice is exactly what the option lets you measure
 (`hms evaluate --model baseline --model conditioned`), and a corpus that only
 covers a narrow range will simply train few or no buckets.
+
+## Optional Global Variance generation (experimental)
+
+MLPG chooses a smooth static acoustic trajectory from state means and delta
+constraints, but its maximum-likelihood average can suppress the utterance-wide
+variation present in the recordings. GV is an **opt-in post-MLPG optimization**
+of those static trajectories, not a fixed variance multiplier. During training,
+HMS stores the mean of each utterance's **within-utterance population variance**
+per normalized static feature (one target each for note-relative F0, mel-cepstral
+coefficients and aperiodicity bands; none for deltas). Utterances with fewer than
+two frames are skipped. The targets are in the optional `global_variance` section
+of `model.yaml` with the number of contributing utterances, not in a new model
+file; the model format remains version 4. A pre-GV model has **no targets** and
+loads/synthesizes unchanged with GV off; asking it for GV reports an error
+rather than inventing statistics.
+
+For each static feature, the optimizer starts at the usual MLPG solution `c0`
+and trades off the *increase in MLPG negative log-likelihood* from moving away
+from `c0` against the squared difference between the new trajectory's variance
+`mean((c - mean(c))²)` and its training target. The trade-off is controlled by
+`gv_weight` (default 1.0); `gv_iterations` (default 20) caps the gradient steps.
+Steps use the exact variance gradient `2(c - mean(c))/T`, MLPG's own dynamic
+windows and precisions, a diagonal preconditioner and a per-feature line search
+that only accepts objective improvements. Scaling the penalty by the larger of
+the starting/target variance (with a small floor) keeps flat features safe.
+Constant trajectories have zero variance gradient and stay constant rather than
+acquire invented noise; one-frame trajectories also stay unchanged. This is an
+**approximate GV penalty**, not a reproduction of a classic GV-MLPG system with
+a learned distribution of global variances or a perceptual quality guarantee.
+The targets include silence/unvoiced frames; very different utterance lengths,
+small corpora or mismatched score statistics may call for tuning or disabling GV.
+
+GV is **disabled by default**, even on newly trained models. Compare a render
+with and without it (with `--vocoder builtin` if WORLD is unavailable):
+
+```bash
+hms synth --model model --score score.tsv --out plain.wav
+hms synth --model model --score score.tsv --out expressive.wav \
+    --gv --gv-weight 2 --gv-iterations 20
+```
+
+```python
+from hms.core.synthesizer import SynthesisConfig, Synthesizer
+
+plain = Synthesizer(model, SynthesisConfig(gv_enabled=False)).synthesize(score)
+expressive = Synthesizer(model, SynthesisConfig(
+    gv_enabled=True, gv_weight=2.0, gv_iterations=20)).synthesize(score)
+```
+
+Or set `synthesis.gv_enabled: true`, `synthesis.gv_weight` (non-negative; zero
+means no updates) and `synthesis.gv_iterations` (non-negative; zero means no
+updates) in `parameters.yaml`; `--no-gv` overrides the YAML setting. Only the
+normalized **static** output of MLPG changes; the optimized MLPG solve and
+existing `variance_scale` remain untouched. In default `f0_source: score` mode,
+the requested note/F0 is still taken from the score; GV of the note-relative F0
+feature only affects the optional acoustic-deviation mode. For a synthetic
+performance/variance check, run `python tools/bench_gv.py --frames 1000 --dim 30`.
 
 ## Data format
 
@@ -350,8 +409,8 @@ hms synth --model model --score score.tsv --out song.wav --f0-file contour.npy
 ```
 model/
 ├── model.yaml     # format version, feature spec, phoneme set, duration and
-│                  # pitch models, normalisation, context index, pitch
-│                  # conditioning + pitch index, parameter budget -- readable
+│                  # pitch models, normalisation, optional GV static targets,
+│                  # context + pitch indexes, parameter budget -- readable
 ├── hmm.npz        # GMM weights/means/variances and transition stats
 ├── backoff.npz    # per phoneme-class pooled models
 ├── context.npz    # sparse phone-context HMMs + optional global backoff
@@ -364,19 +423,21 @@ model/
 
 ```bash
 HMS_NO_AUTO_BUILD=1 python -m pytest
-# 382 tests: 374 passed, 8 optional skips without WORLD
+# 506 passed, 8 optional skips without WORLD (at the time of this change)
 ```
 
 The suite covers the numerical core (banded Cholesky, MLPG against a dense
 solve), the statistical models (GMM/HMM behaviour, duration allocation), the
 feature transforms (round-trip accuracy in the model's own space), the vocoder
 contract for both backends, model serialisation (including the format-3
-context payload, the format-4 pitch-conditioning payload and format-2/3
-compatibility), the sparse context feature, the optional pitch-conditioned
+context payload, the format-4 pitch-conditioning payload, optional GV targets
+and format-2/3 compatibility), the sparse context feature, the optional pitch-conditioned
 acoustic models (bin arithmetic and validation, the scored-note/silence policy,
 bucket separation, the resolution ladder and its fallbacks, serialisation,
 older model formats, determinism, coexistence with contexts, evaluation
-reporting and the CLI), model evaluation, the CLI, out-of-training-range F0 (in
+reporting and the CLI), optional GV (variance/gradient numerics, independent
+static features, optimizer behavior, legacy models and end-to-end generation),
+model evaluation, the CLI, out-of-training-range F0 (in
 both directions, from the score and from an external trajectory, asserted on
 the parameters handed to the vocoder), the external F0 override (trajectory
 preservation, independence from learned deviation and vibrato, and its
@@ -417,9 +478,12 @@ documentation tries to explain *why* each piece looks the way it does.
   (evaluation-corpus likelihood, voicing agreement, duration error, backoff
   usage) and by design reports no aggregate quality score; it also does not
   enforce that the evaluation corpus is disjoint from the training data.
-* Synthesis is a single-pass MLPG render; no prosody/expression editing beyond
-  `--transpose`, `--tempo`, `--variance-scale`, vibrato and an externally
-  supplied F0 trajectory (`--f0-file` / `synthesize(f0=...)`).
+* Synthesis uses a single optimized MLPG solve, optionally followed by the
+  experimental iterative GV penalty on static features. GV is a global target
+  for each feature, not a phoneme-/note-dependent expression model; there is
+  no broader prosody editing beyond `--transpose`, `--tempo`,
+  `--variance-scale`, vibrato and an externally supplied F0 trajectory
+  (`--f0-file` / `synthesize(f0=...)`).
 * Notes outside the F0 range the model was trained on are rendered at the
   requested pitch using the nearest trained spectral envelope, so they are
   audible but are not *natural* for this voice: the envelope comes from frames

@@ -65,6 +65,7 @@ from hms.core.context import (KIND_LEFT, KIND_RIGHT, context_keys,
 from hms.core.duration import DurationModel
 from hms.core.features import (AcousticFrameSequence, FeatureSpec,
                                add_dynamic_features)
+from hms.core.gv import estimate_global_variance
 from hms.core.hmm import LeftToRightHMM
 from hms.core.model import HMSModel, ModelStats
 from hms.core.phonemes import PhonemeSet
@@ -1393,6 +1394,14 @@ class Trainer:
             vibrato_candidates: Sequence[Tuple[float, float]]) -> HMSModel:
         config = self.config
         self.log("3/5  building features")
+        # The cache already contains normalized static+dynamic features. Read
+        # one utterance at a time, using only the first (static) block; the
+        # target is the mean of within-utterance variances, not the variance
+        # of pooled frames around a corpus-wide mean. No new corpus-sized
+        # arrays or HMM training changes are needed.
+        gv_stats = estimate_global_variance(
+            (np.load(data.features_path, mmap_mode="r") for data in utterances
+             if data.n_frames >= 2), self.spec.static_dim)
         phoneme_features, phoneme_voiced, durations = \
             self._collect_cached_phoneme_data(utterances)
         n_occurrences = sum(len(v) for v in phoneme_features.values())
@@ -1524,6 +1533,7 @@ class Trainer:
             pitch_models=pitch_models,
             pitch_index=pitch_index,
             pitch_conditioning=pitch_conditioning,
+            gv_stats=gv_stats,
             metadata={
                 "hms_version": __version__,
                 "vocoder": getattr(self.vocoder, "name", "unknown"),

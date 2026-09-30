@@ -42,6 +42,12 @@ Options that matter in practice (all in `SynthesisConfig`):
     so the trajectory follows the per-frame means more literally (more detail,
     livelier); <1 strengthens them and flattens/smooths the trajectory.  1.0
     reproduces the model.
+``gv_enabled``, ``gv_weight``, ``gv_iterations``
+    Experimental, off by default: iteratively encourage the normalized static
+    trajectory's per-feature variance toward the training utterances' GV
+    targets after MLPG, while penalizing changes to the MLPG likelihood. The
+    weight controls that trade-off and iterations caps the update count. A
+    model without GV targets cannot enable it.
 ``pitch_variation``
     Scales the optional learned deviation in ``acoustic`` and ``state_means``
     modes; 0 suppresses that deviation and values >1 exaggerate it. It has no
@@ -78,6 +84,7 @@ from hms.core.duration import DurationModel
 from hms.core.features import (AcousticFrameSequence, FeatureSpec,
                               hz_to_semitone, semitone_to_hz)
 from hms.core.generation import mlpg, stack_streams
+from hms.core.gv import optimize_global_variance
 from hms.core.model import HMSModel
 from hms.core.pitch_condition import effective_note, is_pitch_tier
 
@@ -87,6 +94,9 @@ class SynthesisConfig:
     """Knobs for one synthesis run."""
 
     variance_scale: float = 1.0
+    gv_enabled: bool = False           # experimental; no effect unless requested
+    gv_weight: float = 1.0             # GV penalty vs the MLPG likelihood
+    gv_iterations: int = 20            # maximum iterations (0 = no updates)
     pitch_variation: float = 1.0
     f0_source: str = "score"           # "score" | "acoustic" | "state_means"
     duration_mode: str = "score"       # "score" | "model"
@@ -111,8 +121,8 @@ class SynthesisConfig:
             raise ValueError("mixture must be 'dominant' or 'marginal'")
         if self.vocoder not in (None, "auto", "native", "pyworld", "builtin"):
             raise ValueError("vocoder must be auto, native, pyworld or builtin")
-        numeric = [self.variance_scale, self.pitch_variation, self.tempo,
-                   self.transpose]
+        numeric = [self.variance_scale, self.gv_weight,
+                   self.pitch_variation, self.tempo, self.transpose]
         numeric.extend(v for v in (self.vibrato_depth, self.vibrato_rate)
                        if v is not None)
         try:
@@ -122,6 +132,14 @@ class SynthesisConfig:
             raise ValueError("synthesis settings must be numeric") from exc
         if self.variance_scale <= 0 or self.tempo <= 0:
             raise ValueError("variance_scale and tempo must be positive")
+        if not isinstance(self.gv_enabled, (bool, np.bool_)):
+            raise ValueError("gv_enabled must be a boolean")
+        if self.gv_weight < 0:
+            raise ValueError("gv_weight must be non-negative")
+        if not isinstance(self.gv_iterations, (int, np.integer)) \
+                or isinstance(self.gv_iterations, (bool, np.bool_)) \
+                or self.gv_iterations < 0:
+            raise ValueError("gv_iterations must be a non-negative integer")
         if self.pitch_variation < 0:
             raise ValueError("pitch_variation must be non-negative")
         if self.vibrato_depth is not None and self.vibrato_depth < 0:
@@ -796,6 +814,15 @@ class Synthesizer:
                           window=spec.delta_window,
                           variance_scale=config.variance_scale,
                           smooth=config.smooth)
+        if config.gv_enabled:
+            if self.model.gv_stats is None:
+                raise ValueError("GV requested but this model has no global_variance "
+                                 "training statistics; retrain it or disable GV")
+            trajectory = optimize_global_variance(
+                trajectory, variances, spec.stream_sizes,
+                self.model.gv_stats.target_variance,
+                window=spec.delta_window, variance_scale=config.variance_scale,
+                weight=config.gv_weight, iterations=config.gv_iterations)
         # back out of the normalisation into feature space
         static = self.model.denormalize(trajectory)
 
