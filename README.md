@@ -404,6 +404,19 @@ hms synth --model model --score score.tsv --out song.wav --f0-file contour.npy
   synthesised at the supplied frequency and reported in `result.diagnostics`,
   exactly as for score-driven F0.
 
+## Experimental V2V frontend (analysis only)
+
+HMS does not yet perform voice-to-voice conversion. The experimental
+`hms.core.v2v` frontend exposes source F0, RMS, LPC-derived cepstra/spectral
+shape and frame timing, but it does not infer phonemes/context or feed source
+features into a target model. The normal score-driven synthesis path is
+unchanged. See [docs/v2v_experiment.md](docs/v2v_experiment.md) for the
+architecture boundary, reproducible benchmark and measured limitations.
+
+```bash
+python tools/bench_v2v.py --backend builtin --seconds 2
+```
+
 ## Model format
 
 ```
@@ -453,7 +466,9 @@ documentation tries to explain *why* each piece looks the way it does.
 
 ## Limitations
 
-* One speaker per model; no voice conversion or adaptation yet.
+* One speaker per model; no end-to-end voice conversion or adaptation yet. The
+  V2V frontend is an analysis-only experiment, not a converter (see
+  [docs/v2v_experiment.md](docs/v2v_experiment.md)).
 * The bundled inventory is a small demo set (open vowels and the consonants
   that carry a melody) — extend `phonemes.yaml` for real lyrics.
 * No explicit duration HMM: state durations come from the score (or per-phoneme
