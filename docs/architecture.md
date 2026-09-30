@@ -32,7 +32,7 @@ external trajectory overrides both:
 
 ```
 score notes ─► target F0 ─────────────────────────────────────────────┐
-score phones ─► hms.core.synthesizer.plan ─► HMM/GMM ─► MLPG ─► sp/ap ├─► WORLD
+score phones ─► hms.core.synthesizer.plan ─► HMM/GMM ─► MLPG ─► (GV) ─► sp/ap ├─► WORLD
    │                          └─ optional F0 deviation / vibrato ─► F0 ┘
    │                          └─ external F0 (synthesize(f0=…)) ─► F0 ─┘
    │                             (authoritative: replaces, not added)
@@ -298,12 +298,72 @@ against a dense solve in the tests to ~1e-15.
 * `smooth=False` skips MLPG entirely and returns the state means (useful when
   debugging the acoustic model without the dynamics).
 
+### Experimental Global Variance (`hms/core/gv.py`)
+
+MLPG's maximum-likelihood trajectory often has too little across-utterance
+variation: the static means and delta constraints smooth rapid changes toward
+their average. GV is an optional *second optimization* on **static** MLPG output,
+not on the stacked delta streams and not a simple gain applied to the output.
+`FeatureSpec.stream_sizes = (static_dim,) * n_streams`; `stack_streams` takes
+feature columns in the order [static, delta, delta-delta] and puts complete
+streams down the row axis. `mlpg` returns `(T, static_dim)` and the optional GV
+optimizer runs on that array **before** `model.denormalize` and `spec.decode`.
+The F0 slot is note-relative in training space, so in score-F0 mode the score's
+requested pitch remains authoritative.
+
+For feature `d`, training estimates the target `v*_d` as the arithmetic mean of
+utterance-level population variances of the **normalized static** frames. Each
+utterance's variance is measured about *that utterance's own mean*, not the
+corpus mean; single-frame utterances are excluded. The cached training features
+are read one utterance at a time, with only `[:, :static_dim]` used. This gives
+one target per static coefficient (no GV for a derivative stream and no extra
+corpus-sized training arrays). Silence/unvoiced frames still contribute; this
+first experiment has no per-phone, voiced-only or duration-conditioned target.
+
+Starting at `c0 = mlpg(μ, Σ, ...)`, for each feature separately the optimizer
+minimizes the following **approximate GV objective** over the whole trajectory:
+
+```
+v(c)      = (1/T) Σ_t (c_t − mean(c))²
+∇_c v(c)  = (2/T) (c − mean(c))
+q         = max(v*, v(c0), 1e-6)
+E(c)      = (1/(2T)) [W(c − c0)]ᵀ P [W(c − c0)]
+            + (gv_weight/2) [(v(c) − v*)/q]²
+```
+
+`W` has the *same* clipped delta/delta-delta windows as MLPG (including
+utterance boundaries), and `P` has its variance floor and `variance_scale` on
+the dynamic streams. When `smooth=True`, `c0` solves the MLPG normal equations,
+so the first term equals the increase in acoustic negative log-likelihood up to
+solve rounding; with `smooth=False`, it is a local quadratic trust anchor around
+the un-smoothed static means instead. Scaling by `T` makes the weight independent
+of sequence length and `q` keeps flat features well-conditioned, but `q` is
+**not** a learned GV uncertainty. The gradient combines `Wᵀ P W(c − c0)/T`
+with `gv_weight · ((v(c) − v*)/q²) · 2(c − mean(c))/T`. Iterations take diagonally
+preconditioned steps, bounded in feature units and accepted by a per-feature
+backtracking line search only if the objective decreases. This applies the
+model's local static/dynamic constraints throughout; it is *not* a post-hoc
+variance multiplier and requires no extra Cholesky solve or dense W matrix.
+
+`SynthesisConfig.gv_enabled=False` is the default (also `synthesis.gv_enabled`
+in YAML or `hms synth --gv` / `--no-gv`). `gv_weight=1.0` and `gv_iterations=20`
+are adjustable (CLI: `--gv-weight`, `--gv-iterations`; zero means no updates).
+The optimized MLPG band assembly, Cholesky and solve are untouched. If the model
+has no stored GV section, disabled synthesis still loads/runs unchanged; an
+explicitly enabled GV render raises a clear error instead of making up targets.
+Constant features have no variance gradient and are left constant; T < 2 and
+non-finite/invalid targets are handled safely. Only a mean per-feature target
+is learned, not the distribution/covariance of GV found in classic GV-MLPG,
+and the weight is a tuning choice rather than a trained parameter. Listen and
+compare on your own corpus; more variance need not mean better audio.
+
 ## 7. Training pipeline (`hms/core/trainer.py`)
 
 ```
 read label file → analyse every utterance (WORLD) → per-frame phoneme/note labels
 → note-relative F0 → static features → deltas
 → per-dimension mean/std normalisation over the whole corpus
+→ optional static GV target statistics from normalized utterance-level frames
 → per phoneme: collect frames, train a LeftToRightHMM
 → pooled per phoneme-class backoff models for phonemes with too little data
 → optional (context.enabled): sparse HMMs for the observed phone contexts,
@@ -311,7 +371,7 @@ read label file → analyse every utterance (WORLD) → per-frame phoneme/note l
 → optional (pitch_conditioning.enabled): the same units re-bucketed by pitch
   bin of the scored note
 → duration model (per phoneme) → pitch model (per phoneme/state) → voicing
-→ HMSModel (spec, hmms, backoff, contexts, pitch models, normalisation, stats)
+→ HMSModel (spec, hmms, backoff, contexts, pitch models, normalisation, GV, stats)
 ```
 
 `min_phoneme_frames` (default 20) is the guard rail: a phoneme below it does
@@ -558,7 +618,9 @@ that is also how the experimental pitch tier is meant to be judged.
    silence and unnoted segments ask for nothing.
 2. `frame_statistics` — per-state GMM means/variances stacked into per-frame
    statistics (dominant component by default, or the mixture marginal).
-3. `mlpg` — the trajectory.
+3. `mlpg` — the normalized static trajectory; optionally run the experimental
+   GV optimizer on its static coefficients, using the model's per-feature GV
+   targets (only when explicitly enabled).
 4. `denormalize` → static features; voicing from HMM/phoneme statistics;
    target F0 from score notes, with optional acoustic/state-mean deviation and
    optional vibrato — or, when `f0=` is passed, that external trajectory
@@ -577,10 +639,10 @@ decided.
 ```
 model.yaml      human readable: format version, feature spec, normalisation
                 (offset/scale), phoneme set, duration model, pitch model
-                (including vibrato), HMM index, context index (when context
-                modelling was on), pitch conditioning definition and pitch
-                index (when pitch conditioning was on), parameter budget,
-                metadata
+                (including vibrato), optional static GV targets, HMM index,
+                context index (when context modelling was on), pitch
+                conditioning definition and pitch index (when pitch
+                conditioning was on), parameter budget, metadata
 hmm.npz         arrays: GMM weights/means/variances, self-loops, durations,
                 voicing probabilities
 backoff.npz     the same for the pooled per-class models
@@ -595,7 +657,21 @@ YAML for anything a human might want to read or tweak, `.npz` for the arrays.
 loader validates the format version. The current format is 4; each version is
 additive over the previous one (2 = baseline, 3 = the context tier, 4 = the
 pitch-conditioned tier), so format-2 and format-3 models keep loading — with an
-empty tier and, for pitch conditioning, `enabled: false` recorded. Context keys
+empty tier and, for pitch conditioning, `enabled: false` recorded. The additive
+`global_variance` YAML section is optional in format 4: older models keep it
+absent rather than receiving fabricated values, and GV is never enabled just
+because the section exists. No version bump or new `.npz` payload is needed:
+
+```yaml
+global_variance:
+  space: normalized_static
+  utterances: 18
+  target_variance: [0.72, 0.91, 0.35]  # actual list has static_dim entries
+```
+
+Malformed, non-finite, negative or wrong-dimension targets are rejected on
+load. The list is indexed exactly like FeatureSpec's static vector, not like
+its stacked delta streams. Context keys
 are three `^`-joined phone symbols (`a^i^sil`); a reserved wildcard marks the
 unmodelled side of a one-sided diphone (`s^a^_` = `a` given left neighbour `s`,
 `_^a^i` = `a` given right neighbour `i`), which keeps the two diphone pools of
@@ -636,7 +712,7 @@ it stands for straight from the file.
 | log-normal durations, no duration HMM | the score already carries the timing; the model only fills gaps |
 | 5 aperiodicity bands | the fine structure of `ap` is perceptually unimportant compared to 1025 extra parameters |
 | vibrato outside the HMM | MLPG would smooth it away; keeping it explicit makes it controllable |
-| no spectral postfilter (GV etc.) | MLPG already yields slightly over-smoothed spectra, and a postfilter is a tuning surface better added later, deliberately |
+| GV is opt-in, not a mandatory spectral postfilter | MLPG can over-smooth; the experimental static GV optimizer offers an inspectable, tunable variance target while leaving the normal render bit-identical when disabled |
 | one speaker per model | adaptation/multi-speaker would complicate every stage; nothing in the format prevents adding it |
 
 ## 11. Extension points
@@ -649,9 +725,10 @@ it stands for straight from the file.
 * **Different dynamics** — `window_matrix`/`mlpg` take the delta window as a
   parameter, so a different regression or a new dynamic feature only needs a
   matching `stream_taps`.
-* **Expression** — `transpose`, `tempo`, `variance_scale`, `pitch_variation`
-  and `Vibrato` are all synthesis-time knobs; adding another one means adding a
-  field to `SynthesisConfig` and applying it in one place.
+* **Expression** — `transpose`, `tempo`, `variance_scale`, experimental
+  `gv_enabled`/`gv_weight`/`gv_iterations`, `pitch_variation` and `Vibrato` are
+  synthesis-time knobs; a future GV optimizer can replace `hms/core/gv.py`
+  without touching MLPG's banded solver.
 * **External F0** — `synthesize(score, f0=…)` (CLI: `hms synth --f0-file`)
   replaces the generated contour. It is deliberately not a `SynthesisConfig`
   field: the trajectory is render-specific data, not a voice setting, and the

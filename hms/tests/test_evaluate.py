@@ -191,6 +191,10 @@ def test_cli_evaluate_refuses_mismatched_feature_specs(
     other = copy.deepcopy(trained_model)
     other.name = "other"
     other.spec.n_mcep = trained_model.spec.n_mcep + 1
+    # This test deliberately changes the static dimension without retraining;
+    # the old GV targets no longer match that spec. Leave the optional section
+    # absent so the loader can reach evaluate's feature-spec mismatch check.
+    other.gv_stats = None
     other_dir = tmp_path / "other"
     other.save(other_dir)
 

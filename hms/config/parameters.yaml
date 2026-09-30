@@ -104,6 +104,14 @@ synthesis:
   # detail); <1 trusts them more, which flattens/smooths the trajectory.  1.0
   # reproduces the model exactly.
   variance_scale: 1.0
+  # EXPERIMENTAL GV: off unless explicitly enabled. Training stores the mean
+  # per-utterance variance of each normalized STATIC feature in model.yaml.
+  # After MLPG, iterative optimization trades off the MLPG likelihood and
+  # matching those targets. A model trained before GV has no targets; --gv on
+  # such a model fails clearly instead of inventing fake statistics.
+  gv_enabled: false
+  gv_weight: 1.0           # GV penalty relative to the MLPG likelihood (0 = off)
+  gv_iterations: 20        # maximum optimizer steps (0 = off)
   pitch_variation: 1.0      # scale of the learned deviation from the note
   # Target F0 comes from score notes by default; learned pitch deviations are optional.
   f0_source: score          # score | acoustic | state_means

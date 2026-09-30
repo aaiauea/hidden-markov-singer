@@ -283,6 +283,9 @@ def cmd_synth(args) -> int:
 
     overrides = {
         "variance_scale": args.variance_scale,
+        "gv_enabled": args.gv_enabled,
+        "gv_weight": args.gv_weight,
+        "gv_iterations": args.gv_iterations,
         "pitch_variation": args.pitch_variation,
         "f0_source": args.f0_source,
         "duration_mode": args.duration_mode,
@@ -302,6 +305,8 @@ def cmd_synth(args) -> int:
     for key, value in overrides.items():
         if value is not None:
             setattr(config, key, value)
+    # CLI overrides use setattr; re-check bounds before generation.
+    config.__post_init__()
 
     time_unit = (parameters.get("training") or {}).get("time_unit", "seconds")
     score = labels_module.load(args.score, time_unit=time_unit,
@@ -466,6 +471,8 @@ def cmd_inspect_model(args) -> int:
                  "n_free_params": model.global_backoff.n_free_params}
                 if model.global_backoff is not None else None),
         }
+        if model.gv_stats is not None:
+            payload["global_variance"] = model.gv_stats.to_dict()
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
@@ -686,6 +693,17 @@ def build_parser() -> argparse.ArgumentParser:
     synth.add_argument("--variance-scale", type=float, default=None,
                        help="scale on the delta variances: >1 follows the "
                             "frame means more literally (livelier), <1 smooths")
+    synth.add_argument("--gv", dest="gv_enabled", action="store_true",
+                       default=None,
+                       help="experimental: optimize static global variance "
+                            "after MLPG (requires a model with GV statistics)")
+    synth.add_argument("--no-gv", dest="gv_enabled", action="store_false",
+                       help="disable GV even if enabled in parameters.yaml")
+    synth.add_argument("--gv-weight", type=float, default=None,
+                       help="strength of the GV penalty relative to MLPG "
+                            "(default 1; 0 makes no changes)")
+    synth.add_argument("--gv-iterations", type=int, default=None,
+                       help="maximum GV optimization steps (default 20)")
     synth.add_argument("--pitch-variation", type=float, default=None,
                        help="scale of the learned deviation from the note")
     synth.add_argument("--f0-source", default=None,
