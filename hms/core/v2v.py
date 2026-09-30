@@ -169,15 +169,13 @@ class V2VAnalysis:
     def candidate_features(self) -> np.ndarray:
         """Compact LPC + F0 + energy matrix for *experiments only*.
 
-        F0 is absolute log-pitch in semitones re. A4, set to 0 on unvoiced
-        frames; the following voicing flag disambiguates that value. RMS is in
-        dB relative to full scale (silence is floored at -240 dB). The cepstral
-        and log-spectrum arrays use a last-voiced edge hold only on a terminal
-        unvoiced suffix; F0, voicing, energy and LPC coefficients stay measured.
-        Empty/all-unvoiced analyses are unchanged. Frame timing remains in
+        F0 is absolute log-pitch in semitones re. A4, set to 0 unless the
+        backend marks the frame voiced and its LPC frame has positive RMS; the
+        following flag disambiguates that value. RMS is in dB relative to full
+        scale (silence is floored at -240 dB). Frame timing remains in
         ``frame_times_s`` rather than being smuggled in as a feature.
         """
-        voiced = self.voiced
+        voiced = self.voiced & (self.energy_rms > 0.0)
         log_f0 = np.zeros(len(self), dtype=np.float64)
         if voiced.any():
             log_f0[voiced] = 12.0 * np.log2(self.f0_hz[voiced] / 440.0)
@@ -330,19 +328,6 @@ class V2VFrontend:
                     np.maximum(np.abs(response), 1e-12))
                 log_power_shape -= log_power_shape.mean(axis=1, keepdims=True)
                 log_spectrum[full_rows] = np.clip(log_power_shape, -80.0, 80.0)
-
-        # A zero/unvoiced suffix has no LPC shape of its own.  Edge-hold the
-        # spectral descriptors after the last valid voiced frame so downstream
-        # sequences do not see a fabricated drop to an all-zero envelope.  Keep
-        # raw predictor coefficients, F0, voicing and RMS as measured; if there
-        # was no valid voiced frame (silence/uninitialized input), do nothing.
-        valid_voiced = np.flatnonzero(
-            (f0 > 0.0) & (energy > 0.0) & (energy >= config.silence_rms))
-        if valid_voiced.size:
-            tail_start = int(valid_voiced[-1]) + 1
-            if tail_start < n_frames:
-                cepstra[tail_start:] = cepstra[tail_start - 1]
-                log_spectrum[tail_start:] = log_spectrum[tail_start - 1]
 
         frequencies = np.linspace(0.0, fs / 2.0, spectrum_bins,
                                   dtype=np.float64)

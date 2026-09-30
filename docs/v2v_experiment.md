@@ -87,13 +87,14 @@ autocorrelation and batched Levinson-Durbin recursion. Coefficients are scaled
 from normalized autocorrelation, so their shape does not depend on signal gain.
 Reflection clipping plus an early stop when residual power collapses avoids
 continuing a numerically ill-conditioned recursion on nearly periodic or silent
-frames. Silent frames retain the identity LPC polynomial. With no voiced
-history, shape features remain zero. If valid voiced material precedes a
-terminal unvoiced suffix, the last cepstral and log-spectrum shape is edge-held
-across that suffix to avoid a synthetic drop in downstream sequences. The raw
-LPC coefficients, F0, voicing and RMS remain measured; empty or all-unvoiced
-inputs have no edge value to hold and remain unchanged. The log spectral
-envelope is mean-centred, so energy remains in the separate RMS feature.
+frames. Silent frames retain the identity LPC polynomial and zero shape
+features. In the candidate matrix, zero-energy frames encode zero log-F0 and
+`voiced_flag=0`; log-RMS is floored at -240 dB. The raw `V2VAnalysis.f0_hz`
+continues to preserve the vocoder estimate (which may extend briefly into a
+zero-energy frame because its pitch window is longer). Consumers can use the
+candidate flag/RMS to distinguish silence from a valid zero-valued shape. The
+log spectral envelope remains mean-centred, so energy stays in the separate RMS
+feature.
 
 The frontend asks the current `Vocoder.analyze` interface for F0 and discards
 its returned source `sp`/`ap` arrays. This keeps source WORLD spectral
@@ -102,7 +103,7 @@ still computes those arrays internally; see the memory result and limitations
 below. Use `vocoder="native"` or `"pyworld"` for real WORLD F0 where available.
 `"builtin"` is the existing NumPy fallback: useful for portable tests, but not
 real WORLD and less accurate for pitch. The fallback autocorrelation window now
-covers at least 2.5 periods at the configured F0 floor while retaining the
+covers at least 3 periods at the configured F0 floor while retaining the
 original hop and output frame count; this reduces octave errors for low F0.
 
 ## Reproducible experiment
@@ -136,22 +137,29 @@ ctypes C-API WORLD backend; `builtin` selected the NumPy fallback.
 | Measurement | Native WORLD backend | Builtin fallback |
 |---|---:|---:|
 | Backend frames for 2.000 s | 401 (0.000–2.000 s) | 405 (0.000–2.020 s) |
-| Median frontend extraction time | 161.9 ms | 103.6 ms |
-| Throughput | 12.4x real time | 19.3x real time |
-| `tracemalloc` peak | 12.52 MiB | 34.42 MiB |
+| Median frontend extraction time | 167.0 ms | 97.7 ms |
+| Throughput | 12.0x real time | 20.5x real time |
+| `tracemalloc` peak | 12.52 MiB | 34.90 MiB |
 | Retained output arrays | 0.57 MiB | 0.58 MiB |
 | Candidate feature matrix | 72.1 KiB | 72.8 KiB |
-| Known 220 Hz tone, median estimated F0 | 219.75 Hz (-2.0 cents) | 225.0 Hz (+38.9 cents) |
+| Known 220 Hz tone, median estimated F0 | 219.75 Hz (-2.0 cents) | 222.7 Hz (+21.3 cents) |
 | Median normalized LPC prediction-error fraction | 2.80e-5 | 2.80e-5 |
 | Median LPC log-envelope / periodogram correlation | 0.878 | 0.878 |
 | Median centred log-power envelope RMSE (natural-log units) | 5.40 | 5.40 |
 | Synthetic vowel probe | 16/20 (80%) | 16/20 (80%) |
 
-A separate builtin autocorrelation stress signal with a 110 Hz fundamental and
-an eight-times-stronger second partial tracked at 110.8 Hz (instead of the
-former short-window octave estimate near 220 Hz). The same test setup tracked
-165 Hz and 220 Hz signals at 167.0 Hz and 222.7 Hz, respectively. These are
-steady synthetic signals, not natural-voice pitch accuracy results.
+A builtin autocorrelation stress signal with a weak 110 Hz fundamental and
+dominant third partial tracked at 110.25 Hz; the prior 2.5-period window
+selected 339.2 Hz. The harmonic-rich 165/220 Hz regression signals track at
+164.55/222.73 Hz. These are steady synthetic signals, not natural-voice pitch
+accuracy results.
+
+The named `tools/exp_continuous_vowel.py` is not present in this checkout, so a
+seeded `DemoSinger` /a/ proxy was compared at 2.5 versus 3.0 periods. Mean ± SD
+F0 (Hz) stayed effectively unchanged: MIDI 45, 110.71 ± 2.11 → 110.72 ± 2.08;
+MIDI 52, 165.99 ± 3.24 → 165.96 ± 3.21; MIDI 57, 221.55 ± 4.27 → 221.59 ±
+4.26. An abrupt 165 → 220 Hz control still crossed 190 Hz at the 0.400 s
+boundary under both windows. This proxy does not replace the missing experiment.
 
 Timings are a small local run, not a hardware-independent performance claim.
 The builtin backend's 405-frame grid extends 20 ms past the 2 s input because

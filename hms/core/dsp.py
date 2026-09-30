@@ -36,14 +36,15 @@ def autocorrelation_f0(x: np.ndarray, fs: int, frame_length: int, hop: int,
                        threshold: float = 0.30) -> np.ndarray:
     """Normalized-autocorrelation F0 with enough cycles for its low end.
 
-    Keep at least 2.5 periods of the requested floor in each analysis frame.
-    This helps distinguish a low fundamental from its strong second harmonic;
-    the hop and output frame count remain those of the caller's original grid.
+    Keep at least three periods of the requested floor in each analysis frame.
+    The longer window helps distinguish low fundamentals from stronger
+    harmonics; the hop and output frame count remain those of the caller's
+    original grid.
     """
     frames = frame_signal(x, frame_length, hop)
     analysis_length = frame_length
     if f0_floor > 0.0:
-        minimum_length = int(np.ceil(2.5 * fs / f0_floor))
+        minimum_length = int(np.ceil(3.0 * fs / f0_floor))
         if minimum_length > analysis_length:
             analysis_length = minimum_length
             if analysis_length % 2 == 0:
