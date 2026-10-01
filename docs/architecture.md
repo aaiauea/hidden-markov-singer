@@ -9,7 +9,8 @@ label file + WAVs
       │
       │  hms.core.labels            score/label parsing, frame alignment
       ▼
-hms.vocoder.*                       WORLD (native | pyworld | builtin)
+hms.vocoder.*                       WORLD (native | pyworld)
+      │                             pure numpy (builtin | mlsa)
       │                             f0 (Hz), sp (power), ap (aperiodicity)
       │  hms.core.features          FeatureSpec.encode / decode
       ▼
@@ -66,6 +67,17 @@ vocoder-agnostic.
   decision from both the autocorrelation peak *and* spectral flatness,
   cepstrally liftered envelope, pitch-synchronous aperiodicity, and
   overlap-add synthesis with a zero-phase magnitude response.
+* `MLSAVocoder` — pure numpy, opt-in (`vocoder="mlsa"`): the same shared
+  analysis, but synthesis goes through the MLSA (mel log spectrum
+  approximation) filter, `H(z) = exp(sum_m a_m z~^{-m})` on the mel-warped
+  axis.  The mel-cepstral coefficients are the ones the feature layer already
+  models (the DCT-II coefficients, converted to the warped Fourier basis), the
+  transfer function is evaluated exactly on the FFT grid and realized as a
+  per-frame FIR with overlap-add, and the excitation is a fractional-position
+  pulse train plus noise mixed *per frequency bin* by the aperiodicity.  It is
+  a synthesizer, not a new parameterisation: duration, `fft_size_for` and
+  analysis conventions are identical to `BuiltinVocoder`.  Full formulation,
+  benchmarks and limitations: [mlsa.md](mlsa.md).
 
 Two details worth knowing:
 
@@ -711,6 +723,8 @@ it stands for straight from the file.
 | `hms evaluate` reports metrics separately, no fused quality score | collapsing likelihood, voicing and duration errors into one number would hide which part of the model a change actually moved |
 | log-normal durations, no duration HMM | the score already carries the timing; the model only fills gaps |
 | 5 aperiodicity bands | the fine structure of `ap` is perceptually unimportant compared to 1025 extra parameters |
+| MLSA is opt-in; `auto` still prefers WORLD, then `builtin` | adding a backend must not silently change what an existing configuration renders with, and the MLSA filter is a different synthesis model rather than a bug fix for the fallback |
+| MLSA is opt-in, `auto` still prefers WORLD then `builtin` | adding a backend must not silently change what an existing configuration renders with; the MLSA filter is a different synthesis model, not a bug fix for the fallback |
 | vibrato outside the HMM | MLPG would smooth it away; keeping it explicit makes it controllable |
 | GV is opt-in, not a mandatory spectral postfilter | MLPG can over-smooth; the experimental static GV optimizer offers an inspectable, tunable variance target while leaving the normal render bit-identical when disabled |
 | one speaker per model | adaptation/multi-speaker would complicate every stage; nothing in the format prevents adding it |
@@ -718,8 +732,12 @@ it stands for straight from the file.
 ## 11. Extension points
 
 * **New phonemes** — edit `phonemes.yaml` (or point `--phonemes` at your own).
-* **New vocoder** — subclass `hms.vocoder.base.Vocoder` and register it in
-  `hms/vocoder/__init__.py`.
+* **New vocoder** — subclass `hms.vocoder.base.Vocoder`, register the name in
+  `hms/vocoder/__init__.py` (`_BACKENDS`, `available_backends`, `get_vocoder`)
+  and add it to the `vocoder` validators in `hms/core/synthesizer.py` and
+  `hms/core/trainer.py` plus the `--vocoder` help text in `hms/cli/main.py`;
+  `hms doctor` lists whatever the registry holds.  Keep `auto`'s precedence
+  unless the new backend is meant to become the default.
 * **Different features** — `FeatureSpec` is data; the trainer, model file and
   synthesizer read their geometry from it.
 * **Different dynamics** — `window_matrix`/`mlpg` take the delta window as a

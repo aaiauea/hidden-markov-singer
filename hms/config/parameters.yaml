@@ -38,7 +38,7 @@ acoustic:
   f0_ceil: 800.0
   f0_estimation: dio        # "dio" (fast) or "harvest" (robust, slower)
   refine_f0: true
-  vocoder: auto             # auto | native | pyworld | builtin
+  vocoder: auto             # auto | native | pyworld | builtin | mlsa
 
 training:
   # Per phoneme-class budgets live in phonemes.yaml, not here.

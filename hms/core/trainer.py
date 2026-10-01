@@ -166,8 +166,10 @@ class TrainingConfig:
             raise ValueError("time_unit must be 'seconds' or 'frames'")
         if self.f0_estimation not in ("dio", "harvest"):
             raise ValueError("f0_estimation must be 'dio' or 'harvest'")
-        if self.vocoder not in ("auto", "native", "pyworld", "builtin"):
-            raise ValueError("vocoder must be auto, native, pyworld or builtin")
+        if self.vocoder not in ("auto", "native", "pyworld", "builtin",
+                                "mlsa"):
+            raise ValueError("vocoder must be auto, native, pyworld, builtin "
+                             "or mlsa")
         if self.n_iterations < 1:
             raise ValueError("n_iterations must be at least 1")
         if self.min_phoneme_frames < 1:

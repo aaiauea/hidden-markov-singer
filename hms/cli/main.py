@@ -138,7 +138,7 @@ def cmd_doctor(args) -> int:
         _log("pyyaml           : MISSING")
     _log("")
     _log("vocoder backends :")
-    for name in ("pyworld", "native", "builtin"):
+    for name in (n for n in BACKENDS if n != "auto"):
         status = "available" if backends[name] else "unavailable"
         _log(f"  {name:9s} {status}")
     if backends["native"]:
@@ -148,8 +148,9 @@ def cmd_doctor(args) -> int:
     if not backends["native"] and not backends["pyworld"]:
         _log("")
         _log("No real WORLD backend is available, so HMS would fall back to the")
-        _log("builtin approximation. To build WORLD from source (needs a C++")
-        _log("compiler, no Python headers), run:")
+        _log("builtin approximation (`--vocoder mlsa` selects the MLSA filter")
+        _log("instead). To build WORLD from source (needs a C++ compiler, no")
+        _log("Python headers), run:")
         _log("    tools/build_world.sh")
     _log("")
     _log(f"backend names accepted by --vocoder: {', '.join(BACKENDS)}")
@@ -602,7 +603,7 @@ def build_parser() -> argparse.ArgumentParser:
     # -- doctor ------------------------------------------------------------
     doctor = sub.add_parser("doctor", help="report available backends")
     doctor.add_argument("--vocoder", default=None,
-                        help="backend to report on (auto|native|pyworld|builtin)")
+                        help="backend to report on (auto|native|pyworld|builtin|mlsa)")
     doctor.set_defaults(func=cmd_doctor)
 
     # -- extract -----------------------------------------------------------

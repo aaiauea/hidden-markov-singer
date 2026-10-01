@@ -63,9 +63,15 @@ pip install -r requirements.txt        # numpy + PyYAML (+ pytest for tests)
 
 The build step compiles the vendored WORLD sources plus a C ABI wrapper into
 `hms/vocoder/_native/libhms_world.so` (needs `g++`). It is **optional**: without
-it HMS falls back to a pure-numpy vocoder (`builtin`), so the whole pipeline
-still runs — the spectral quality is just lower. `hms doctor` tells you which
-backends are available:
+it HMS falls back to a pure-numpy vocoder, so the whole pipeline still runs.
+There are two pure-numpy backends: `builtin` (the default fallback, a zero-phase
+magnitude filter) and `mlsa`, an MLSA (mel log spectrum approximation) filter
+with a per-frequency-band mixed excitation — see
+[the MLSA vocoder backend](docs/mlsa.md) for the exact formulation, the
+benchmark numbers and the trade-offs. `--vocoder mlsa` selects it; `auto` keeps
+resolving to WORLD when available and to `builtin` otherwise.
+
+`hms doctor` tells you which backends are available:
 
 ```
 $ hms doctor
@@ -74,6 +80,7 @@ vocoder backends :
   pyworld   unavailable
   native    available
   builtin   available
+  mlsa      available
 ```
 
 ## Quickstart
@@ -423,13 +430,20 @@ model/
 
 ```bash
 HMS_NO_AUTO_BUILD=1 python -m pytest
-# 506 passed, 8 optional skips without WORLD (at the time of this change)
+# 536 passed, 9 optional skips without WORLD (at the time of this change)
 ```
 
 The suite covers the numerical core (banded Cholesky, MLPG against a dense
 solve), the statistical models (GMM/HMM behaviour, duration allocation), the
 feature transforms (round-trip accuracy in the model's own space), the vocoder
-contract for both backends, model serialisation (including the format-3
+contract every backend shares (including the exact rendered length at both the
+window-dominated and frame-grid-dominated regimes), the MLSA backend (its
+filter reproducing the project's own mel-cepstrum at the analysis knots, the
+truncation error of the default filter length, deterministic seeded synthesis,
+silence, voiced tones, unvoiced noise, per-bin aperiodicity mixing, gliding and
+stepping F0, one-frame and zero-frame utterances, non-contiguous views,
+NaN/Inf and absurd envelopes, and end-to-end synthesis through a trained model),
+model serialisation (including the format-3
 context payload, the format-4 pitch-conditioning payload, optional GV targets
 and format-2/3 compatibility), the sparse context feature, the optional pitch-conditioned
 acoustic models (bin arithmetic and validation, the scored-note/silence policy,
@@ -460,7 +474,11 @@ documentation tries to explain *why* each piece looks the way it does.
   log-normal statistics when the score has no timing).
 * The `builtin` vocoder is a fallback: it uses a zero-phase magnitude response
   instead of WORLD's minimum-phase impulse response, so build the native
-  backend (or install `pyworld`) for the real thing.
+  backend (or install `pyworld`) for the real thing.  The optional `mlsa`
+  backend renders the same parameters through a mel-log-spectrum exponential
+  with a per-bin mixed excitation (better pitch/voicing fidelity, ~1.0-1.4x the
+  time and 1.4-4.2x the peak heap of `builtin` — neither faster nor smaller,
+  and still ~100x faster than real time; see [docs/mlsa.md](docs/mlsa.md)).
 * WORLD's synthesis is returned unscaled (see `Vocoder.synthesize`); it can
   overshoot `[-1, 1]` on very periodic material and `write_wav` applies the
   headroom.  A trained model is tied to the feature definition that produced
