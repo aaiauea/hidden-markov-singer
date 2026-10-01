@@ -30,10 +30,12 @@ def builtin_vocoder():
 
 
 def test_backend_registry():
-    assert BACKENDS == ("auto", "pyworld", "native", "builtin")
+    assert BACKENDS == ("auto", "pyworld", "native", "builtin", "mlsa")
     availability = available_backends()
-    assert set(availability) == {"pyworld", "native", "builtin"}
+    assert set(availability) == {"pyworld", "native", "builtin", "mlsa"}
+    # the two pure-numpy backends need no compiler or optional package
     assert availability["builtin"] is True
+    assert availability["mlsa"] is True
     with pytest.raises(ValueError):
         get_vocoder("nonsense")
 
@@ -253,7 +255,7 @@ def test_synthesised_length_follows_the_world_convention(fs, n_frames):
     expected = int(n_frames * frame_period / 1000.0 * fs)
     hop = max(1, int(round(fs * frame_period / 1000.0)))
     f0 = np.full(n_frames, 200.0)
-    for vname in ("native", "builtin"):
+    for vname in ("native", "builtin", "mlsa"):
         if vname == "native" and not available_backends()["native"]:
             continue
         vocoder = get_vocoder(vname, fs=fs, frame_period=frame_period)

@@ -119,8 +119,10 @@ class SynthesisConfig:
             raise ValueError("duration_mode must be 'score' or 'model'")
         if self.mixture not in ("dominant", "marginal"):
             raise ValueError("mixture must be 'dominant' or 'marginal'")
-        if self.vocoder not in (None, "auto", "native", "pyworld", "builtin"):
-            raise ValueError("vocoder must be auto, native, pyworld or builtin")
+        if self.vocoder not in (None, "auto", "native", "pyworld",
+                                "builtin", "mlsa"):
+            raise ValueError("vocoder must be auto, native, pyworld, builtin "
+                             "or mlsa")
         numeric = [self.variance_scale, self.gv_weight,
                    self.pitch_variation, self.tempo, self.transpose]
         numeric.extend(v for v in (self.vibrato_depth, self.vibrato_rate)
