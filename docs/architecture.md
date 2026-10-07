@@ -751,6 +751,15 @@ it stands for straight from the file.
   replaces the generated contour. It is deliberately not a `SynthesisConfig`
   field: the trajectory is render-specific data, not a voice setting, and the
   whole override is one conversion function plus one branch in `synthesize`.
+* **The source / excitation** — `hms/source` (Phase 1, analysis only) gives the
+  excitation its own representation next to the spectral one:
+  `SourceModel.analyze` turns audio into pitch-synchronous residual cycles
+  (`VoiceSourceModel`) or frame-synchronous residual units
+  (`GenericResidualSourceModel`), `SourcePCA` compresses them, and
+  `SourceFrame`/`SourceSequence` carry them on the same frame grid the acoustic
+  features use. Nothing in this pipeline calls it yet — see
+  [docs/source_model.md](source_model.md) for what is there, what was measured,
+  and what a source-aware synthesis phase would have to add.
 * **A different conditioning variable** — the pitch bins are one instance of a
   general shape: `hms/core/pitch_condition.py` owns the mapping from a scored
   segment to an integer condition, `HMSModel.resolve_unit(…, pitch_bin=…)` owns
