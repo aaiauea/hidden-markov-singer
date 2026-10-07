@@ -30,7 +30,11 @@ things that break naive period picking:
 The epochs are optionally *refined* to the strongest residual sample inside a
 window of ``+/- refine_ratio`` periods (bounded by the neighbouring epochs so
 the refinement can never cross cycles).  Excitation events are sharp, so this
-snaps the cycle boundaries onto them even when the F0 track is coarse.
+snaps the cycle boundaries onto them even when the F0 track is coarse.  The
+refinement is applied to each voiced run *independently*: an epoch's neighbours,
+its local period and the span it may move inside all come from its own run, so
+no epoch is ever pulled across a voiced/unvoiced boundary onto an event that
+belongs to another run (or to the gap between them).
 
 :func:`pick_epochs` returns the epochs **and the voiced run each belongs to**.  A
 cycle is only a cycle when its two epochs come from the same run: the interval
@@ -102,7 +106,11 @@ def pick_epochs(f0: np.ndarray, hop: int, n_samples: int, fs: int,
         monotone, valid cycles.
     refine
         Snap each epoch to the largest residual sample within
-        ``+/- refine_ratio * period``.  Requires ``residual``.
+        ``+/- refine_ratio * period``.  Requires ``residual``.  Each voiced run
+        is refined on its own: a neighbouring run's epochs -- and the unvoiced
+        gap between them -- never take part in an epoch's window, its local
+        period or its bounds, so refinement cannot move an epoch across a
+        voiced/unvoiced boundary.
     """
     f0 = np.asarray(f0, dtype=np.float64).reshape(-1)
     hop = max(1, int(hop))
@@ -117,7 +125,7 @@ def pick_epochs(f0: np.ndarray, hop: int, n_samples: int, fs: int,
     voiced = np.isfinite(f0) & (f0 > 0)
     positions = frame_positions(f0.size, hop)
 
-    epochs, runs = [], []
+    epochs, runs, spans = [], [], {}
     for run, (start_frame, stop_frame) in enumerate(_voiced_runs(voiced)):
         start = int(start_frame) * hop
         stop = min(n_samples, int(stop_frame) * hop)
@@ -136,6 +144,9 @@ def pick_epochs(f0: np.ndarray, hop: int, n_samples: int, fs: int,
         if len(index):
             epochs.append(start + index)
             runs.append(np.full(len(index), run, dtype=np.int64))
+            # the samples this run covers: the region its epochs may be refined
+            # inside, so a snap can never leave the run
+            spans[run] = (start, stop)
 
     if not epochs:
         return empty
@@ -145,28 +156,68 @@ def pick_epochs(f0: np.ndarray, hop: int, n_samples: int, fs: int,
     epochs, runs = epochs[order], runs[order]
     if refine and residual is not None and len(epochs) > 1:
         epochs = _refine_epochs(epochs, np.asarray(residual, dtype=np.float64),
-                                hop, period_min, period_max, fs, refine_ratio)
+                                period_min, period_max, refine_ratio,
+                                runs=runs, bounds=spans)
     return epochs, runs
 
 
-def _refine_epochs(epochs: np.ndarray, residual: np.ndarray, hop: int,
-                   period_min: float, period_max: float, fs: int,
-                   ratio: float) -> np.ndarray:
-    """Snap epochs to the strongest residual sample in a bounded window.
+def _refine_epochs(epochs: np.ndarray, residual: np.ndarray, period_min: float,
+                   period_max: float, ratio: float,
+                   runs: Optional[np.ndarray] = None,
+                   bounds: Optional[dict] = None) -> np.ndarray:
+    """Snap every epoch onto a local residual maximum, one voiced run at a time.
 
-    The window of epoch ``i`` is clipped to
+    Two epochs of different voiced runs are separated by an unvoiced gap and must
+    never influence each other, so each run is refined on its own: the neighbour
+    bounds, the local period and the span an epoch may move inside all come from
+    the run the epoch belongs to.  ``bounds`` maps a run id to its sample span
+    ``(start, stop)``; a run without an entry (or ``runs=None``, meaning "the
+    whole array is one run") is refined as if it spanned the whole signal, which
+    is the behaviour of a caller that has no run information.
+
+    Inside a run the window of epoch ``i`` is clipped to
     ``(epoch[i-1] + period_min, epoch[i+1] - period_min)`` so the result stays
     strictly increasing *and* no cycle is ever pushed below the shortest period
     the extractor keeps -- otherwise a snap on a very short cycle (a high F0)
     could shrink its neighbours below the floor and the cycle would be dropped
-    even though the tracked epochs were valid.  Epochs that cannot be refined
-    (window outside the signal, or no room left) keep their tracked position.
+    even though the tracked epochs were valid.  The first and last epoch of a run
+    have no neighbour on that side; their bound is the run's own span, never a
+    neighbouring run's epoch, so a snap cannot pull an epoch into the unvoiced
+    gap either.  Epochs whose window holds nothing to snap onto keep their
+    tracked position.
     """
     residual = np.asarray(residual, dtype=np.float64).reshape(-1)
     n = len(residual)
-    if n == 0:
+    epochs = np.asarray(epochs, dtype=np.int64).reshape(-1)
+    if n == 0 or epochs.size == 0:
         return epochs
+    if runs is None:
+        groups = [(None, 0, epochs.size)]
+    else:
+        runs = np.asarray(runs).reshape(-1)
+        if runs.size != epochs.size:
+            raise ValueError("runs must have one entry per epoch")
+        # the epochs are sorted by position and each run's epochs are contiguous
+        # in it, so a run is a slice of the array
+        edges = np.concatenate([[0], np.flatnonzero(np.diff(runs)) + 1, [epochs.size]])
+        groups = [(int(runs[a]), a, b) for a, b in zip(edges[:-1], edges[1:])]
+
     refined = epochs.copy()
+    for run, first, last in groups:
+        span_start, span_stop = (0, n) if bounds is None else bounds.get(run, (0, n))
+        refined[first:last] = _refine_run(
+            epochs[first:last], residual, span_start, span_stop,
+            period_min, period_max, ratio)
+    return refined
+
+
+def _refine_run(epochs: np.ndarray, residual: np.ndarray, span_start: int,
+                span_stop: int, period_min: float, period_max: float,
+                ratio: float) -> np.ndarray:
+    """Refine the epochs of a single voiced run (increasing sample indices)."""
+    n = len(residual)
+    refined = epochs.copy()
+    spacing = int(max(1, round(period_min)))
     for i in range(len(epochs)):
         # Local period: half the distance between the neighbouring epochs at the
         # edges, the full distance in the middle.  (Using the *span* of two
@@ -177,20 +228,19 @@ def _refine_epochs(epochs: np.ndarray, residual: np.ndarray, hop: int,
             period = 0.5 * float(epochs[i + 1] - epochs[i - 1])
         elif i + 1 < len(epochs):
             period = float(epochs[i + 1] - epochs[i])
-        else:
+        elif i > 0:
             period = float(epochs[i] - epochs[i - 1])
+        else:
+            period = period_min          # a lone epoch: no period to size with
         period = float(np.clip(period, period_min, period_max))
         width = max(1, int(round(ratio * period)))
-        spacing = int(max(1, round(period_min)))
-        low = int(refined[i - 1]) + spacing if i > 0 else 0
-        high = int(epochs[i + 1]) - spacing if i + 1 < len(epochs) else n - 1
+        low = int(refined[i - 1]) + spacing if i > 0 else int(span_start)
+        high = (int(epochs[i + 1]) - spacing if i + 1 < len(epochs)
+                else int(span_stop) - 1)
         low = min(max(low, 0), n - 1)
         high = min(max(high, 0), n - 1)
         window_low = min(max(epochs[i] - width, low), high)
         window_high = min(max(epochs[i] + width, window_low), high)
-        if window_high < window_low:             # cannot happen, but never trust that
-            refined[i] = min(max(epochs[i], low), high)
-            continue
         window = np.abs(residual[window_low:window_high + 1])
         if window.size and np.isfinite(window).any():
             refined[i] = window_low + int(np.argmax(np.nan_to_num(window, nan=-1.0)))

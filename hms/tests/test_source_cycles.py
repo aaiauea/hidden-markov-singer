@@ -198,6 +198,74 @@ def test_epoch_refinement_snaps_onto_the_excitation_event():
     assert (interior % period).max() <= 1
 
 
+def test_epoch_refinement_never_uses_a_neighbour_from_another_voiced_run():
+    """Refinement refines each voiced run on its own, not the whole epoch array.
+
+    Two voiced runs separated by a six-frame unvoiced gap.  Every tracked epoch
+    has an excitation event of its own, and *inside the gap* sit two much louder
+    events: one just after the end of the first run, one just before the start
+    of the second.  A window sized from the neighbouring run's epoch reaches
+    both of them -- that is the leak this test is about -- while a window that
+    only knows the run's own epochs reaches neither.  Each run is therefore
+    refined independently, every epoch stays on its own run's event, and no
+    cycle is stretched across (or out of) a voiced run.
+    """
+    fs, hop, period, ratio = 22050, 110, 88, 0.25
+    n_samples = 22000
+    run0, run1 = (20, 60), (66, 100)                 # gap: samples [6600, 7260)
+    spans = [(run0[0] * hop, run0[1] * hop), (run1[0] * hop, run1[1] * hop)]
+    track = np.zeros(200)
+    track[run0[0]:run0[1]] = fs / period
+    track[run1[0]:run1[1]] = fs / period
+
+    tracked, runs = pick_epochs(track, hop, n_samples, fs, refine=False)
+    assert len(np.unique(runs)) == 2
+    assert runs[0] == 0 and runs[-1] == 1            # the runs are not contiguous
+
+    # one excitation event per tracked epoch, plus two louder ones in the gap
+    residual = np.zeros(n_samples)
+    half = 5
+    shape = np.hanning(2 * half + 1)
+    for position in tracked:
+        residual[position - half:position + half + 1] += shape
+    leak0, leak1 = spans[0][1] + 2, spans[1][0] - 2
+    residual[leak0] = residual[leak1] = 100.0
+
+    # the geometry this test is about: a window sized from the *other* run's
+    # epoch reaches the gap events (a run-relative width would not)
+    last0 = tracked[runs == 0][-1]
+    first1 = tracked[runs == 1][0]
+    leaked_width = int(round(ratio * 0.5 * (first1 - tracked[runs == 0][-2])))
+    assert leak0 <= last0 + leaked_width
+    assert leak1 >= first1 - leaked_width
+
+    refined, refined_runs = pick_epochs(track, hop, n_samples, fs, refine=True,
+                                        residual=residual, refine_ratio=ratio)
+    assert np.array_equal(refined_runs, runs)
+
+    # no epoch leaves the run it belongs to, and none snaps onto a gap event
+    for run, (start, stop) in enumerate(spans):
+        inside = refined[runs == run]
+        assert ((inside >= start) & (inside < stop)).all()
+        assert not np.isin(inside, [leak0, leak1]).any()
+    # each epoch stays glued to an event of its own run: crossing the boundary
+    # moves an epoch a whole period away, a normal snap moves it a sample or two
+    for run in (0, 1):
+        assert (np.abs(refined[runs == run] - tracked[runs == run]) <= 8).all()
+    # the boundary epochs in particular are untouched by the other run
+    assert refined[runs == 0][-1] == last0
+    assert refined[runs == 1][0] == first1
+
+    # and no cycle is produced across (or sticking out of) a voiced run: the
+    # leak used to stretch the last cycle of each run to two periods
+    cycles = extract_cycles(residual, refined, 128, runs=runs)
+    assert len(cycles) > 50
+    assert (np.diff(cycles.epochs) > 0).all()
+    for epoch, length in zip(cycles.epochs, cycles.periods):
+        assert any(start <= epoch and epoch + length <= stop for start, stop in spans)
+        assert length <= period + 2
+
+
 def test_frame_positions_follow_the_frame_grid():
     assert np.array_equal(frame_positions(4, 110), np.array([0.0, 110.0, 220.0, 330.0]))
 

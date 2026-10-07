@@ -153,26 +153,26 @@ on the second. With the defaults (`cycle_length=128`, `n_mcep=30`,
 audio              : 32.11 s, 22050 Hz, 6441 frames @ 5 ms
 voiced frames      : 5314 / 6441 (82.5 %)
 valid source units : 8419 extracted cycles (8419 source vectors)
-cycle period       : 11 .. 220 samples, median 67 (F0 100.2 .. 2004.5 Hz, median 329.1 Hz)
+cycle period       : 11 .. 207 samples, median 67 (F0 106.5 .. 2004.5 Hz, median 329.1 Hz)
 
 all cycles  (basis fitted on the first half, measured on the second)
    k  expl. var       MSE     RMSE  rel RMSE  median err  p90 err    corr
-   1      0.232    0.6473   0.8045     0.805       0.795    0.991   0.538
-   4      0.485    0.4456   0.6676     0.668       0.664    0.898   0.718
-   8      0.663    0.3159   0.5620     0.562       0.514    0.785   0.812
-  16      0.852    0.1599   0.3999     0.400       0.345    0.570   0.912
-  32      0.983    0.0172   0.1311     0.131       0.063    0.211   0.991
+   1      0.232    0.6476   0.8047     0.805       0.796    0.991   0.537
+   4      0.485    0.4457   0.6676     0.668       0.665    0.897   0.718
+   8      0.663    0.3155   0.5617     0.562       0.514    0.786   0.813
+  16      0.852    0.1597   0.3997     0.400       0.347    0.567   0.912
+  32      0.983    0.0174   0.1319     0.132       0.063    0.212   0.991
 
 per pitch (same period, basis fitted and measured within the group)
   F0 Hz  cycles                   k=4                   k=8                  k=16
   393.8     369     0.807/     0.493     0.919/     0.437     0.989/     0.337
   350.0     347     0.767/     0.572     0.892/     0.487     0.976/     0.342
-  294.0     340     0.830/     0.563     0.918/     0.513     0.983/     0.401
+  294.0     341     0.824/     0.560     0.911/     0.507     0.981/     0.396
   262.5     301     0.877/     0.594     0.961/     0.515     0.995/     0.403
-  355.6     292     0.814/     0.581     0.926/     0.528     0.987/     0.414
+  355.6     294     0.814/     0.590     0.926/     0.534     0.987/     0.421
+  298.0     270     0.814/     0.549     0.916/     0.492     0.985/     0.319
   334.1     268     0.807/     0.391     0.929/     0.284     0.991/     0.150
-  298.0     268     0.819/     0.563     0.921/     0.511     0.987/     0.365
-  329.1     254     0.782/     0.467     0.927/     0.340     0.991/     0.199
+  329.1     255     0.774/     0.466     0.925/     0.337     0.991/     0.200
 (cells: explained variance / held-out relative RMSE)
 
 longest steady stretch  (87 cycles at ~374 Hz)
@@ -201,8 +201,8 @@ How to read it:
   them *unseen* by the fit) 8 coefficients give relative RMSE 0.56 /
   correlation 0.81; conditioning on the pitch alone (per-pitch groups, which is
   what a Phase 2 source model conditioning on the note would provide) improves
-  that to 0.28–0.53 relative RMSE with explained variance 0.89–0.96. 16
-  coefficients reach 0.40 pooled and 0.15–0.41 per pitch.
+  that to 0.28–0.53 relative RMSE with explained variance 0.91–0.96. 16
+  coefficients reach 0.40 pooled and 0.15–0.42 per pitch.
 * **The residual loss is conditioning, not capacity.** The same 8 coefficients
   give 0.06 relative RMSE inside one steady stretch and 0.56 on the whole
   corpus. What separates the two is that the corpus mixes excitation shapes from
@@ -226,11 +226,15 @@ noisy one.
 
 **Epoch refinement** (`refine_ratio`, how far an epoch may snap toward the
 strongest residual sample in its neighbourhood). Held-out relative RMSE /
-cycle-to-cycle correlation at k=8 on the corpus: off 0.713/—, 0.15 0.657/0.940,
-0.25 0.604/0.950, **0.35 0.569/0.957**, 0.50 0.529/0.965. The default is 0.35:
-larger windows keep improving the numbers because excitation events are what the
-snap locks onto, but past half a period an epoch could reach its neighbour's
-event, which is the failure the neighbour bound exists to prevent.
+cycle-to-cycle correlation at k=8 on the corpus: off 0.713/0.795, 0.15
+0.657/0.939, 0.25 0.603/0.950, **0.35 0.569/0.956**, 0.50 0.529/0.963. The
+default is 0.35: larger windows keep improving the numbers because excitation
+events are what the snap locks onto, but past half a period an epoch could reach
+its neighbour's event, which is the failure the neighbour bound exists to
+prevent. The refinement runs **per voiced run**: an epoch's neighbours, its local
+period and the span it may move inside all come from its own run, never from a
+neighbouring run or the unvoiced gap between them
+(`hms/tests/test_source_cycles.py::test_epoch_refinement_never_uses_a_neighbour_from_another_voiced_run`).
 
 **F0 analysis window** (`f0_window_periods`). The default 0 keeps the plain
 `4 * hop` window the rest of HMS uses, which tracks pitch and vibrato closely.
@@ -278,4 +282,4 @@ level loss and it exists only for periods longer than `cycle_length` samples
 | `hms/source/generic.py` | `GenericResidualSourceModel` (pitch-free backend) |
 | `hms/source/pca.py` | `SourcePCA` (fit / encode / decode / save / load / report) |
 | `tools/bench_source_pca.py` | the experiment above |
-| `hms/tests/test_source_cycles.py`, `test_source_pca.py`, `test_source_model.py` | the unit tests (84 tests: cycles, PCA, model API and reconstruction) |
+| `hms/tests/test_source_cycles.py`, `test_source_pca.py`, `test_source_model.py` | the unit tests (85 tests: cycles, PCA, model API and reconstruction) |
