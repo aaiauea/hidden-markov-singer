@@ -293,6 +293,20 @@ the requested note/F0 is still taken from the score; GV of the note-relative F0
 feature only affects the optional acoustic-deviation mode. For a synthetic
 performance/variance check, run `python tools/bench_gv.py --frames 1000 --dim 30`.
 
+## Source models (Phase 1, experimental)
+
+HMS models the filter with the HMM/GMM and leaves the source to the vocoder.
+`hms/source` adds a *representation* of the excitation — pitch-synchronous
+residual cycles, normalised to fixed-length vectors, compressed by a NumPy-only
+PCA — as the first phase of a source-aware architecture. It is analysis and
+validation only: nothing in the trainer, parameter generation or vocoders calls
+it, and the existing synthesiser is unchanged. `python tools/bench_source_pca.py`
+measures how much of a cycle survives a handful of coefficients (a steady note:
+~6 % relative error with 8 coefficients; mixed material: ~56 %, the difference
+being the pitch/phoneme conditioning a later phase would learn). See
+[docs/source_model.md](docs/source_model.md) for the design, the numbers and the
+measured trade-offs.
+
 ## Data format
 
 Everything is a tab-separated text file; no database, no binary labels:
@@ -462,7 +476,9 @@ notes really are the requested ones.
 
 See [docs/architecture.md](docs/architecture.md) for the pipeline, the feature
 layout, the HMM/GMM/training design, the note-conditioned pitch model, and the
-trade-offs behind each choice. `hms/model/…` is a small system on purpose; the
+trade-offs behind each choice, and [docs/source_model.md](docs/source_model.md)
+for the Phase 1 source/excitation representation (analysis only — it is not part
+of the synthesiser yet). `hms/model/…` is a small system on purpose; the
 documentation tries to explain *why* each piece looks the way it does.
 
 ## Limitations
