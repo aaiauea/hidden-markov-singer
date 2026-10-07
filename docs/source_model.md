@@ -201,7 +201,7 @@ How to read it:
   them *unseen* by the fit) 8 coefficients give relative RMSE 0.56 /
   correlation 0.81; conditioning on the pitch alone (per-pitch groups, which is
   what a Phase 2 source model conditioning on the note would provide) improves
-  that to 0.28–0.53 relative RMSE with explained variance 0.91–0.96. 16
+  that to 0.28–0.53 relative RMSE with explained variance 0.89–0.96. 16
   coefficients reach 0.40 pooled and 0.15–0.42 per pitch.
 * **The residual loss is conditioning, not capacity.** The same 8 coefficients
   give 0.06 relative RMSE inside one steady stretch and 0.56 on the whole
@@ -210,8 +210,9 @@ How to read it:
   conditions on those (an HMM over source coefficients, coupled to the spectral
   model) is exactly what Phase 2 would add.
 * Note that `mean_correlation` and relative RMSE are different lenses on the
-  same thing: a relative RMSE of 0.5 corresponds to a correlation of ~0.87
-  (energy, not amplitude).
+  same thing: a relative RMSE of 0.5 corresponds to a correlation of ~0.86
+  (measured at k=12: 0.496 / 0.860 — relative RMSE is an energy error, the
+  correlation is not).
 
 ## Measured design choices
 
