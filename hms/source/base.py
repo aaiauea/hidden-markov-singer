@@ -58,7 +58,7 @@ from typing import Iterator, Optional
 import numpy as np
 
 from hms.core.features import DEFAULT_N_MCEP
-from hms.source.cycles import place_cycles
+from hms.source.cycles import frame_coverage, place_cycles, unit_support_mask
 
 #: Default length of one fixed-length source vector, in samples.
 DEFAULT_CYCLE_LENGTH = 128
@@ -202,6 +202,23 @@ class SourceSequence:
         """Per-unit frequency in Hz, derived from the measured periods."""
         with np.errstate(divide="ignore", invalid="ignore"):
             return np.where(self.periods > 0, self.fs / np.maximum(self.periods, 1), 0.0)
+
+    def support_mask(self, n_samples: Optional[int] = None) -> np.ndarray:
+        """``(n_samples,)`` bool: the samples a source unit spans.
+
+        Added for Phase 3: a renderer that mixes a learned source with the
+        backend's own excitation has to know where the learned one actually
+        exists (see :func:`hms.source.cycles.unit_support_mask`).  The default
+        length is the sequence's own ``n_samples``; pass one to ask about a
+        longer or shorter render.
+        """
+        length = int(self.n_samples if n_samples is None else n_samples)
+        return unit_support_mask(self.epochs, self.periods, length)
+
+    @property
+    def coverage(self) -> np.ndarray:
+        """Per-frame covered fraction in ``[0, 1]`` (one entry per frame)."""
+        return frame_coverage(self.support_mask(), self.hop, self.n_frames)
 
     # -- generic view ------------------------------------------------------
 

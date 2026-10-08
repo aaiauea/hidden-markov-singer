@@ -73,13 +73,13 @@ Limitations
 from __future__ import annotations
 
 import functools
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
 from hms.core.features import (DEFAULT_N_MCEP, AcousticFrameSequence,
                                hz_to_mel, mel_band_count, power_to_mcep)
-from hms.vocoder.base import Vocoder
+from hms.vocoder.base import Vocoder, blend_excitation, render_length
 from hms.vocoder.builtin import BuiltinVocoder
 
 #: The reconstructed log power is clipped to +/- this value, mirroring the
@@ -248,6 +248,10 @@ class MLSAVocoder(Vocoder):
 
     name = "mlsa"
 
+    #: This backend generates its own pulse/noise excitation, so it can also be
+    #: handed one (see `Vocoder.synthesize_with_excitation`).
+    supports_external_excitation = True
+
     #: Used when the caller does not pin an FFT size (mirrors the WORLD default).
     DEFAULT_FFT_SIZE = 2048
 
@@ -310,6 +314,25 @@ class MLSAVocoder(Vocoder):
     # -- synthesis ---------------------------------------------------------
 
     def synthesize(self, params: AcousticFrameSequence) -> np.ndarray:
+        return self._synthesize(params, excitation=None, weights=None)
+
+    def synthesize_with_excitation(self, params: AcousticFrameSequence,
+                                   excitation: np.ndarray,
+                                   weights: Optional[np.ndarray] = None
+                                   ) -> np.ndarray:
+        """Drive the MLSA filter with a learned source instead of a pulse train.
+
+        The supplied waveform replaces the *pulse* exactly where ``weights``
+        says it covers the timeline; the noise half and the per-bin
+        aperiodicity mix are untouched, so an unvoiced frame stays pure noise
+        (``ap`` is forced to 1 there) and the mel-cepstral envelope keeps
+        owning loudness.
+        """
+        return self._synthesize(params, excitation=excitation, weights=weights)
+
+    def _synthesize(self, params: AcousticFrameSequence,
+                    excitation: Optional[np.ndarray],
+                    weights: Optional[np.ndarray]) -> np.ndarray:
         f0 = np.asarray(params.f0, dtype=np.float64).reshape(-1)
         n_frames = int(f0.size)
         if n_frames == 0:
@@ -346,7 +369,7 @@ class MLSAVocoder(Vocoder):
 
         # WORLD's duration convention (`f0_length * frame_period * fs`), which
         # every backend must reproduce so a phrase's length is backend-independent.
-        y_length = int(n_frames * frame_period / 1000.0 * fs)
+        y_length = render_length(n_frames, frame_period, fs)
         filter_length = self.filter_length or _next_power_of_two(
             FILTER_PERIODS * hop)
         n_fft = _next_power_of_two(hop + filter_length)
@@ -366,9 +389,21 @@ class MLSAVocoder(Vocoder):
         # cover every output sample, so it is generated up to the last sample
         # that can reach the output, with the last frame's F0 replicated (the
         # same edge convention `add_dynamic_features` uses).
-        pulse = self._pulse_train(f0, fs, hop, n_exc,
-                                  int(min(y_length + filter_length,
-                                          n_exc - 1)))
+        if excitation is None:
+            pulse = self._pulse_train(f0, fs, hop, n_exc,
+                                      int(min(y_length + filter_length,
+                                              n_exc - 1)))
+        else:
+            # Only build the pulse where the learned source does not cover:
+            # a fully covered render pays nothing for an excitation it discards.
+            if weights is not None and not np.any(
+                    np.asarray(weights, dtype=np.float64) < 1.0):
+                pulse = np.zeros(n_exc, dtype=np.float64)
+            else:
+                pulse = self._pulse_train(f0, fs, hop, n_exc,
+                                          int(min(y_length + filter_length,
+                                                  n_exc - 1)))
+            pulse = blend_excitation(pulse, excitation, weights)
         noise = np.random.default_rng(self.seed).standard_normal(n_exc)
 
         y = np.zeros(n_exc + n_fft, dtype=np.float64)

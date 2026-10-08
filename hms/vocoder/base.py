@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import abc
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -12,6 +12,60 @@ from hms.core.features import AcousticFrameSequence
 
 class VocoderUnavailable(RuntimeError):
     """Raised when a backend cannot be used on this machine."""
+
+
+def render_length(n_frames: int, frame_period: float, fs: int) -> int:
+    """Samples a render of ``n_frames`` frames produces.
+
+    This is WORLD's duration convention (``f0_length * frame_period * fs``),
+    which every backend reproduces so that a phrase's length does not depend on
+    the backend -- and, since Phase 3, so that a source excitation rendered
+    outside the backend is laid out on exactly the grid the backend filters.
+    Note that it is *not* ``n_frames * hop``: at 44.1 kHz / 5 ms a frame
+    advances by 220.5 samples, so the two drift apart by half a sample per
+    frame over a long render.
+    """
+    return int(int(n_frames) * float(frame_period) / 1000.0 * int(fs))
+
+
+def blend_excitation(default: np.ndarray, learned: np.ndarray,
+                     weights: Optional[np.ndarray] = None) -> np.ndarray:
+    """Mix a caller-supplied excitation into the backend's own, per sample.
+
+        ``out = weights * learned + (1 - weights) * default``
+
+    ``weights`` is ``(n_samples,)`` in ``[0, 1]``, aligned with ``learned``:
+    ``1`` hands the sample to the learned source, ``0`` keeps the backend's
+    pulse train.  It is supplied by the source layer
+    (:func:`hms.source.synthesis.fade_weights`), which ramps it over one frame
+    at every coverage boundary -- a step here would be a step in the filter's
+    input.  ``None`` means "take the learned source wherever it is non-zero",
+    the hard switch, which exists for callers that do their own fade.
+
+    ``learned`` shorter than ``default`` is zero-padded rather than rejected:
+    a backend internally renders more samples than it outputs (the
+    overlap-add tail), and the uncovered tail is exactly where its own
+    excitation belongs.
+    """
+    default = np.asarray(default, dtype=np.float64).reshape(-1)
+    learned = np.asarray(learned, dtype=np.float64).reshape(-1)
+    n = max(default.size, learned.size)
+    if learned.size != n:
+        padded = np.zeros(n, dtype=np.float64)
+        padded[:learned.size] = learned
+        learned = padded
+    if default.size != n:
+        padded = np.zeros(n, dtype=np.float64)
+        padded[:default.size] = default
+        default = padded
+    if weights is None:
+        weights = (learned != 0.0).astype(np.float64)
+    weights = np.clip(np.asarray(weights, dtype=np.float64).reshape(-1), 0.0, 1.0)
+    if weights.size != n:
+        padded = np.zeros(n, dtype=np.float64)
+        padded[:min(weights.size, n)] = weights[:min(weights.size, n)]
+        weights = padded
+    return default + (learned - default) * weights
 
 
 def limit_peak(audio: np.ndarray, ceiling: float = 1.0,
@@ -43,6 +97,11 @@ class Vocoder(abc.ABC):
     """
 
     name: str = "abstract"
+
+    #: True when `synthesize_with_excitation` is implemented.  WORLD-style
+    #: backends take (f0, sp, ap) and nothing else, so this stays False for
+    #: them; overriding it is how a backend opts into source-aware synthesis.
+    supports_external_excitation: bool = False
 
     def __init__(self, fft_size: int | None = None, fs: int = 44100,
                  frame_period: float = 5.0) -> None:
@@ -113,6 +172,31 @@ class Vocoder(abc.ABC):
         normalise before writing: :func:`hms.data.wavio.write_wav` does, or call
         :func:`limit_peak` for a hard ceiling.
         """
+
+    def synthesize_with_excitation(self, params: AcousticFrameSequence,
+                                   excitation: np.ndarray,
+                                   weights: Optional[np.ndarray] = None
+                                   ) -> np.ndarray:
+        """Filter a caller-supplied excitation instead of generating one.
+
+        This is the Phase-3 seam: the source layer renders an excitation
+        (see :mod:`hms.source.synthesis`) and the backend -- which owns the
+        filter -- splices it in where it covers the timeline, keeping its own
+        excitation everywhere else.  Only the *periodic* component is replaced:
+        aperiodicity and the unvoiced noise path are untouched, so an unvoiced
+        frame stays exactly as it is today.
+
+        A backend that builds its excitation inside a closed synthesis call
+        (WORLD: ``Synthesis(f0, sp, ap)``) cannot honour this, and says so by
+        leaving :attr:`supports_external_excitation` False -- the default.  The
+        synthesis layer turns that into an error naming the backends that do,
+        rather than silently ignoring the caller's source model.
+        """
+        raise VocoderUnavailable(
+            f"the {self.name!r} backend cannot filter a caller-supplied "
+            f"excitation (it synthesizes f0/sp/ap internally); source-aware "
+            f"synthesis needs a backend that owns its excitation -- use "
+            f"'builtin' or 'mlsa'")
 
     # -- convenience -------------------------------------------------------
 

@@ -293,22 +293,48 @@ the requested note/F0 is still taken from the score; GV of the note-relative F0
 feature only affects the optional acoustic-deviation mode. For a synthetic
 performance/variance check, run `python tools/bench_gv.py --frames 1000 --dim 30`.
 
-## Source models (Phase 1 representation + Phase 2 predictor)
+## Source models (Phase 1 representation, Phase 2 predictor, Phase 3 synthesis)
 
-HMS models the filter with the acoustic HMM/GMM and leaves source/vocoder
-integration unchanged. Phase 1 provides pitch-synchronous or frame-synchronous
-source units and a NumPy PCA; Phase 2 adds a standalone HMM/GMM predictor over
-those existing PCA coefficients, optionally selected by sparse phone context
-and conditioned on an explicit frame-level F0 trajectory. It can train,
-save/load and generate a Phase-1 `SourceSequence`, but does not yet connect to
-full-audio synthesis or predict source gain. Use `SourceTrainer`,
-`SourceTrainingExample` and `SourceHMMModel` from `hms.source`; explicit F0
-must match the source analysis frame grid and is never silently resized.
-`python tools/bench_source_pca.py`
-measures representation reconstruction (a steady note: ~6 % relative error
-with 8 coefficients; mixed material: ~56 %). See
-[docs/source_model.md](docs/source_model.md) for the training/generation flow,
-serialization format, limitations and Phase-1 measurements.
+HMS models the **filter** with the acoustic HMM/GMM. The **source** has its own
+branch, built up in three phases, and each one is usable on its own:
+
+* **Phase 1 — representation.** Pitch-synchronous (`voice`) or frame-synchronous
+  (`residual`) source units plus a NumPy PCA. `python tools/bench_source_pca.py`
+  measures the reconstruction (a steady note: ~6 % relative error with 8
+  coefficients; mixed material: ~56 %).
+* **Phase 2 — predictor.** A standalone HMM/GMM over those existing PCA
+  coefficients, selected by sparse phone context and conditioned on an explicit
+  frame-level F0 trajectory. It trains, saves/loads and generates a Phase-1
+  `SourceSequence`. Use `SourceTrainer`, `SourceTrainingExample` and
+  `SourceHMMModel` from `hms.source`; explicit F0 must match the source analysis
+  frame grid and is never silently resized.
+* **Phase 3 — source-aware synthesis.** The learned source is rendered as an
+  excitation and drives the vocoder's filter in place of the pulse train. Pass
+  a Phase-2 model to `Synthesizer.synthesize(..., source_model=...)` (or
+  `hms synth --source-model`) with a backend that owns its excitation
+  (`--vocoder builtin` or `--vocoder mlsa`):
+
+  ```python
+  from hms.source import SourceHMMModel
+
+  source = SourceHMMModel.load("model-source")
+  result = Synthesizer(model).synthesize(score, source_model=source)
+  ```
+
+  ```bash
+  hms synth --model model --score score.tsv --out song.wav \
+            --source-model model-source --vocoder mlsa
+  ```
+
+  The learned source replaces the **periodic** half of the excitation only. The
+  aperiodicity/noise path, the spectral envelope, the timing and the F0 are
+  untouched, so unvoiced frames stay exactly as they are and loudness stays with
+  the acoustic model. Without `source_model=` the render is bit-identical to
+  ordinary HMS synthesis. Phase 2 predicts source *shape*, not amplitude, so
+  there is no learned gain: the excitation is calibrated to the level of the
+  pulse train it replaces and `source_gain` (default 1.0) tilts that. See
+  [docs/source_model.md](docs/source_model.md) for the training/generation flow,
+  the integration boundary, serialization and the remaining limitations.
 
 ## Data format
 
@@ -478,10 +504,11 @@ notes really are the requested ones.
 ## How it works
 
 See [docs/architecture.md](docs/architecture.md) for the pipeline, the feature
-layout, the HMM/GMM/training design, the note-conditioned pitch model, and the
-trade-offs behind each choice, and [docs/source_model.md](docs/source_model.md)
-for the Phase 1 source/excitation representation and Phase 2 standalone source
-predictor (still not wired into the synthesizer). `hms/model/…` is a small system on purpose; the
+layout, the HMM/GMM/training design, the note-conditioned pitch model, the
+source/filter integration boundary, and the trade-offs behind each choice, and
+[docs/source_model.md](docs/source_model.md) for the source/excitation branch:
+Phase 1's representation, Phase 2's standalone predictor and Phase 3's
+source-aware synthesis. `hms/model/…` is a small system on purpose; the
 documentation tries to explain *why* each piece looks the way it does.
 
 ## Limitations
@@ -525,3 +552,10 @@ documentation tries to explain *why* each piece looks the way it does.
   requested pitch using the nearest trained spectral envelope, so they are
   audible but are not *natural* for this voice: the envelope comes from frames
   the model never saw at that pitch.
+* Source-aware synthesis (Phase 3) needs a vocoder backend that owns its
+  excitation, i.e. `--vocoder builtin` or `--vocoder mlsa`: WORLD's synthesis
+  takes `(f0, sp, ap)` and nothing else, so the `native` and `pyworld` backends
+  refuse a caller-supplied excitation rather than silently ignoring it. The
+  Phase-2 source model predicts source *shape*, not amplitude, so there is no
+  learned gain yet: the excitation is calibrated to the level of the pulse
+  train it replaces and the output level still follows the acoustic envelope.

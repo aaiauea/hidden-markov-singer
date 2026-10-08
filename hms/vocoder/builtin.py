@@ -24,20 +24,24 @@ Synthesis
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
 from hms.core.dsp import (autocorrelation_f0, frame_signal,
                           harmonicity_aperiodicity, spectral_flatness)
 from hms.core.features import AcousticFrameSequence
-from hms.vocoder.base import Vocoder, limit_peak
+from hms.vocoder.base import Vocoder, blend_excitation, limit_peak, render_length
 
 
 class BuiltinVocoder(Vocoder):
     """Approximate pure-numpy analysis/synthesis backend."""
 
     name = "builtin"
+
+    #: This backend builds its own excitation, so it can also be handed one
+    #: (see `Vocoder.synthesize_with_excitation`).
+    supports_external_excitation = True
 
     #: Used when the caller does not pin an FFT size (mirrors the WORLD default).
     DEFAULT_FFT_SIZE = 2048
@@ -97,6 +101,25 @@ class BuiltinVocoder(Vocoder):
     # -- synthesis ---------------------------------------------------------
 
     def synthesize(self, params: AcousticFrameSequence) -> np.ndarray:
+        return self._synthesize(params, excitation=None, weights=None)
+
+    def synthesize_with_excitation(self, params: AcousticFrameSequence,
+                                   excitation: np.ndarray,
+                                   weights: Optional[np.ndarray] = None
+                                   ) -> np.ndarray:
+        """Filter a learned source instead of this backend's pulse train.
+
+        The supplied waveform replaces the *pulse* exactly where ``weights``
+        says it covers the timeline; the noise component and the per-frame
+        aperiodicity mix are untouched, so an unvoiced frame (which this
+        backend renders as pure noise) is unaffected, and the spectral envelope
+        keeps owning loudness.
+        """
+        return self._synthesize(params, excitation=excitation, weights=weights)
+
+    def _synthesize(self, params: AcousticFrameSequence,
+                    excitation: Optional[np.ndarray],
+                    weights: Optional[np.ndarray]) -> np.ndarray:
         f0 = np.asarray(params.f0, dtype=np.float64).reshape(-1)
         n_frames = len(f0)
         if n_frames == 0:
@@ -116,11 +139,12 @@ class BuiltinVocoder(Vocoder):
         # at 44.1 kHz a 5 ms hop rounds to 220 samples while WORLD's formula
         # advances by 220.5, so the frame-grid length overtakes the windowed
         # one (the exact case that made a 32 s render 0.03 s short).
-        y_length = int(n_frames * frame_period / 1000.0 * fs)
+        y_length = render_length(n_frames, frame_period, fs)
         tail = int((n_frames - 1) * hop + fft_size)
-        render_length = max(tail, y_length)
-        excitation = self._excitation(f0, ap, fs, hop, render_length)
-        y = self._apply_envelope(excitation, sp, fft_size, hop, render_length)
+        length = max(tail, y_length)
+        mixed = self._excitation(f0, ap, fs, hop, length,
+                                 excitation=excitation, weights=weights)
+        y = self._apply_envelope(mixed, sp, fft_size, hop, length)
         y = y[:max(y_length, 1)]
         # This backend builds its excitation from scratch, so its absolute
         # level is arbitrary: scale it once, via the shared policy, instead of
@@ -129,14 +153,37 @@ class BuiltinVocoder(Vocoder):
         return limit_peak(y, ceiling=0.99, headroom=1.0)
 
     def _excitation(self, f0: np.ndarray, ap: np.ndarray, fs: int, hop: int,
-                    y_length: int) -> np.ndarray:
-        """Pulse train + high-passed noise, mixed per frame by aperiodicity."""
+                    y_length: int, excitation: Optional[np.ndarray] = None,
+                    weights: Optional[np.ndarray] = None) -> np.ndarray:
+        """Pulse train + high-passed noise, mixed per frame by aperiodicity.
+
+        With ``excitation`` the pulse train is replaced by that waveform where
+        ``weights`` says it applies (see :func:`blend_excitation`); everything
+        downstream -- the aperiodicity mix, the unvoiced noise path -- is the
+        same code either way.
+        """
+        noise = self._noise_source(y_length)
+        pulse = self._pulse_train(f0, ap, fs, hop, y_length)
+        if excitation is not None:
+            # Only build the pulse where the learned source does not cover:
+            # a fully covered render pays nothing for an excitation it discards.
+            if weights is not None and not np.any(
+                    np.asarray(weights, dtype=np.float64) < 1.0):
+                pulse = np.zeros(y_length, dtype=np.float64)
+            pulse = blend_excitation(pulse, excitation, weights)
+        return self._mix(pulse, noise, ap, len(f0), hop, y_length)
+
+    def _noise_source(self, y_length: int) -> np.ndarray:
+        """The deterministic high-passed noise half of the excitation."""
         rng = np.random.default_rng(self.seed)
         noise = rng.standard_normal(y_length)
         # cheap high-pass: aperiodicity rises with frequency in real voices, so
         # the noise component should not be flat down to DC
-        noise = noise - 0.3 * np.concatenate([[0.0], noise[:-1]])
+        return noise - 0.3 * np.concatenate([[0.0], noise[:-1]])
 
+    def _pulse_train(self, f0: np.ndarray, ap: np.ndarray, fs: int, hop: int,
+                     y_length: int) -> np.ndarray:
+        """The pulse-train half of the excitation (one pulse per period)."""
         pulse = np.zeros(y_length)
         voiced = f0[f0 > 0]
         if voiced.size and float(np.min(ap)) < 1.0:
@@ -162,11 +209,18 @@ class BuiltinVocoder(Vocoder):
                         pulse[dst_lo:dst_hi] += shape[src_lo:src_lo + dst_hi
                                                       - dst_lo]
                     position += period
+        return pulse
 
+    def _mix(self, pulse: np.ndarray, noise: np.ndarray, ap: np.ndarray,
+             n_frames: int, hop: int, y_length: int) -> np.ndarray:
+        """Mix the two excitation halves per frame, by aperiodicity."""
         noise_ratio = np.clip(ap.mean(axis=1), 0.0, 1.0)
         pulse_gain = np.zeros(y_length)
         noise_gain = np.zeros(y_length)
-        for t in range(len(f0)):
+        # `min` rather than `len(ap)`: this backend does not require sp/ap to
+        # carry the same frame count as f0, and neither may paint gains past
+        # the frames the caller actually supplied.
+        for t in range(min(int(n_frames), len(noise_ratio))):
             start, end = t * hop, min((t + 1) * hop, y_length)
             if start >= y_length:
                 break

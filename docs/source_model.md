@@ -1,18 +1,14 @@
-# Source/excitation model (Phase 1 representation + Phase 2 predictor)
+# Source/excitation model (Phase 1 + Phase 2 + Phase 3)
 
 HMS has traditionally modelled the **filter**: a mel-cepstrum envelope per
 frame, learned by the acoustic HMM/GMM. The **source** was left to the vocoder,
 which invents it from scratch (a pulse train plus noise mixed by the
 aperiodicity). Phase 1 added a generic source representation, analysis backends
-and NumPy PCA. Phase 2 now adds a separate statistical predictor over those
-existing PCA coefficients.
+and NumPy PCA. Phase 2 added a separate statistical predictor over those
+existing PCA coefficients. Phase 3 connects the two branches: the learned source
+is rendered as an excitation and drives the vocoder's filter.
 
-The source model remains deliberately separate from the acoustic trainer,
-parameter generator, synthesizer and vocoder. Phase 2 can train, save, load and
-generate a source trajectory, but it does not wire that trajectory into full
-audio synthesis; existing acoustic and vocoder APIs remain unchanged.
-
-The intended paired architecture is
+The completed architecture is
 
 ```
 labels + explicit F0 ──► source HMM/GMM ──► PCA coefficients ──► excitation ─┐
@@ -20,11 +16,19 @@ labels + explicit F0 ──► source HMM/GMM ──► PCA coefficients ──�
 labels (+ score F0) ───► acoustic HMM/GMM ─► spectral envelope / AP ──────┘
 ```
 
-The acoustic branch remains as it is today. The new source branch predicts the
-Phase-1 representation independently from phoneme/context labels and an
-explicit frame-level F0 trajectory. A future integration phase can decide how
-to combine the two branches without changing the source representation or
-redefining the acoustic APIs.
+The acoustic branch is untouched by all three phases. The source branch predicts
+the Phase-1 representation independently from phoneme/context labels and an
+explicit frame-level F0 trajectory, and Phase 3 is the seam where the two meet.
+
+* [Phase 1](#phase-1-source-representation) — representation, backends, PCA.
+* [Phase 2](#phase-2-context--f0-conditioned-coefficient-prediction) — the
+  standalone predictor.
+* [Phase 3](#phase-3-source-aware-synthesis) — rendering the prediction as an
+  excitation and filtering it.
+
+Phase 3 is opt-in and additive: `Synthesizer.synthesize(score)` without a
+`source_model` is bit-identical to the synthesis HMS has always done, and no
+acoustic model file, vocoder API or Phase-1/Phase-2 API changed meaning.
 
 ## Pipeline
 
@@ -356,10 +360,10 @@ from hms.source import SourceHMMModel
 loaded = SourceHMMModel.load("models/singer-a-source")
 ```
 
-`excitation` here is still only the source waveform on the sample grid; this is
-not yet full filtered audio, and no `Synthesizer`, acoustic model format, or
-vocoder backend has been changed. The `seed` argument is retained for API
-parity, but MLPG prediction is deterministic and does not sample.
+`excitation` here is only the source waveform on the sample grid; full filtered
+audio is what [Phase 3](#phase-3-source-aware-synthesis) adds. The `seed`
+argument is retained for API parity, but MLPG prediction is deterministic and
+does not sample.
 
 ### Separate model format and current scope
 
@@ -373,14 +377,199 @@ model.
 The Phase-1 representation remains band-limited to `cycle_length / 2`
 harmonics per period, and its residual is a zero-phase inverse-filter output,
 not a claimed glottal-flow estimate. Phase 2 does not predict Phase-1 unit gains,
-connect to the acoustic spectral envelope/vocoder, infer an F0 track when none
-is supplied, or add new pitch/vibrato modelling. These are deliberate later
-integration/modeling decisions, not alternate source representations.
+infer an F0 track when none is supplied, or add new pitch/vibrato modelling.
+Connecting it to the acoustic envelope and the vocoder is Phase 3, below.
 
 `hms/tests/test_source_hmm.py` covers overlap alignment, F0 validation and
 pitch-change features, sparse context selection, configurable PCA size,
 voiced/unvoiced behavior, deterministic MLPG generation, PCA decoder
 compatibility, and YAML/NPZ save/load.
+
+## Phase 3: source-aware synthesis
+
+Phase 3 is an **integration** phase. It redefines no representation, retrains
+nothing, and does not touch the acoustic HMM/GMM, the parameter generator or the
+feature layout. It adds one module (`hms/source/synthesis.py`), one optional
+capability on the vocoder interface, one optional argument on
+`Synthesizer.synthesize`, and two CLI flags.
+
+### The integration boundary
+
+The seam is the **excitation waveform on the sample grid** — not PCA
+coefficients, not WORLD parameters:
+
+```
+SourceHMMModel.generate(utterance, f0)          # Phase 2, unchanged
+        │  .sequence  (Phase-1 units, PCA-decoded)
+        ▼
+hms.source.synthesis.render_source_excitation    # place_cycles + coverage
+        │  excitation (n_samples,)  + support / weights / coverage
+        ▼
+Vocoder.synthesize_with_excitation(params, …)    # the backend's own filter
+        │
+        ▼
+      audio
+```
+
+`hms/source/synthesis.py` owns the source: it places the units on the sample
+grid with Phase 1's `place_cycles`, marks where they exist, and calibrates the
+level. It knows nothing about WORLD, MLSA or mel-cepstra. The vocoder owns the
+filter: a backend that generates its own excitation can also be handed one, and
+that is the only place where filtering happens. Nothing forces a backend to
+understand PCA coefficients, and `SourceHMMModel` gained no WORLD-specific code.
+
+### What the learned source replaces
+
+Only the **periodic** half of the excitation — the pulse train. The noise half
+(aperiodicity) is untouched, which preserves two existing behaviours for free:
+
+* **Unvoiced excitation is unchanged.** Every HMS backend forces `ap` to 1 on an
+  unvoiced frame, i.e. pure noise, so the learned source is multiplied by zero
+  there and the existing noise path is exactly what it was. The learned source is
+  not asked to be a noise generator and does not have to be muted. For the
+  `voice` backend there are no units in unvoiced frames anyway; for the
+  frame-synchronous `residual` backend, units in unvoiced frames are
+  inaudible for this reason (see limitations).
+* **Loudness stays with the acoustic model.** `sp` and `ap` still decide how
+  loud a frame is, as they did before.
+
+Where the source does not cover the timeline — unvoiced gaps, the samples after
+the last epoch of a run, the tail past the end of the frame grid — the backend's
+own excitation is used, so nothing regresses relative to an ordinary render.
+
+The transition is **continuous and frame-aligned**: the source layer builds a
+per-sample weight from the sample-accurate support mask and smooths it with a
+moving average one frame period long (`fade_weights`), so every boundary ramps
+over `hop` samples instead of stepping. The ramp is computed from a cumulative
+sum, so it is O(n) with no kernel and no scipy.
+
+### Timing and alignment
+
+The two branches are made to agree before anything is rendered:
+
+| quantity | how agreement is enforced |
+|---|---|
+| sample rate | `source_model.spec.fs` must equal `model.spec.fs` exactly, else `ValueError` — HMS never resamples audio or a source prediction |
+| frame period | same check on `frame_period` |
+| frame count | the source branch is given the acoustic `plan`'s frame count, never its own |
+| F0 | the render's own `parameters.f0` (Hz, `0` = unvoiced) is sliced per utterance and passed to `generate`, so pitch and voicing cannot disagree |
+| duration / sample count | `render_length(n_frames, frame_period, fs)` — the same WORLD convention the backends use |
+| sample layout | an utterance starting at frame `lo` is written at sample `lo * hop`, the mapping the vocoder itself uses, so no drift accumulates over a long score |
+
+`plan()` records `(utterance, start_frame, stop_frame)` per score utterance as
+internal state — the same pattern as its existing `_frame_units`, so the public
+six-value return signature is unchanged — because Phase 2 is defined per
+utterance and the frame grid is flat across the score.
+
+A source model whose `voiced_threshold` or `f0_ref_hz` differs from the acoustic
+model's is **reported** rather than rejected: the F0 is shared, so the two
+branches derive voicing from the same track and the acoustic branch's decision
+still reaches the vocoder. They cannot fight.
+
+### Source gain
+
+**Phase 2 predicts source shape, not amplitude.** Its generated units carry
+`gains = 1.0`. Phase 3 therefore does not invent a gain model. What it does:
+
+1. every generated unit is scaled to **unit RMS**. This is Phase 1's own storage
+   convention — `SourceSequence.excitation` holds unit-RMS cycles and
+   `SourceSequence.gains` holds the level — so for a Phase-1 analysis it is the
+   identity, and for a generated one it removes the unmodelled amplitude the
+   sampled PCA coefficients arrive with (measured spread on a fitted model: an
+   order of magnitude, i.e. isolated spikes, a clipped filter, and a render
+   several dB quiet after a backend's peak normalisation). Degenerate units
+   — numerically zero, so carrying no shape either — are silenced rather than
+   multiplied by `1/eps`;
+2. `restore_gain=True` then applies the sequence's own `gains`, so a Phase-1
+   analysis (or a future gain predictor) reaches the output through the existing
+   representation with no new field;
+3. the placed waveform is finally scaled to **unit RMS over the samples it
+   covers** — exactly the calibration of the MLSA pulse train it replaces (that
+   train is built to unit mean square at any F0 so the output level tracks
+   `sp`). The measured RMS and the applied scalar are kept on
+   `SourceExcitation` (`source_rms`, `applied_gain`) so the correction is
+   inspectable, not hidden;
+4. `source_gain` (default `1.0`) is a single deliberate scalar on top, exposed
+   as `SynthesisConfig.source_gain`, `hms synth --source-gain`, and the
+   `synthesis:` block of `parameters.yaml`.
+
+Net effect: **loudness stays with the acoustic model.** Measured on the demo
+corpus (32 s, same vocoder, only the excitation swapped), a broadband
+whitened-residual-like source renders at **+7 % RMS** through `builtin` and
+**−11 %** through `mlsa`, with the excitation's crest factor at ~9 against the
+default pulse train's ~6. Without step 1 the same measurement gives −75 % and
+a peak of 10 (clipping) instead of 2.2.
+
+The honest limitation: equalising the *excitation* RMS does not equalise the
+*output* level, because a learned source does not have a pulse train's flat
+spectrum — a deliberately narrow-band source can still come out several dB
+louder, and only a per-unit gain target in the source HMM would fix that. That
+is future work, not something Phase 3 pretends to have.
+
+### API
+
+```python
+from hms.core.model import HMSModel
+from hms.core.synthesizer import Synthesizer, SynthesisConfig
+from hms.source import SourceHMMModel
+
+model = HMSModel.load("model")
+source = SourceHMMModel.load("model-source")
+score = labels.load("corpus/score.tsv")
+
+# ordinary HMS synthesis -- unchanged, bit-identical to before Phase 3
+plain = Synthesizer(model).synthesize(score)
+
+# source-aware synthesis
+result = Synthesizer(model, SynthesisConfig(vocoder="mlsa", source_gain=1.0)
+                     ).synthesize(score, source_model=source)
+result.source            # SourceExcitation: excitation, support, weights,
+                         # coverage, voiced, n_units, source_rms, applied_gain
+result.source.summary()  # one-line diagnostic
+```
+
+```bash
+hms synth --model model --score score.tsv --out song.wav \
+          --source-model model-source --vocoder mlsa [--source-gain 1.0]
+```
+
+`source_model=` follows the same convention as the existing `f0=`: it is
+per-render data, not a voice setting, so it is a `synthesize` argument rather
+than a `SynthesisConfig` field and it is not needed by anyone who does not train
+a source model. `SynthesisResult.source` is an additive field that is `None`
+for an ordinary render.
+
+### Which backends are supported
+
+| backend | source-aware synthesis | why |
+|---|---|---|
+| `builtin` | yes | pure-numpy: it builds its own pulse/noise excitation, so it can be handed one |
+| `mlsa` | yes | same: fractional-position pulse train plus noise, mixed per bin |
+| `native` (WORLD) | no | `Synthesis(f0, sp, ap)` takes no excitation |
+| `pyworld` | no | same |
+
+Support is an explicit capability, `Vocoder.supports_external_excitation`
+(default `False`) plus `Vocoder.synthesize_with_excitation(...)`, which raises
+`VocoderUnavailable` naming the backends that do support it. The synthesizer
+turns a refusal into a `ValueError` before rendering anything rather than
+silently dropping the caller's source model. A new backend only has to override
+the flag and splice the waveform into whatever excitation it already builds.
+
+### Tests
+
+`hms/tests/test_source_synthesis.py` (32 tests) covers: the ordinary path
+unchanged without a source model; both numpy backends rendering a tiny Phase-2
+model; the learned source actually changing the audio; frame-count,
+sample-rate and frame-period agreement; F0 identity between the branches;
+rejection of a wrong-length / non-finite / negative F0 and of a render longer
+than its frame grid; unit spans staying inside the utterance and never crossing
+a voiced/unvoiced gap; an all-unvoiced score rendering **bit-identically** to
+the ordinary path; the one-frame continuous transition; unit-RMS calibration;
+amplitude staying in the same ballpark and tracking `source_gain`
+monotonically; determinism; finite output of the expected sample count; refusal
+by a backend that cannot filter an excitation; and an end-to-end
+labels + F0 → acoustic model → source model → excitation → filter → waveform
+render.
 
 ## Where the code lives
 
@@ -388,12 +577,15 @@ compatibility, and YAML/NPZ save/load.
 |---|---|
 | `hms/source/base.py` | `SourceFrame`, `SourceSequence`, `SourceModel`, `assign_frame_noise` |
 | `hms/source/residual.py` | mel-cepstrum whitening / inverse filtering |
-| `hms/source/cycles.py` | epoch tracking, cycle extraction, resampling, placement |
+| `hms/source/cycles.py` | epoch tracking, cycle extraction, resampling, placement, unit support / frame coverage |
 | `hms/source/voice.py` | `VoiceSourceModel`, `estimate_f0`, `smooth_f0` |
 | `hms/source/generic.py` | `GenericResidualSourceModel` (pitch-free backend) |
 | `hms/source/pca.py` | `SourcePCA` (fit / encode / decode / save / load / report) |
 | `hms/source/trainer.py` | Phase-2 examples, alignment, PCA reuse, phone/context HMM/GMM training |
 | `hms/source/hmm.py` | F0-conditioned prediction, MLPG, Phase-1 decoding, separate save/load |
+| `hms/source/synthesis.py` | Phase-3 excitation rendering, coverage/weights, geometry checks |
+| `hms/vocoder/base.py` | `Vocoder`, `render_length`, `blend_excitation`, the external-excitation capability |
 | `tools/bench_source_pca.py` | the Phase-1 reconstruction experiment above |
 | `hms/tests/test_source_cycles.py`, `test_source_pca.py`, `test_source_model.py` | Phase-1 cycle, PCA, API and reconstruction tests |
 | `hms/tests/test_source_hmm.py` | Phase-2 alignment, context, F0, generation and serialization tests |
+| `hms/tests/test_source_synthesis.py` | Phase-3 source-aware synthesis integration tests |
