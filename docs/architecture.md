@@ -41,6 +41,19 @@ score phones ─► hms.core.synthesizer.plan ─► HMM/GMM ─► MLPG ─► 
                                                               is used
 ```
 
+Phase 2 adds a **separate** source-parameter branch over the Phase-1 source
+representation. It is not called by the current synthesis pipeline:
+
+```
+labelled phones/context + explicit frame F0
+                 └─► source HMM/GMM ─► MLPG ─► PCA coefficients
+                                                └─► Phase-1 PCA decoder ─► source units
+```
+
+The source tier has its own singer-specific files and strict frame/F0 checks.
+It does not alter `HMSModel`, acoustic HMMs, `Synthesizer`, `FeatureSpec`'s
+acoustic dimensions, or vocoder backends.
+
 ## Why HMM/GMM in 2020s terms
 
 An HMM with Gaussian mixtures is a *small, interpretable, trainable-from-almost-
@@ -665,8 +678,10 @@ pitch.npz       the same for the pitch-conditioned models (only written when
 ```
 
 YAML for anything a human might want to read or tweak, `.npz` for the arrays.
-`HMSModel.save/load` is the only serialisation code in the project, and the
-loader validates the format version. The current format is 4; each version is
+`HMSModel.save/load` is the serialization path for the acoustic tier; its
+loader validates the format version. (The separate Phase-2 source predictor
+uses its own `source.yaml` + NPZ format, documented below.) The current acoustic
+format is 4; each version is
 additive over the previous one (2 = baseline, 3 = the context tier, 4 = the
 pitch-conditioned tier), so format-2 and format-3 models keep loading — with an
 empty tier and, for pitch conditioning, `enabled: false` recorded. The additive
@@ -711,6 +726,40 @@ records its own `bin_size` (and `bin_unit`), synthesis needs no training
 configuration to interpret a bin, and a bucket can be checked against the notes
 it stands for straight from the file.
 
+## Phase 2 source model (standalone)
+
+The source predictor is implemented under `hms/source/`, alongside—not inside—
+the generic acoustic HMM tier. `SourceTrainer` consumes Phase-1
+`SourceSequence` objects, the existing `SourcePCA`, a labelled `Utterance`, and
+an optional authoritative F0 track. It overlap-aligns per-cycle/per-frame PCA
+coefficients onto the source analysis frame grid, derives the configured HMS
+static/delta streams, then reuses `LeftToRightHMM`, `DiagGMM`, `DurationModel`,
+`hms.core.context` and the banded `mlpg` solver.
+
+The source observation vector is the PCA coefficient stream (plus its dynamic
+streams). When enabled, phone context selects a sparse triphone/diphone HMM;
+context symbols are not appended as an unbounded numeric feature vector. Each
+state has a small mixture-gated ridge regression from three per-frame F0
+features—normalized
+semitone log-F0, its within-voiced-run delta, and a voiced flag—to its source
+statistics. This makes F0 trajectories explicit while retaining the shared
+HMM/GMM/MLPG infrastructure. A supplied track is never resized or pitch-clamped;
+its sample rate, frame period and frame count must match the source data.
+
+`SourceHMMModel.generate` returns both frame-aligned PCA coefficients and a
+Phase-1 `SourceSequence` decoded through the saved PCA basis. It is deterministic
+and does not sample. `voice` maps the trajectory to pitch-cycle units and leaves
+unvoiced excitation to the existing downstream noise path; `residual` maps it to
+frame-synchronous units and can model unvoiced residual shapes. The current
+result is an excitation/source waveform only, not filtered audio. Gains are
+neutral; the source predictor does not model amplitude.
+
+The separate source directory contains `source.yaml`, `source_hmms.npz`, and
+`source_pca.npz`. It does not change `HMSModel.save/load`, acoustic model files,
+the synthesizer, or vocoder APIs. Training controls, usage and remaining scope
+are documented in [source_model.md](source_model.md); focused tests live in
+`hms/tests/test_source_hmm.py`.
+
 ## 10. Design trade-offs (what is deliberately missing)
 
 | decision | why |
@@ -751,15 +800,15 @@ it stands for straight from the file.
   replaces the generated contour. It is deliberately not a `SynthesisConfig`
   field: the trajectory is render-specific data, not a voice setting, and the
   whole override is one conversion function plus one branch in `synthesize`.
-* **The source / excitation** — `hms/source` (Phase 1, analysis only) gives the
-  excitation its own representation next to the spectral one:
-  `SourceModel.analyze` turns audio into pitch-synchronous residual cycles
+* **The source / excitation** — `hms/source` keeps Phase-1 analysis/PCA and the
+  Phase-2 source HMM/GMM predictor separate from the acoustic tier.
+  `SourceModel.analyze` extracts pitch-synchronous cycles
   (`VoiceSourceModel`) or frame-synchronous residual units
   (`GenericResidualSourceModel`), `SourcePCA` compresses them, and
-  `SourceFrame`/`SourceSequence` carry them on the same frame grid the acoustic
-  features use. Nothing in this pipeline calls it yet — see
-  [docs/source_model.md](source_model.md) for what is there, what was measured,
-  and what a source-aware synthesis phase would have to add.
+  `SourceTrainer` / `SourceHMMModel` predict those coefficients from phone
+  context and explicit F0. The standalone predictor is not called by the current
+  full-audio synthesis pipeline; see [docs/source_model.md](source_model.md) for
+  training, generation, tests, and the remaining source/vocoder integration work.
 * **A different conditioning variable** — the pitch bins are one instance of a
   general shape: `hms/core/pitch_condition.py` owns the mapping from a scored
   segment to an integer condition, `HMSModel.resolve_unit(…, pitch_bin=…)` owns

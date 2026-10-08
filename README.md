@@ -293,19 +293,22 @@ the requested note/F0 is still taken from the score; GV of the note-relative F0
 feature only affects the optional acoustic-deviation mode. For a synthetic
 performance/variance check, run `python tools/bench_gv.py --frames 1000 --dim 30`.
 
-## Source models (Phase 1, experimental)
+## Source models (Phase 1 representation + Phase 2 predictor)
 
-HMS models the filter with the HMM/GMM and leaves the source to the vocoder.
-`hms/source` adds a *representation* of the excitation — pitch-synchronous
-residual cycles, normalised to fixed-length vectors, compressed by a NumPy-only
-PCA — as the first phase of a source-aware architecture. It is analysis and
-validation only: nothing in the trainer, parameter generation or vocoders calls
-it, and the existing synthesiser is unchanged. `python tools/bench_source_pca.py`
-measures how much of a cycle survives a handful of coefficients (a steady note:
-~6 % relative error with 8 coefficients; mixed material: ~56 %, the difference
-being the pitch/phoneme conditioning a later phase would learn). See
-[docs/source_model.md](docs/source_model.md) for the design, the numbers and the
-measured trade-offs.
+HMS models the filter with the acoustic HMM/GMM and leaves source/vocoder
+integration unchanged. Phase 1 provides pitch-synchronous or frame-synchronous
+source units and a NumPy PCA; Phase 2 adds a standalone HMM/GMM predictor over
+those existing PCA coefficients, optionally selected by sparse phone context
+and conditioned on an explicit frame-level F0 trajectory. It can train,
+save/load and generate a Phase-1 `SourceSequence`, but does not yet connect to
+full-audio synthesis or predict source gain. Use `SourceTrainer`,
+`SourceTrainingExample` and `SourceHMMModel` from `hms.source`; explicit F0
+must match the source analysis frame grid and is never silently resized.
+`python tools/bench_source_pca.py`
+measures representation reconstruction (a steady note: ~6 % relative error
+with 8 coefficients; mixed material: ~56 %). See
+[docs/source_model.md](docs/source_model.md) for the training/generation flow,
+serialization format, limitations and Phase-1 measurements.
 
 ## Data format
 
@@ -477,8 +480,8 @@ notes really are the requested ones.
 See [docs/architecture.md](docs/architecture.md) for the pipeline, the feature
 layout, the HMM/GMM/training design, the note-conditioned pitch model, and the
 trade-offs behind each choice, and [docs/source_model.md](docs/source_model.md)
-for the Phase 1 source/excitation representation (analysis only — it is not part
-of the synthesiser yet). `hms/model/…` is a small system on purpose; the
+for the Phase 1 source/excitation representation and Phase 2 standalone source
+predictor (still not wired into the synthesizer). `hms/model/…` is a small system on purpose; the
 documentation tries to explain *why* each piece looks the way it does.
 
 ## Limitations
