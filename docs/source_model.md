@@ -1,32 +1,30 @@
-# Source/excitation model (Phase 1)
+# Source/excitation model (Phase 1 representation + Phase 2 predictor)
 
-HMS has always modelled the **filter**: a mel-cepstrum envelope per frame, learned
-by the HMM/GMM. The **source** was left to the vocoder, which invents it from
-scratch (a pulse train plus noise mixed by the aperiodicity). That is a good
-synthesiser, but the excitation is a fixed recipe rather than something a model
-can learn, and the recipe only knows how to be a voice.
+HMS has traditionally modelled the **filter**: a mel-cepstrum envelope per
+frame, learned by the acoustic HMM/GMM. The **source** was left to the vocoder,
+which invents it from scratch (a pulse train plus noise mixed by the
+aperiodicity). Phase 1 added a generic source representation, analysis backends
+and NumPy PCA. Phase 2 now adds a separate statistical predictor over those
+existing PCA coefficients.
 
-This document covers **Phase 1 of a source-aware HMS**: a generic representation
-of the excitation, a first (voice) backend that extracts it from real audio, a
-NumPy PCA that compresses it, and the measurements that say how much survives.
-It is deliberately *analysis only* — nothing in the trainer, the parameter
-generator or the vocoder calls any of it, so the existing synthesiser is
-unchanged bit for bit.
+The source model remains deliberately separate from the acoustic trainer,
+parameter generator, synthesizer and vocoder. Phase 2 can train, save, load and
+generate a source trajectory, but it does not wire that trajectory into full
+audio synthesis; existing acoustic and vocoder APIs remain unchanged.
 
-The eventual architecture, once a later phase learns a model over these
-parameters, is
+The intended paired architecture is
 
 ```
-                 ┌── spectral model ──→ spectral envelope ──┐
-    HMM output ──┤                                           ├─→ filter ─→ audio
-                 └── source model ────→ excitation ─────────┘
+labels + explicit F0 ──► source HMM/GMM ──► PCA coefficients ──► excitation ─┐
+                                                                          ├─► filter ─► audio
+labels (+ score F0) ───► acoustic HMM/GMM ─► spectral envelope / AP ──────┘
 ```
 
-i.e. the HMM output is *split*: one half stays what it is today (mel-cepstrum +
-aperiodicity → spectral envelope), the other half describes the excitation and
-drives a source generator in front of the same filter. Phase 1 builds the right
-half's data path and proves it carries information; Phase 2 would give it
-parameters a model can generate.
+The acoustic branch remains as it is today. The new source branch predicts the
+Phase-1 representation independently from phoneme/context labels and an
+explicit frame-level F0 trajectory. A future integration phase can decide how
+to combine the two branches without changing the source representation or
+redefining the acoustic APIs.
 
 ## Pipeline
 
@@ -46,8 +44,10 @@ audio ──► F0 (supplied, or estimated) ──► epochs ──► inverse f
   pure-NumPy autocorrelation + spectral-flatness estimator the fallback vocoder
   uses (`hms.core.dsp`), with a source-side variant that can trade time
   resolution for low-pitch robustness (`f0_window_periods`, see below).
-  Non-finite, negative and out-of-range values become unvoiced or are clamped —
-  a bad track costs cycle spacing, never a malformed vector.
+  The Phase-1 analyzer sanitizes non-finite/negative and out-of-range values
+  for cycle extraction. The Phase-2 predictor is stricter: an explicit track
+  must be finite and non-negative, is never clamped or resized, and uses the
+  configured threshold only to derive voicing.
 * **Epochs** are found by *phase accumulation* over the per-sample period, not
   by picking periods independently: an F0 jump changes the slope of the phase,
   it cannot make epochs run backwards or jump a whole period. Each voiced run
@@ -199,16 +199,19 @@ How to read it:
 * **Across mixed material, 4–8 coefficients are a coarse sketch.** Pooled over
   every cycle in the corpus (different notes, vowels and consonants, half of
   them *unseen* by the fit) 8 coefficients give relative RMSE 0.56 /
-  correlation 0.81; conditioning on the pitch alone (per-pitch groups, which is
-  what a Phase 2 source model conditioning on the note would provide) improves
-  that to 0.28–0.53 relative RMSE with explained variance 0.89–0.96. 16
-  coefficients reach 0.40 pooled and 0.15–0.42 per pitch.
+  correlation 0.81; conditioning on pitch alone (per-pitch groups, an oracle
+  rather than a predictor) improves that to 0.28–0.53 relative RMSE with
+  explained variance 0.89–0.96. Phase 2 adds an explicit F0-conditioned
+  predictor, but these benchmark figures remain representation measurements,
+  not a quality claim for the trained predictor. 16 coefficients reach 0.40
+  pooled and 0.15–0.42 per pitch.
 * **The residual loss is conditioning, not capacity.** The same 8 coefficients
   give 0.06 relative RMSE inside one steady stretch and 0.56 on the whole
   corpus. What separates the two is that the corpus mixes excitation shapes from
-  different pitches, vowels and consonant transitions; a source model that
-  conditions on those (an HMM over source coefficients, coupled to the spectral
-  model) is exactly what Phase 2 would add.
+  different pitches, vowels and consonant transitions; Phase 2 now models those
+  dependencies in a separate HMM/GMM over source coefficients, selected by
+  phone context and conditioned on explicit per-frame F0. It remains independent
+  of the acoustic HMM and is not yet coupled into full waveform synthesis.
 * Note that `mean_correlation` and relative RMSE are different lenses on the
   same thing: a relative RMSE of 0.5 corresponds to a correlation of ~0.86
   (measured at k=12: 0.496 / 0.860 — relative RMSE is an energy error, the
@@ -255,22 +258,129 @@ level loss and it exists only for periods longer than `cycle_length` samples
 (a 200-sample cycle resampled to 128 loses ~19 % of its RMS; see
 `hms/tests/test_source_cycles.py`).
 
-## What Phase 1 does not do
+## Phase 2: context- and F0-conditioned coefficient prediction
 
-* No HMM is trained on the source coefficients, and the acoustic parameter model
-  is untouched.
-* Nothing in `hms.core.synthesizer`, `hms.core.generation` or the vocoders calls
-  the source model. `SourceModel.synthesize` renders the *excitation* on the
-  sample grid — it is a validation path, not a new vocoder.
-* Unvoiced excitation is not modelled: unvoiced frames are marked (noise level
-  1.0) but their excitation is still the vocoder's noise.
-* The representation is band-limited to `cycle_length / 2` harmonics per period,
-  and the residual is a zero-phase inverse-filter output, not a claimed glottal
-  flow estimate. A minimum-phase inverse filter would not change what the PCA
-  can represent here (measured: no gain over the zero-phase division).
-* Conditioning the source model on pitch, phoneme or context is left to the
-  phase that learns it — the numbers above say that is where the remaining
-  error lives.
+Phase 2 lives in `hms/source/trainer.py` and `hms/source/hmm.py`. It consumes
+Phase-1 `SourceSequence` units and the existing `SourcePCA`; it does **not**
+change source analysis, create a new representation, or modify the acoustic
+HMS model.
+
+### Training flow
+
+1. `SourceTrainingExample` pairs one `Utterance`, one Phase-1 `SourceSequence`,
+   and an optional explicit F0 track. If the track is omitted, the sequence's
+   existing `source.f0` is used. `SourceTrainingExample.from_audio(...)` is only
+   a convenience wrapper around the selected Phase-1 analyzer.
+2. A supplied `SourcePCA` is reused unchanged. If none is supplied,
+   `SourceTrainingConfig.pca_components` controls a call to the existing
+   `SourcePCA.fit` (default: 8).
+3. The PCA coefficients on source units are overlap-resampled to the analysis
+   frame grid: each unit contributes according to its sample overlap with
+   `[frame * hop, (frame + 1) * hop)`. Multiple fast units are averaged, a
+   longer pitch cycle contributes to each covered frame, and uncovered frames
+   stay invalid—there is no interpolation across missing units or unvoiced
+   holes. Training uses only labelled frames with valid source coverage.
+4. The normalized static coefficient stream and its optional HMS delta and
+   delta-delta streams are collected by phone occurrence. The existing
+   `LeftToRightHMM` / `DiagGMM` and `DurationModel` train the phone units. The
+   sparse context tier reuses `hms.core.context`: observed exact triphones and,
+   when enabled, one-sided diphones are kept only when their configured frame
+   and occurrence thresholds are met. Selection falls back through triphone,
+   best-supported diphone, phone, class backoff and optional global backoff.
+5. Each HMM state gets component-gated, regularized linear regressions from the
+   explicit F0 features to the static/dynamic PCA observation means. The F0
+   input is normalized semitone log-F0 relative to `FeatureSpec.f0_ref_hz`, its
+   first HMS delta, and an explicit voiced flag. Delta calculation is confined
+   to voiced runs so an unvoiced gap cannot create a large artificial pitch
+   jump. The source HMM's observation dimension is only
+   `pca.n_components * number_of_dynamic_streams`; categorical context is used
+   for HMM selection, not concatenated into the GMM vector.
+
+The explicit F0 track is authoritative: it must be finite, non-negative, and
+one value per source analysis frame; it is never estimated, clamped, stretched,
+or silently resized by the Phase-2 trainer or generator. Use `0 Hz` for
+unvoiced frames (values at or below the configured voiced threshold are also
+treated as unvoiced). Sample rate and frame period must match the `FeatureSpec`; there
+is no implicit resampling. When creating examples from audio, pass the F0 track
+on the exact frame grid returned by that Phase-1 analyzer.
+
+Example (the variables `utterances`, `waveforms`, `f0_tracks`, `spec`, and
+`phoneme_set` come from the caller's existing data pipeline):
+
+```python
+from hms.source import (SourceTrainer, SourceTrainingConfig,
+                        SourceTrainingExample, get_source_model)
+
+analyzer = get_source_model(
+    "voice", cycle_length=128, fs=spec.fs,
+    frame_period=spec.frame_period, n_mcep=spec.n_mcep)
+examples = [
+    SourceTrainingExample.from_audio(
+        utt, audio, analyzer, fs=spec.fs, frame_period=spec.frame_period,
+        f0_hz=f0)
+    for utt, audio, f0 in zip(utterances, waveforms, f0_tracks)
+]
+config = SourceTrainingConfig(
+    pca_components=8, context_enabled=True,
+    context_min_frames=100, context_min_occurrences=3)
+model = SourceTrainer(spec, phoneme_set, config).fit(
+    examples, pca=phase1_pca, name="singer-a")
+model.save("models/singer-a-source")
+```
+
+### Generation and Phase-1 decoding
+
+`SourceHMMModel.generate(utterance, f0_hz)` deterministically resolves the
+labelled phone contexts, allocates each active phone's frames to HMM states by
+`DurationModel` proportions, predicts the state/component moments from the
+explicit F0 trajectory, and calls the existing banded MLPG solver for a smooth
+coefficient path. It returns a `SourcePrediction` with frame-aligned
+`frame_coefficients`, F0/voicing/active/state/phone tracks, and a Phase-1
+`SourceSequence` in `.sequence`.
+
+The sequence stores PCA-decoded vectors on the Phase-1 backend's native unit
+grid: pitch cycles for `voice`, frame groups for `residual`. The `voice` backend
+does not invent cycles in unvoiced frames; the existing downstream source or
+vocoder path remains responsible for their noise. The frame-synchronous
+`residual` backend can predict residual units in voiced and unvoiced labelled
+regions. Generated unit gains are neutral (`1.0`): Phase 2 predicts source
+shape coefficients, not the Phase-1 gain track or a separate amplitude model.
+
+The returned vectors remain usable through the existing Phase-1 decoder API:
+
+```python
+prediction = model.generate(utterance, f0_hz=target_f0)
+excitation = analyzer.synthesize(prediction.sequence, pca=model.pca)
+# Or reload the standalone source tier later:
+from hms.source import SourceHMMModel
+loaded = SourceHMMModel.load("models/singer-a-source")
+```
+
+`excitation` here is still only the source waveform on the sample grid; this is
+not yet full filtered audio, and no `Synthesizer`, acoustic model format, or
+vocoder backend has been changed. The `seed` argument is retained for API
+parity, but MLPG prediction is deterministic and does not sample.
+
+### Separate model format and current scope
+
+A source tier saves as a standalone directory containing `source.yaml`,
+`source_hmms.npz`, and `source_pca.npz`. YAML stores geometry, F0/coefficient
+normalization, context/backoff indexes and training options; numeric HMM/GMM and
+F0-regression arrays and the Phase-1 PCA basis are stored as NPZ without pickle.
+This keeps singer-specific source data separate from the generic acoustic HMS
+model.
+
+The Phase-1 representation remains band-limited to `cycle_length / 2`
+harmonics per period, and its residual is a zero-phase inverse-filter output,
+not a claimed glottal-flow estimate. Phase 2 does not predict Phase-1 unit gains,
+connect to the acoustic spectral envelope/vocoder, infer an F0 track when none
+is supplied, or add new pitch/vibrato modelling. These are deliberate later
+integration/modeling decisions, not alternate source representations.
+
+`hms/tests/test_source_hmm.py` covers overlap alignment, F0 validation and
+pitch-change features, sparse context selection, configurable PCA size,
+voiced/unvoiced behavior, deterministic MLPG generation, PCA decoder
+compatibility, and YAML/NPZ save/load.
 
 ## Where the code lives
 
@@ -282,5 +392,8 @@ level loss and it exists only for periods longer than `cycle_length` samples
 | `hms/source/voice.py` | `VoiceSourceModel`, `estimate_f0`, `smooth_f0` |
 | `hms/source/generic.py` | `GenericResidualSourceModel` (pitch-free backend) |
 | `hms/source/pca.py` | `SourcePCA` (fit / encode / decode / save / load / report) |
-| `tools/bench_source_pca.py` | the experiment above |
-| `hms/tests/test_source_cycles.py`, `test_source_pca.py`, `test_source_model.py` | the unit tests (85 tests: cycles, PCA, model API and reconstruction) |
+| `hms/source/trainer.py` | Phase-2 examples, alignment, PCA reuse, phone/context HMM/GMM training |
+| `hms/source/hmm.py` | F0-conditioned prediction, MLPG, Phase-1 decoding, separate save/load |
+| `tools/bench_source_pca.py` | the Phase-1 reconstruction experiment above |
+| `hms/tests/test_source_cycles.py`, `test_source_pca.py`, `test_source_model.py` | Phase-1 cycle, PCA, API and reconstruction tests |
+| `hms/tests/test_source_hmm.py` | Phase-2 alignment, context, F0, generation and serialization tests |

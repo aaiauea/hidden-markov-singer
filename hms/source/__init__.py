@@ -1,36 +1,28 @@
-"""Source/excitation models (Phase 1: representation and analysis).
+"""Source/excitation analysis (Phase 1) and standalone prediction (Phase 2).
 
-HMS has always modelled the *filter* (a mel-cepstrum envelope per frame) and
-left the *source* to the vocoder.  This package adds a representation for the
-source itself, so that a later phase can model it next to the spectral model::
+HMS has traditionally modelled the *filter* (a mel-cepstrum envelope per frame)
+and left the *source* to the vocoder. Phase 1 added a generic source-vector
+representation, pitch-synchronous and frame-synchronous analyzers, and NumPy
+PCA. Phase 2 adds a separate HMM/GMM predictor over the existing PCA
+coefficients. It does not change the acoustic trainer, synthesizer or vocoder::
 
-                 ┌── spectral model ──→ spectral envelope ──┐
-    HMM output ──┤                                           ├─→ filter ─→ audio
-                 └── source model ────→ excitation ─────────┘
-
-Phase 1 is analysis and validation only: nothing here is called by the trainer,
-the parameter generator or the vocoder, so the existing synthesiser is bit-for-bit
-unchanged.  What exists now is
-
-    audio ──► source cycles (128 samples) ──► PCA coefficients (4-16)
-                                                │
-                                                └──► reconstructed cycles
+labels + explicit F0 ──► source HMM/GMM ──► PCA coefficients ──► excitation
+labels ────────────────► acoustic HMM/GMM ─► spectral envelope / AP ─► filter
 
 * :class:`~hms.source.base.SourceFrame` / :class:`~hms.source.base.SourceSequence`
   -- the generic, backend-independent representation.
 * :class:`~hms.source.base.SourceModel` -- the interface a source backend
   implements (``analyze`` plus the shared ``encode``/``decode``/``synthesize``).
-* :class:`~hms.source.voice.VoiceSourceModel` -- pitch-synchronous residual
-  cycles (`get_source_model("voice")`), the first concrete backend.
-* :class:`~hms.source.generic.GenericResidualSourceModel` -- the pitch-free,
-  frame-synchronous residual (`get_source_model("residual")`), which is what a
-  non-voice source can start from.
-* :class:`~hms.source.pca.SourcePCA` -- NumPy-only PCA over the source vectors,
-  with save/load and reconstruction measurement.
+* :class:`~hms.source.voice.VoiceSourceModel` and
+  :class:`~hms.source.generic.GenericResidualSourceModel` -- the Phase-1
+  pitch-synchronous and frame-synchronous backends.
+* :class:`~hms.source.pca.SourcePCA` -- NumPy-only PCA over the source vectors.
+* :class:`~hms.source.trainer.SourceTrainer` and
+  :class:`~hms.source.hmm.SourceHMMModel` -- Phase-2 training, F0-conditioned
+  prediction, PCA decoding and separate model save/load.
 
-See ``docs/source_model.md`` for the design and ``tools/bench_source_pca.py`` for
-the reconstruction experiment (cycles -> coefficients -> cycles, MSE per number
-of components).
+See ``docs/source_model.md`` for both phases and ``tools/bench_source_pca.py``
+for the Phase-1 reconstruction experiment.
 """
 
 from __future__ import annotations
@@ -46,6 +38,10 @@ from hms.source.generic import GenericResidualSourceModel
 from hms.source.pca import DEFAULT_N_COMPONENTS, SourcePCA
 from hms.source.residual import inverse_filter, spectral_envelope, whiten
 from hms.source.voice import VoiceSourceModel, estimate_f0, smooth_f0
+from hms.source.hmm import (SourceF0Regressor, SourceHMMModel, SourcePrediction,
+                            align_source_coefficients, f0_condition_features)
+from hms.source.trainer import (SourceTrainer, SourceTrainingConfig,
+                                SourceTrainingExample)
 
 #: Registered backends, in the order `get_source_model` considers them.
 SOURCE_BACKENDS = ("voice", "residual")
@@ -54,7 +50,10 @@ _MODELS = {"voice": VoiceSourceModel, "residual": GenericResidualSourceModel}
 
 __all__ = [
     "SourceFrame", "SourceSequence", "SourceModel", "SourcePCA", "CycleSet",
-    "VoiceSourceModel", "GenericResidualSourceModel", "get_source_model",
+    "SourceHMMModel", "SourcePrediction", "SourceF0Regressor", "SourceTrainer",
+    "SourceTrainingConfig", "SourceTrainingExample", "align_source_coefficients",
+    "f0_condition_features", "VoiceSourceModel", "GenericResidualSourceModel",
+    "get_source_model",
     "available_backends", "SOURCE_BACKENDS", "DEFAULT_CYCLE_LENGTH",
     "MIN_CYCLE_LENGTH", "DEFAULT_N_COMPONENTS", "pick_epochs", "extract_cycles",
     "resample_cycle", "place_cycles", "noise_level", "impulsiveness", "whiten",
