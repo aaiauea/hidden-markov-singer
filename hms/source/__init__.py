@@ -20,9 +20,12 @@ labels ────────────────► acoustic HMM/GMM ─�
 * :class:`~hms.source.trainer.SourceTrainer` and
   :class:`~hms.source.hmm.SourceHMMModel` -- Phase-2 training, F0-conditioned
   prediction, PCA decoding and separate model save/load.
+* :mod:`hms.source.synthesis` -- Phase 3: renders a Phase-2 prediction as an
+  excitation on the sample grid, which a vocoder backend can splice into its
+  filter (``Synthesizer.synthesize(..., source_model=...)``).
 
-See ``docs/source_model.md`` for both phases and ``tools/bench_source_pca.py``
-for the Phase-1 reconstruction experiment.
+See ``docs/source_model.md`` for all three phases and
+``tools/bench_source_pca.py`` for the Phase-1 reconstruction experiment.
 """
 
 from __future__ import annotations
@@ -31,9 +34,10 @@ from typing import Dict, Optional
 
 from hms.source.base import (DEFAULT_CYCLE_LENGTH, MIN_CYCLE_LENGTH, SourceFrame,
                              SourceModel, SourceSequence)
-from hms.source.cycles import (CycleSet, extract_cycles, impulsiveness,
-                               noise_level, pick_epochs, place_cycles,
-                               resample_cycle)
+from hms.source.cycles import (CycleSet, extract_cycles, frame_coverage,
+                               impulsiveness, noise_level, pick_epochs,
+                               place_cycles, resample_cycle,
+                               unit_support_mask)
 from hms.source.generic import GenericResidualSourceModel
 from hms.source.pca import DEFAULT_N_COMPONENTS, SourcePCA
 from hms.source.residual import inverse_filter, spectral_envelope, whiten
@@ -42,6 +46,12 @@ from hms.source.hmm import (SourceF0Regressor, SourceHMMModel, SourcePrediction,
                             align_source_coefficients, f0_condition_features)
 from hms.source.trainer import (SourceTrainer, SourceTrainingConfig,
                                 SourceTrainingExample)
+from hms.source.synthesis import (SourceExcitation, frame_hop,
+                                  normalize_units, render_length,
+                                  render_score_source_excitation,
+                                  render_source_excitation,
+                                  source_model_diagnostics,
+                                  source_model_is_compatible)
 
 #: Registered backends, in the order `get_source_model` considers them.
 SOURCE_BACKENDS = ("voice", "residual")
@@ -54,9 +64,14 @@ __all__ = [
     "SourceTrainingConfig", "SourceTrainingExample", "align_source_coefficients",
     "f0_condition_features", "VoiceSourceModel", "GenericResidualSourceModel",
     "get_source_model",
+    "SourceExcitation", "render_source_excitation",
+    "render_score_source_excitation", "source_model_diagnostics",
+    "source_model_is_compatible", "render_length", "frame_hop",
+    "normalize_units",
     "available_backends", "SOURCE_BACKENDS", "DEFAULT_CYCLE_LENGTH",
     "MIN_CYCLE_LENGTH", "DEFAULT_N_COMPONENTS", "pick_epochs", "extract_cycles",
-    "resample_cycle", "place_cycles", "noise_level", "impulsiveness", "whiten",
+    "resample_cycle", "place_cycles", "unit_support_mask", "frame_coverage",
+    "noise_level", "impulsiveness", "whiten",
     "inverse_filter", "spectral_envelope", "estimate_f0", "smooth_f0",
 ]
 

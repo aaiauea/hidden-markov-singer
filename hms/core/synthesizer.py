@@ -70,12 +70,37 @@ Options that matter in practice (all in `SynthesisConfig`):
     is authoritative: the score note, the learned deviation, the generated
     vibrato and ``pitch_smoothing`` are all skipped for that render.  See
     `external_f0_to_semitones`.
+
+Source-aware synthesis (Phase 3, optional)
+------------------------------------------
+``source_model=`` (argument, not a config field) takes a trained Phase-2
+:class:`hms.source.hmm.SourceHMMModel` and renders the *learned* excitation
+instead of the vocoder's pulse train::
+
+    acoustic parameters (sp, ap, F0)  ─┐
+                                       ├─► filter ─► audio
+    learned source excitation ─────────┘
+
+The seam is the excitation waveform, and only its **periodic** half is
+replaced: the aperiodicity/noise path, the spectral envelope, the timing and
+the F0 are all the ones this module already produced, so unvoiced frames and
+loudness behave exactly as before.  Where the source covers the timeline the
+backend's pulse train is swapped out; everywhere else it is kept, so an
+ordinary render is the special case in which nothing is swapped.
+
+Everything the source branch needs comes from the acoustic branch that already
+ran — the frame count from `plan`, the F0 from the decoded parameters, the
+utterance boundaries from `plan`'s own bookkeeping — and the geometry is
+checked before anything is rendered (`hms.source.synthesis.
+source_model_diagnostics`).  Without ``source_model=`` the source package is
+never imported and the result is bit-identical to what this module has always
+produced.  See `hms.source.synthesis` and ``docs/source_model.md``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -87,6 +112,11 @@ from hms.core.generation import mlpg, stack_streams
 from hms.core.gv import optimize_global_variance
 from hms.core.model import HMSModel
 from hms.core.pitch_condition import effective_note, is_pitch_tier
+from hms.vocoder.base import render_length
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from hms.source.hmm import SourceHMMModel
+    from hms.source.synthesis import SourceExcitation
 
 
 @dataclass
@@ -111,6 +141,12 @@ class SynthesisConfig:
     vocoder: Optional[str] = None      # override the backend
     #: inter-phoneme smoothing of the generated F0, in frames (0 = off)
     pitch_smoothing: int = 0
+    #: Scales the learned source excitation in source-aware synthesis.  It is
+    #: *not* a loudness model: Phase 2 predicts source shape, not amplitude, so
+    #: the rendered excitation is calibrated to the level of the pulse train it
+    #: replaces and this only tilts that.  1.0 leaves the acoustic model's
+    #: loudness (envelope + aperiodicity) exactly as it is.
+    source_gain: float = 1.0
 
     def __post_init__(self) -> None:
         if self.f0_source not in ("score", "acoustic", "state_means"):
@@ -123,8 +159,8 @@ class SynthesisConfig:
                                 "builtin", "mlsa"):
             raise ValueError("vocoder must be auto, native, pyworld, builtin "
                              "or mlsa")
-        numeric = [self.variance_scale, self.gv_weight,
-                   self.pitch_variation, self.tempo, self.transpose]
+        numeric = [self.variance_scale, self.gv_weight, self.pitch_variation,
+                   self.tempo, self.transpose, self.source_gain]
         numeric.extend(v for v in (self.vibrato_depth, self.vibrato_rate)
                        if v is not None)
         try:
@@ -150,6 +186,8 @@ class SynthesisConfig:
             raise ValueError("vibrato_rate must be positive")
         if self.pitch_smoothing < 0:
             raise ValueError("pitch_smoothing must be non-negative")
+        if self.source_gain < 0:
+            raise ValueError("source_gain must be non-negative")
 
 
 @dataclass
@@ -165,6 +203,10 @@ class SynthesisResult:
     durations: np.ndarray              # per frame phoneme segment index
     f0_semitones: np.ndarray           # absolute, NaN when unvoiced
     diagnostics: List[str]
+    #: The learned excitation that drove this render, or ``None`` when the
+    #: render used the ordinary (backend-generated) source.  Additive: it only
+    #: ever exists for source-aware synthesis.
+    source: Optional["SourceExcitation"] = None
 
     @property
     def duration(self) -> float:
@@ -282,6 +324,10 @@ class Synthesizer:
         #: `frame_statistics`/`voicing` use exactly the units `plan` chose
         #: without changing the six-value plan() API.
         self._frame_units = None
+        #: (utterance, start_frame, stop_frame) from the last `plan`; what
+        #: source-aware synthesis feeds to the Phase-2 source model so both
+        #: branches render the same utterances on the same frame grid.
+        self._utterance_spans: List[Tuple[object, int, int]] = []
 
     @property
     def vocoder(self):
@@ -333,6 +379,12 @@ class Synthesizer:
         frame_units = [] if (self.model.contexts or self.model.pitch_models) \
             else None
         self._frame_units = None
+        #: (utterance, start_frame, stop_frame) per score utterance -- the frame
+        #: grid is flat across the score, and Phase 3's source branch is defined
+        #: per utterance, so it needs the same boundaries `plan` chose.  Kept as
+        #: state for exactly the reason `_frame_units` is: the public six-value
+        #: return signature stays as it is.
+        self._utterance_spans = []
         next_segment_id = 0
         duration_rng = np.random.default_rng(config.seed)
         #: pitch-condition bookkeeping for the summary diagnostic
@@ -341,6 +393,7 @@ class Synthesizer:
         pitch_missing_bins: Dict[int, int] = {}
 
         for utterance in score:
+            utterance_start = len(frame_phones)
             if config.duration_mode == "model" or utterance.end <= utterance.start:
                 # no usable timing in the score: let the duration model decide
                 phones = [s.phone for s in utterance.segments] or ["sil"]
@@ -414,6 +467,8 @@ class Synthesizer:
                         frame_units.extend([hmm] * int(count))
                 segment_frames.append(int(sum(counts)))
                 next_segment_id += 1
+            self._utterance_spans.append((utterance, utterance_start,
+                                          len(frame_phones)))
 
         self._frame_units = frame_units
         note_per_frame = np.asarray(notes, dtype=np.float64)
@@ -789,7 +844,9 @@ class Synthesizer:
 
     def synthesize(self, score: labels_module.Score,
                    default_note: float = 60.0,
-                   f0=None) -> SynthesisResult:
+                   f0=None,
+                   source_model: Optional["SourceHMMModel"] = None
+                   ) -> SynthesisResult:
         """Render `score`.
 
         ``f0`` is an optional external F0 trajectory (Hz, one value per
@@ -798,6 +855,16 @@ class Synthesizer:
         skipped -- so the caller is the only source of pitch for that render.
         See `external_f0_to_semitones` for the units, the voicing convention
         and the validation.  With ``f0=None`` (the default) nothing changes.
+
+        ``source_model`` is an optional Phase-2 source model
+        (:class:`hms.source.hmm.SourceHMMModel`).  With it, the render becomes
+        **source-aware**: the learned source replaces the *pulse train* in the
+        excitation wherever the model covers the timeline, while the spectral
+        envelope, the aperiodicity/noise path and the timing stay exactly as
+        they are.  It follows the same convention as ``f0`` -- per-render data,
+        not a voice setting -- and with ``source_model=None`` (the default) the
+        synthesis path is bit-identical to an ordinary HMS render.  See
+        `render_source` and `hms.source.synthesis`.
         """
         config = self.config
         spec = self.model.spec
@@ -847,7 +914,31 @@ class Synthesizer:
         diagnostics.extend(self._out_of_range_pitch_diagnostics(f0_semitones))
 
         parameters = spec.decode(static, f0_semitones=f0_semitones)
-        audio = self.vocoder.synthesize(parameters)
+        # Refuse an unsupported backend before the source branch runs: whether
+        # a vocoder can filter an excitation is a property of the backend, not
+        # of this score or this source model, so there is nothing to gain by
+        # generating source units (HMM state sequence, PCA decode, cycle
+        # placement) only to throw them away.
+        if source_model is not None \
+                and not self.vocoder.supports_external_excitation:
+            raise ValueError(
+                f"the {self.vocoder.name!r} vocoder backend cannot filter a "
+                f"caller-supplied excitation, so it cannot render a "
+                f"Phase-2 source model; select a backend that owns its "
+                f"excitation (--vocoder builtin or --vocoder mlsa)")
+        source = self.render_source(source_model, parameters, diagnostics) \
+            if source_model is not None else None
+        if source is None:
+            audio = self.vocoder.synthesize(parameters)
+        else:
+            diagnostics.append(source.summary())
+            diagnostics.append(
+                f"source excitation: calibrated by {source.applied_gain:.3f} "
+                f"to unit RMS (measured {source.source_rms:.3f}); "
+                f"source_gain={self.config.source_gain:g} is applied on top, "
+                f"the acoustic envelope and aperiodicity still own loudness")
+            audio = self.vocoder.synthesize_with_excitation(
+                parameters, source.excitation, source.weights)
 
         state_sequence = [f"{phone}/{state}"
                           for phone, state in zip(frame_phones, state_ids)]
@@ -856,18 +947,54 @@ class Synthesizer:
             notes=notes, state_ids=np.asarray(state_ids, dtype=np.int64),
             state_sequence=state_sequence,
             durations=np.asarray(segment_ids, dtype=np.int64),
-            f0_semitones=f0_semitones, diagnostics=diagnostics)
+            f0_semitones=f0_semitones, diagnostics=diagnostics, source=source)
+
+    # -- source-aware synthesis (Phase 3) ----------------------------------
+
+    def render_source(self, source_model: "SourceHMMModel",
+                      parameters: AcousticFrameSequence,
+                      diagnostics: List[str]) -> Optional["SourceExcitation"]:
+        """Render the Phase-2 source branch onto this render's frame grid.
+
+        Everything the source branch needs comes from the acoustic branch that
+        already ran: the frame count from `plan`, the F0 from ``parameters.f0``
+        (Hz, ``0`` = unvoiced -- the same track the vocoder will use), and the
+        utterances and their frame spans from `plan`'s own bookkeeping.  The two
+        branches therefore agree on sample rate, frame period, frame count, F0,
+        voicing and duration by construction rather than by convention; the
+        geometry checks in `source_model_diagnostics` are what turn a mismatch
+        into an error instead of a silently stretched excitation.
+        """
+        from hms.source.synthesis import (render_score_source_excitation,
+                                          source_model_diagnostics)
+
+        spec = self.model.spec
+        diagnostics.extend(source_model_diagnostics(self.model, source_model))
+        n_samples = render_length(len(parameters.f0), spec.frame_period,
+                                  spec.fs)
+        source = render_score_source_excitation(
+            source_model, self._utterance_spans, parameters.f0, n_samples,
+            mixture="mean" if self.config.mixture == "marginal" else "dominant",
+            source_gain=float(self.config.source_gain))
+        if not self._utterance_spans:
+            diagnostics.append("source-aware synthesis: the score produced no "
+                               "utterance spans, so no learned source was "
+                               "rendered")
+        return source
 
 
 def synthesize(model: HMSModel, score: labels_module.Score,
                config: Optional[SynthesisConfig] = None,
                default_note: float = 60.0, f0=None,
+               source_model: Optional["SourceHMMModel"] = None,
                log=None) -> SynthesisResult:
     """Functional entry point used by the CLI.
 
     ``f0`` is the optional external F0 trajectory (Hz, one value per synthesis
     frame, 0.0 for unvoiced) that replaces the generated contour; see
-    `external_f0_to_semitones`.
+    `external_f0_to_semitones`.  ``source_model`` is the optional Phase-2 source
+    model that turns the render into source-aware synthesis; see
+    `Synthesizer.synthesize`.
     """
     return Synthesizer(model, config, log).synthesize(
-        score, default_note=default_note, f0=f0)
+        score, default_note=default_note, f0=f0, source_model=source_model)

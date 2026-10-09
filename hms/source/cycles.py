@@ -435,6 +435,65 @@ def place_cycles(cycles: np.ndarray, epochs: np.ndarray, periods: np.ndarray,
     return out / np.maximum(weight, 1.0)
 
 
+def unit_support_mask(epochs: np.ndarray, periods: np.ndarray,
+                      n_samples: int) -> np.ndarray:
+    """``(n_samples,)`` bool: the samples at least one source unit spans.
+
+    ``place_cycles`` answers "what does the source look like"; this answers the
+    other half of the question a renderer needs, "where does it exist".  A
+    pitch-synchronous source does not tile the timeline: unvoiced gaps, the
+    samples of the last frame after the final epoch, and the stretch past the
+    end of the render are all *uncovered*, and a synthesis backend has to keep
+    its own excitation there rather than treating the silence as a source.
+
+    Units may overlap (a frame-synchronous backend with ``unit_frames > 1``, or
+    a placed sequence that was not re-extracted), so coverage is a boolean OR,
+    not a sum.  Out-of-range and non-positive spans are skipped instead of
+    raising: a malformed unit must not make the whole render invalid.
+    """
+    n_samples = max(0, int(n_samples))
+    mask = np.zeros(n_samples, dtype=bool)
+    if n_samples == 0:
+        return mask
+    starts = np.asarray(epochs, dtype=np.int64).reshape(-1)
+    periods = np.asarray(periods, dtype=np.int64).reshape(-1)
+    if starts.size == 0:
+        return mask
+    stops = starts + np.maximum(periods, 0)
+    starts = np.clip(starts, 0, n_samples)
+    stops = np.clip(stops, 0, n_samples)
+    for start, stop in zip(starts.tolist(), stops.tolist()):
+        if stop > start:
+            mask[start:stop] = True
+    return mask
+
+
+def frame_coverage(support: np.ndarray, hop: int, n_frames: int) -> np.ndarray:
+    """Sample-level source support -> per-frame covered fraction in ``[0, 1]``.
+
+    Frame ``t`` owns samples ``[t * hop, (t + 1) * hop)`` -- the same frame grid
+    the acoustic features use -- and its value is the share of that window a
+    source unit covers.  A frame a short cycle only reaches into therefore gets
+    a partial value instead of claiming a whole period, which is what makes the
+    number usable both as a diagnostic and as a "how much of this frame is
+    learned" weight.  Samples past the end of ``support`` count as uncovered,
+    so a render whose sample length overruns the frame grid reports that rather
+    than assuming coverage.
+    """
+    hop = max(1, int(hop))
+    n_frames = int(max(n_frames, 0))
+    coverage = np.zeros(n_frames, dtype=np.float64)
+    if n_frames == 0 or support.size == 0:
+        return coverage
+    support = np.asarray(support, dtype=np.float64).reshape(-1)
+    needed = n_frames * hop
+    window = np.zeros(needed, dtype=np.float64)
+    keep = min(needed, support.size)
+    window[:keep] = support[:keep]
+    return window.reshape(n_frames, hop).mean(axis=1)
+
+
 __all__ = ["pick_epochs", "extract_cycles", "resample_cycle", "place_cycles",
            "noise_level", "impulsiveness", "frame_positions", "CycleSet",
+           "unit_support_mask", "frame_coverage",
            "MIN_PERIOD_SAMPLES", "RESAMPLE_METHODS"]

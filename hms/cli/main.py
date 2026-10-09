@@ -296,6 +296,7 @@ def cmd_synth(args) -> int:
         "mixture": args.mixture,
         "seed": args.seed,
         "vocoder": args.vocoder,
+        "source_gain": args.source_gain,
     }
     if args.vibrato is not None:
         overrides["vibrato"] = bool(args.vibrato)
@@ -326,11 +327,20 @@ def cmd_synth(args) -> int:
         external_f0 = _load_f0_file(args.f0_file)
         _log(f"f0 file : {args.f0_file}")
 
+    source_model = None
+    if getattr(args, "source_model", None):
+        from hms.source.hmm import SourceHMMModel
+        source_model = SourceHMMModel.load(args.source_model)
+        _log(f"source  : {args.source_model} "
+             f"({source_model.source_backend} backend, "
+             f"{source_model.n_context_models} context model(s))")
+
     synthesizer = Synthesizer(model, config, log=_log)
     _log(f"model   : {model.name} ({len(model.hmms)} phonemes)")
     _log(f"backend : {synthesizer.vocoder.name}")
     t0 = time.time()
-    result = synthesizer.synthesize(score, f0=external_f0)
+    result = synthesizer.synthesize(score, f0=external_f0,
+                                    source_model=source_model)
     _log(f"rendered {len(score)} utterance(s), {result.duration:.2f} s "
          f"of audio in {time.time() - t0:.1f} s")
     for diagnostic in result.diagnostics:
@@ -736,6 +746,14 @@ def build_parser() -> argparse.ArgumentParser:
     synth.add_argument("--vibrato-rate", type=float, default=None)
     synth.add_argument("--seed", type=int, default=None)
     synth.add_argument("--vocoder", default=None)
+    synth.add_argument("--source-model", default=None,
+                       help="Phase-2 source model directory: render with the "
+                            "learned excitation instead of the backend's pulse "
+                            "train (needs --vocoder builtin or --vocoder mlsa)")
+    synth.add_argument("--source-gain", type=float, default=None,
+                       help="scale the learned excitation in source-aware "
+                            "synthesis (1.0 = the level of the pulse train it "
+                            "replaces; Phase 2 does not predict amplitude)")
     synth.add_argument("--float-wav", action="store_true",
                        help="write 32-bit float WAV instead of 16-bit PCM")
     synth.add_argument("--trace", default=None,
