@@ -164,6 +164,14 @@ def fade_weights(support: np.ndarray, fade: int) -> np.ndarray:
     that reaches the last sample simply stays high, because there is nothing
     after it left to preserve.
 
+    The minimum alone is not enough, and the result is masked by ``support``
+    for that reason.  Each average reaches ``fade - 1`` samples past the end of
+    the coverage it can see -- the backward one into the gap *after* a run, the
+    forward one into the gap *before* the next -- so in an uncovered gap
+    narrower than about two fades both are positive at once.  Masking makes the
+    invariant unconditional rather than dependent on how far apart two runs
+    happen to be, and costs nothing inside a run, where the mask is 1.
+
     ``fade`` defaults to one frame period at the call sites below, which is what
     makes the transition frame-aligned: it is one frame long and it starts at
     the sample where the source's coverage actually starts.
@@ -186,7 +194,9 @@ def fade_weights(support: np.ndarray, fade: int) -> np.ndarray:
               ) * (1.0 / float(fade))
     downward = (prefix[np.clip(index + fade, 0, n)] - prefix[index]
                 ) * (1.0 / float(fade))
-    return np.minimum(upward, downward)
+    # The mask is the invariant, stated once: whatever the two averages do, a
+    # sample the source does not cover is never handed to the learned source.
+    return np.minimum(upward, downward) * np.clip(values, 0.0, 1.0)
 
 
 @dataclass

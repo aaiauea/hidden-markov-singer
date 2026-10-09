@@ -776,6 +776,52 @@ def test_uncovered_samples_keep_the_backend_excitation_exactly(shape):
             assert weights[stop - fade - 1] == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize("gap", [1, 5, 50, 150, 199])
+def test_a_short_internal_gap_is_never_given_a_weight(gap):
+    """Both moving averages can see a *different* run across a narrow gap.
+
+    ``upward`` looks back and reaches ``fade - 1`` samples past the end of the
+    run behind it; ``downward`` looks forward and reaches the same distance
+    back from the run ahead.  In a gap narrower than about two fades both are
+    positive at once, so ``minimum`` alone still hands the backend's excitation
+    to a learned source that is silent there -- a gap of 300 samples with
+    ``fade = 200`` used to pick up weights up to 0.245.
+
+    Masking by ``support`` is what makes the invariant unconditional instead
+    of a property of how far apart two runs happen to be.  It costs nothing
+    inside a run, where the mask is 1: the in-run weights are bit-identical to
+    the unmasked minimum.
+    """
+    rng = np.random.default_rng(gap)
+    n, fade = 2000, 200
+    support = np.zeros(n, dtype=bool)
+    support[400:900] = True
+    support[900 + gap:1600] = True
+    gap_mask = np.zeros(n, dtype=bool)
+    gap_mask[900:900 + gap] = True
+    default = rng.standard_normal(n)
+    learned = np.where(support, rng.standard_normal(n), 0.0)
+
+    weights = fade_weights(support, fade)
+    blended = blend_excitation(default, learned, weights)
+
+    # the gap is untouched, exactly -- the reported bug
+    assert np.count_nonzero(weights[gap_mask]) == 0
+    assert np.array_equal(blended[gap_mask], default[gap_mask])
+    # ... and so is every other uncovered sample
+    assert np.count_nonzero(weights[~support]) == 0
+    assert np.array_equal(blended[~support], default[~support])
+    # ... while the covered runs keep their shape: full weight in the middle
+    assert weights[600:700] == pytest.approx(1.0)
+    assert weights[900 + gap + fade:1400] == pytest.approx(1.0)
+    # ... and a ramp rather than a step inside each run, so the crossfade the
+    # mask protects has not itself been thrown away
+    for start, stop in ((400, 900), (900 + gap, 1600)):
+        interior = weights[start:stop]
+        assert np.abs(np.diff(interior)).max() <= 1.0 / fade + 1e-9
+        assert (interior > 0.0).all()
+
+
 def test_a_real_render_never_weights_uncovered_samples(
         trained_model, short_score, tiny_source_model):
     """The same invariant, on a real render rather than a synthetic mask."""
