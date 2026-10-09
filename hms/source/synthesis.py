@@ -142,10 +142,27 @@ def fade_weights(support: np.ndarray, fade: int) -> np.ndarray:
 
     Switching between two excitations sample-by-sample would put a step into the
     filter's input, so every boundary is ramped over ``fade`` samples instead.
-    The smoothing is a moving average computed from a cumulative sum, i.e. a
-    *linear* ramp in O(n) with no kernel of length ``fade`` and no scipy.  The
-    fade is zero-padded at both ends of the signal, so the very first and last
-    samples of a render ramp down to the backend's own excitation as well.
+
+    The ramp is **inside** the covered span, never outside it.  That matters
+    because the mix a backend performs is
+
+        ``out = weights * learned + (1 - weights) * default``
+
+    and the learned waveform is zero wherever ``support`` is false.  A weight
+    that leaks past the last covered sample would therefore not crossfade into
+    anything -- it would *attenuate* the backend's own excitation and replace it
+    with silence.  A centred moving average does exactly that: it ramps from
+    ``fade // 2`` samples before coverage starts, so an unvoiced gap next to a
+    voiced run lost half its level at the boundary.  Taking the minimum of a
+    backward and a forward moving average keeps the whole transition where both
+    signals exist.
+
+    Both averages come from one cumulative sum, so this is still O(n) with no
+    kernel of length ``fade`` and no scipy.  Where a run starts at sample 0 the
+    backward window is truncated, so the weight climbs from ``1 / fade`` over
+    the render's first samples instead of switching on at full level; a run
+    that reaches the last sample simply stays high, because there is nothing
+    after it left to preserve.
 
     ``fade`` defaults to one frame period at the call sites below, which is what
     makes the transition frame-aligned: it is one frame long and it starts at
@@ -160,11 +177,16 @@ def fade_weights(support: np.ndarray, fade: int) -> np.ndarray:
         return np.clip(values, 0.0, 1.0)
     prefix = np.zeros(n + 1, dtype=np.float64)
     np.cumsum(values, out=prefix[1:])
-    low = np.arange(n, dtype=np.int64) - fade // 2
-    high = low + fade
-    np.clip(low, 0, n, out=low)
-    np.clip(high, 0, n, out=high)
-    return (prefix[high] - prefix[low]) * (1.0 / float(fade))
+    index = np.arange(n, dtype=np.int64)
+    # Backward average: ramps up over the first `fade` samples of a run, then
+    # holds at 1.  Forward average: holds at 1, then ramps down over the last
+    # `fade` samples.  Their minimum is 1 through the middle of a run, ramps
+    # only where the run itself is, and is exactly 0 everywhere else.
+    upward = (prefix[index + 1] - prefix[np.clip(index - fade + 1, 0, n)]
+              ) * (1.0 / float(fade))
+    downward = (prefix[np.clip(index + fade, 0, n)] - prefix[index]
+                ) * (1.0 / float(fade))
+    return np.minimum(upward, downward)
 
 
 @dataclass

@@ -35,7 +35,8 @@ from hms.source.synthesis import (fade_weights, frame_hop,
                                   render_score_source_excitation,
                                   source_model_diagnostics,
                                   source_model_is_compatible)
-from hms.vocoder.base import Vocoder, VocoderUnavailable, render_length
+from hms.vocoder.base import (Vocoder, VocoderUnavailable, blend_excitation,
+                              render_length)
 from hms.vocoder.builtin import BuiltinVocoder
 from hms.vocoder.mlsa import MLSAVocoder
 
@@ -319,6 +320,40 @@ def test_a_backend_that_cannot_filter_an_excitation_is_refused(
         synthesizer.synthesize(short_score, source_model=tiny_source_model)
     # ... while the same backend renders the ordinary path fine.
     assert np.isfinite(synthesizer.synthesize(short_score).audio).all()
+
+
+def test_an_unsupported_backend_is_refused_before_the_source_is_rendered(
+        trained_model, short_score, tiny_source_model):
+    """Fail fast: no source units are generated on the way to the refusal.
+
+    Whether a backend can filter an excitation is a property of the backend,
+    not of the score or the source model, so the render can be rejected
+    before the HMM state sequence, the PCA decode and the cycle placement run.
+    """
+    class _ClosedVocoder(BuiltinVocoder):
+        supports_external_excitation = False
+
+    synthesizer = Synthesizer(trained_model,
+                              SynthesisConfig(vocoder="builtin", seed=0,
+                                              vibrato=False))
+    synthesizer._vocoder = _ClosedVocoder(fft_size=trained_model.spec.fft_size)
+
+    calls = []
+    render_source = synthesizer.render_source
+
+    def _spy(*args, **kwargs):
+        calls.append(args[0])
+        return render_source(*args, **kwargs)
+
+    synthesizer.render_source = _spy
+    with pytest.raises(ValueError, match="cannot filter a caller-supplied"):
+        synthesizer.synthesize(short_score, source_model=tiny_source_model)
+    assert calls == [], "the source branch ran before the backend was checked"
+    # and the diagnostics say nothing about a source that was never rendered
+    synthesizer.render_source = render_source
+    result = synthesizer.synthesize(short_score)
+    assert result.source is None
+    assert not any("source" in message for message in result.diagnostics)
 
 
 @pytest.mark.parametrize("name", ["builtin", "mlsa"])
@@ -689,6 +724,80 @@ def test_fade_weights_ramp_over_one_frame():
     assert weights[399] == 0.0
     assert np.all(np.abs(np.diff(weights)) <= 1.0 / 100.0 + 1e-12)
     assert weights.min() >= 0.0 and weights.max() <= 1.0
+
+
+@pytest.mark.parametrize("shape", ["leading gap", "trailing gap",
+                                   "internal gap"])
+def test_uncovered_samples_keep_the_backend_excitation_exactly(shape):
+    """A weight that leaks past the coverage attenuates instead of crossfading.
+
+    `blend_excitation` computes ``w * learned + (1 - w) * default``, and the
+    learned waveform is silent wherever the source has no units -- `place_cycles`
+    only writes inside the spans `unit_support_mask` marks.  Outside the covered
+    span the mix therefore collapses to ``default * (1 - w)``: a weight there is
+    not a transition into anything, it is a hole in the backend's own
+    excitation.
+
+    A centred moving average puts half its ramp on the uncovered side, which
+    cost ~6 dB at every voiced/unvoiced boundary.  The fade has to live entirely
+    inside the coverage, where both signals actually exist.
+    """
+    rng = np.random.default_rng(11)
+    n, fade = 4000, 200
+    support = np.zeros(n, dtype=bool)
+    if shape == "leading gap":
+        support[1200:] = True            # uncovered head, run to the end
+        runs = [(1200, n)]
+    elif shape == "trailing gap":
+        support[:2800] = True            # run from sample 0, uncovered tail
+        runs = [(0, 2800)]
+    else:
+        support[800:1800] = True         # two runs with an uncovered gap
+        support[2600:3400] = True
+        runs = [(800, 1800), (2600, 3400)]
+    # the learned source is silent outside its coverage, as `place_cycles`
+    # leaves it
+    default = rng.standard_normal(n)
+    learned = np.where(support, rng.standard_normal(n), 0.0)
+
+    weights = fade_weights(support, fade)
+    blended = blend_excitation(default, learned, weights)
+
+    outside = ~support
+    assert np.count_nonzero(weights[outside]) == 0
+    # bit-exact, not merely close: `w == 0` makes the mix the identity
+    assert np.array_equal(blended[outside], default[outside])
+    # ... and the transition is still a ramp rather than a step
+    assert np.abs(np.diff(weights)).max() <= 1.0 / fade + 1e-9
+    # ... that reaches full weight inside every run long enough to hold it
+    for start, stop in runs:
+        if stop - start > 2 * fade:
+            assert weights[start + fade] == pytest.approx(1.0)
+            assert weights[stop - fade - 1] == pytest.approx(1.0)
+
+
+def test_a_real_render_never_weights_uncovered_samples(
+        trained_model, short_score, tiny_source_model):
+    """The same invariant, on a real render rather than a synthetic mask."""
+    source = render(trained_model, short_score, tiny_source_model).source
+    assert source.covered_samples > 0
+    assert np.count_nonzero(source.weights[~source.support]) == 0
+
+
+def test_the_fade_stays_inside_the_covered_span(trained_model, short_score,
+                                                tiny_source_model):
+    """Weight 0 outside, a ramp at the edges, full weight in the middle.
+
+    Pinning all three together is what stops a future "simplification" from
+    turning the fade back into a straight `support.astype(float)`: that would
+    keep this test's first assertion and silently drop the crossfade.
+    """
+    source = render(trained_model, short_score, tiny_source_model).source
+    weights, support = source.weights, source.support
+    assert np.count_nonzero(weights[~support]) == 0
+    assert (weights[support] > 0.0).any()
+    assert weights.max() == pytest.approx(1.0)
+    assert np.abs(np.diff(weights)).max() <= 1.0 / source.hop + 1e-9
 
 
 def test_render_score_source_excitation_tiles_the_utterances(tiny_source_model):

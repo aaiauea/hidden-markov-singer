@@ -914,17 +914,23 @@ class Synthesizer:
         diagnostics.extend(self._out_of_range_pitch_diagnostics(f0_semitones))
 
         parameters = spec.decode(static, f0_semitones=f0_semitones)
+        # Refuse an unsupported backend before the source branch runs: whether
+        # a vocoder can filter an excitation is a property of the backend, not
+        # of this score or this source model, so there is nothing to gain by
+        # generating source units (HMM state sequence, PCA decode, cycle
+        # placement) only to throw them away.
+        if source_model is not None \
+                and not self.vocoder.supports_external_excitation:
+            raise ValueError(
+                f"the {self.vocoder.name!r} vocoder backend cannot filter a "
+                f"caller-supplied excitation, so it cannot render a "
+                f"Phase-2 source model; select a backend that owns its "
+                f"excitation (--vocoder builtin or --vocoder mlsa)")
         source = self.render_source(source_model, parameters, diagnostics) \
             if source_model is not None else None
         if source is None:
             audio = self.vocoder.synthesize(parameters)
         else:
-            if not self.vocoder.supports_external_excitation:
-                raise ValueError(
-                    f"the {self.vocoder.name!r} vocoder backend cannot filter a "
-                    f"caller-supplied excitation, so it cannot render a "
-                    f"Phase-2 source model; select a backend that owns its "
-                    f"excitation (--vocoder builtin or --vocoder mlsa)")
             diagnostics.append(source.summary())
             diagnostics.append(
                 f"source excitation: calibrated by {source.applied_gain:.3f} "
