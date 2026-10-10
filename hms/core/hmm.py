@@ -379,28 +379,47 @@ class LeftToRightHMM:
         """
         if not sequences:
             raise ValueError("no training sequences given")
+        if method not in ("viterbi", "baum_welch"):
+            raise ValueError(f"unknown training method {method!r}")
         self.covariance_type = covariance_type
         self.dim = sequences[0].shape[1]
-        all_frames = np.concatenate(sequences, axis=0)
-        if not np.isfinite(all_frames).all():
-            raise ValueError("training features contain non-finite values")
+        if method == "viterbi":
+            # Validate per occurrence: a corpus-sized concatenated copy is only
+            # needed by the bootstrap below, and the Viterbi path can avoid it.
+            for sequence in sequences:
+                if sequence.ndim != 2 or sequence.shape[1] != self.dim:
+                    raise ValueError("training sequences must share one "
+                                     "feature dimension")
+                if not np.isfinite(sequence).all():
+                    raise ValueError("training features contain non-finite values")
+        else:
+            all_frames = np.concatenate(sequences, axis=0)
+            if not np.isfinite(all_frames).all():
+                raise ValueError("training features contain non-finite values")
 
-        # Bootstrap every state with the same global Gaussian; the first
-        # iteration's duration-proportional split breaks the symmetry.
-        for i in range(self.n_states):
-            self.states[i] = HMMState(
-                gmm=DiagGMM.fit(all_frames, n_components=n_components,
-                                covariance_type=covariance_type,
-                                var_floor_ratio=var_floor_ratio, seed=seed + i),
-                duration=StateDurationStats(0.0, 1.0, len(sequences)))
-
-        if method == "baum_welch":
+            # Bootstrap every state with the same global Gaussian; Baum-Welch
+            # reads these emissions in its first E-step.
+            for i in range(self.n_states):
+                self.states[i] = HMMState(
+                    gmm=DiagGMM.fit(all_frames, n_components=n_components,
+                                    covariance_type=covariance_type,
+                                    var_floor_ratio=var_floor_ratio,
+                                    seed=seed + i),
+                    duration=StateDurationStats(0.0, 1.0, len(sequences)))
             self._train_baum_welch(sequences, voiced, n_components,
                                    covariance_type, n_iterations,
                                    var_floor_ratio, seed)
             return
-        if method != "viterbi":
-            raise ValueError(f"unknown training method {method!r}")
+
+        # Viterbi path: the iteration-0 segmentation is duration-proportional
+        # and never reads emissions, and it overwrites the GMM of every state
+        # that receives frames.  Bootstrap GMMs are therefore fitted lazily,
+        # only for states left without frames (rare), which yields exactly the
+        # same models while skipping a full pooled EM fit per state.
+        for i in range(self.n_states):
+            self.states[i] = HMMState(
+                gmm=None,  # type: ignore[arg-type]  # filled after iteration 0
+                duration=StateDurationStats(0.0, 1.0, len(sequences)))
 
         for iteration in range(max(1, n_iterations)):
             frames_by_state: List[List[np.ndarray]] = [[] for _ in range(self.n_states)]
@@ -445,10 +464,35 @@ class LeftToRightHMM:
                     if len(votes):
                         self.states[i].voiced_prob = float(np.mean(votes))
 
+            if iteration == 0:
+                self._bootstrap_unfitted_states(sequences, n_components,
+                                                covariance_type,
+                                                var_floor_ratio, seed)
+
             means = np.array([np.exp(s.duration.mean) for s in self.states])
             for i in range(self.n_states):
                 self.self_loops[i] = float(np.clip(1.0 - 1.0 / max(means[i], 1.0),
                                                    MIN_SELF_LOOP, MAX_SELF_LOOP))
+
+    def _bootstrap_unfitted_states(self, sequences: Sequence[np.ndarray],
+                                   n_components: int, covariance_type: str,
+                                   var_floor_ratio: float, seed: int) -> None:
+        """Give every state still lacking a GMM its bootstrap Gaussian.
+
+        Same fit as the eager bootstrap (``seed + i`` on the pooled frames), so
+        the result is identical; it only runs for states that received no frames
+        during the duration-proportional first iteration.
+        """
+        missing = [i for i in range(self.n_states)
+                   if self.states[i].gmm is None]
+        if not missing:
+            return
+        all_frames = np.concatenate(sequences, axis=0)
+        for i in missing:
+            self.states[i].gmm = DiagGMM.fit(
+                all_frames, n_components=n_components,
+                covariance_type=covariance_type,
+                var_floor_ratio=var_floor_ratio, seed=seed + i)
 
     def _train_baum_welch(self, sequences: Sequence[np.ndarray],
                           voiced: Optional[Sequence[np.ndarray]],
