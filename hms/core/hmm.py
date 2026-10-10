@@ -164,22 +164,30 @@ class LeftToRightHMM:
         ll = self.emission_log_likelihood(X)
         n = self.n_states
         a = self.transition_matrix()
+        # Log-transition table, computed once per call instead of per (t, j).
+        log_a = np.log(np.maximum(a, EPS))
+        log_trans = log_a[:n, :n]
+        all_states = np.arange(n)
 
         score = np.full((t_frames, n), -np.inf)
         back = np.zeros((t_frames, n), dtype=np.int64)
-        score[0] = ll[0] + np.log(np.maximum(a[0, :n], EPS))
+        score[0] = ll[0] + log_a[0, :n]
         for t in range(1, t_frames):
-            for j in range(n):
-                previous = score[t - 1] + np.log(np.maximum(a[:n, j], EPS))
-                if not np.isfinite(previous).any():
-                    back[t, j] = j
-                    score[t, j] = -np.inf
-                    continue
-                best_i = int(np.argmax(previous))
-                score[t, j] = previous[best_i] + ll[t, j]
-                back[t, j] = best_i
+            previous = score[t - 1]
+            if not np.isfinite(previous).any():
+                # Every path has died: nothing can be recovered from here on.
+                back[t] = all_states
+                score[t] = -np.inf
+                continue
+            # candidates[i, j] = score(t-1, i) + log a(i -> j); the column-wise
+            # argmax picks the same predecessor as a per-state argmax would
+            # (first maximum on ties), so the recursion is bit-for-bit equal.
+            candidates = previous[:, None] + log_trans
+            best_i = candidates.argmax(axis=0)
+            back[t] = best_i
+            score[t] = candidates[best_i, all_states] + ll[t]
 
-        exit_scores = score[-1] + np.log(np.maximum(a[:n, n], EPS))
+        exit_scores = score[-1] + log_a[:n, n]
         last = int(np.argmax(exit_scores))
         path = np.zeros(t_frames, dtype=np.int64)
         path[-1] = last
