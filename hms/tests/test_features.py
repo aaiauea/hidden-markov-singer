@@ -246,6 +246,57 @@ def test_single_frame_and_empty_inputs():
                        np.zeros((0, 257))).shape == (0, spec.static_dim)
 
 
+@pytest.mark.parametrize("n_frames,n_features,use_delta,use_delta2,window", [
+    (0, 4, True, True, 2),
+    (1, 3, True, False, 2),
+    (2, 5, False, True, 1),
+    (5, 4, False, False, 2),
+    (7, 4, True, True, 2),
+    (13, 6, False, True, 3),
+])
+def test_dynamic_feature_scratch_reuse_is_bit_exact(
+        n_frames, n_features, use_delta, use_delta2, window):
+    """The allocation-reduced accumulator must preserve every float64 bit."""
+    rng = np.random.default_rng(1701 + n_frames + n_features)
+    base = rng.normal(size=(n_frames, n_features * 2))
+    static = base[:, ::2]             # include a non-contiguous input view
+    original = static.copy()
+
+    # Reference the former allocation-heavy expression and its left-to-right
+    # summation order. It is intentionally local to the regression test.
+    def legacy_delta_features(values):
+        values = np.atleast_2d(np.asarray(values, dtype=np.float64))
+        n, dim = values.shape
+        if n == 0:
+            return np.zeros((0, dim * (1 + use_delta + use_delta2)))
+
+        def pad(x):
+            return np.pad(x, ((window, window), (0, 0)), mode="edge")
+
+        coeffs = np.array([k / (2.0 * sum(i * i
+                                           for i in range(1, window + 1)))
+                           for k in range(-window, window + 1)])
+        padded = pad(values)
+        streams = [values]
+        if use_delta or use_delta2:
+            delta = sum(coeffs[k] * padded[k:k + n]
+                        for k in range(2 * window + 1))
+            if use_delta:
+                streams.append(delta)
+            if use_delta2:
+                padded_delta = pad(delta)
+                delta2 = sum(coeffs[k] * padded_delta[k:k + n]
+                             for k in range(2 * window + 1))
+                streams.append(delta2)
+        return np.concatenate(streams, axis=1)
+
+    expected = legacy_delta_features(static)
+    actual = add_dynamic_features(static, use_delta, use_delta2, window)
+    assert actual.dtype == np.float64
+    assert np.array_equal(actual, expected)
+    assert np.array_equal(static, original), "delta construction must not mutate input"
+
+
 def test_invalid_spectral_shape_is_rejected():
     spec = FeatureSpec(fs=22050, fft_size=1024, n_mcep=12)
     with pytest.raises(ValueError):

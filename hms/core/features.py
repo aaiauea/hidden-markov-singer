@@ -582,7 +582,10 @@ def add_dynamic_features(static: np.ndarray, use_delta: bool = True,
     """Stack static (+ delta, + delta-delta) streams along the feature axis.
 
     Edge replication is used at utterance boundaries so the output has exactly
-    the same number of frames as the input.
+    the same number of frames as the input.  Delta accumulation reuses one
+    scratch matrix instead of materializing a product and a new sum result for
+    every regression-window tap; the arithmetic order and float64 operations
+    are unchanged.
     """
     static = np.atleast_2d(np.asarray(static, dtype=np.float64))
     n, dim = static.shape
@@ -595,18 +598,33 @@ def add_dynamic_features(static: np.ndarray, use_delta: bool = True,
     coeffs = delta_coeffs(window)
     padded = pad(static)
     streams = [static]
+    workspace = None
     if use_delta or use_delta2:
+        def delta_of(padded_values: np.ndarray) -> np.ndarray:
+            nonlocal workspace
+            # Starting with tap zero matches Python's left-to-right `sum`.
+            # Reuse a single product buffer and accumulate in place for the
+            # remaining taps, avoiding multiple frame-sized temporaries.
+            delta = padded_values[:n] * coeffs[0]
+            if workspace is None:
+                workspace = np.empty_like(delta)
+            for k in range(1, 2 * window + 1):
+                np.multiply(padded_values[k:k + n], coeffs[k], out=workspace)
+                np.add(delta, workspace, out=delta)
+            return delta
+
         # padded[t + k] == static[t + k - window] (edge replicated), so the
         # delta of frame t is simply sum_k coeffs[k] * padded[t + k].
-        delta = sum(coeffs[k] * padded[k: k + n]
-                    for k in range(2 * window + 1))
+        delta = delta_of(padded)
         if use_delta:
             streams.append(delta)
         if use_delta2:
             padded_d = pad(delta)
-            delta2 = sum(coeffs[k] * padded_d[k: k + n]
-                         for k in range(2 * window + 1))
+            delta2 = delta_of(padded_d)
             streams.append(delta2)
+    # Do not keep the scratch array live while concatenate allocates the final
+    # feature matrix; it is no longer needed once all requested streams exist.
+    workspace = None
     return np.concatenate(streams, axis=1)
 
 
