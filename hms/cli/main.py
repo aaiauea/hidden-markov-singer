@@ -287,6 +287,8 @@ def cmd_synth(args) -> int:
         "gv_enabled": args.gv_enabled,
         "gv_weight": args.gv_weight,
         "gv_iterations": args.gv_iterations,
+        "gm_enabled": args.gm_enabled,
+        "gm_strength": args.gm_strength,
         "pitch_variation": args.pitch_variation,
         "f0_source": args.f0_source,
         "duration_mode": args.duration_mode,
@@ -715,6 +717,17 @@ def build_parser() -> argparse.ArgumentParser:
                             "(default 1; 0 makes no changes)")
     synth.add_argument("--gv-iterations", type=int, default=None,
                        help="maximum GV optimization steps (default 20)")
+    synth.add_argument("--gm", dest="gm_enabled", action="store_true",
+                       default=None,
+                       help="experimental: match static global variance to "
+                            "training targets after MLPG (requires a model "
+                            "with GV statistics; mutually exclusive with --gv)")
+    synth.add_argument("--no-gm", dest="gm_enabled", action="store_false",
+                       help="disable GM even if enabled in parameters.yaml")
+    synth.add_argument("--gm-strength", type=float, default=None,
+                       help="strength of GM variance matching: 0 leaves the "
+                            "MLPG trajectory unchanged, 1 matches each "
+                            "eligible feature's training target (default 1)")
     synth.add_argument("--pitch-variation", type=float, default=None,
                        help="scale of the learned deviation from the note")
     synth.add_argument("--f0-source", default=None,

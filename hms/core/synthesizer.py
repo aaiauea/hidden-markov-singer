@@ -48,6 +48,13 @@ Options that matter in practice (all in `SynthesisConfig`):
     targets after MLPG, while penalizing changes to the MLPG likelihood. The
     weight controls that trade-off and iterations caps the update count. A
     model without GV targets cannot enable it.
+``gm_enabled``, ``gm_strength``
+    Experimental, off by default: Global Variance *Matching*, a lighter
+    alternative to GV. Instead of optimizing, it performs one closed-form
+    rescale of the normalized static trajectory so each eligible feature's
+    variance moves toward the same training targets (``gm_strength`` 0 leaves
+    MLPG unchanged, 1 matches the target). It is deterministic, not stochastic
+    sampling, and is mutually exclusive with ``gv_enabled``.
 ``pitch_variation``
     Scales the optional learned deviation in ``acoustic`` and ``state_means``
     modes; 0 suppresses that deviation and values >1 exaggerate it. It has no
@@ -109,7 +116,7 @@ from hms.core.duration import DurationModel
 from hms.core.features import (AcousticFrameSequence, FeatureSpec,
                               hz_to_semitone, semitone_to_hz)
 from hms.core.generation import mlpg, stack_streams
-from hms.core.gv import optimize_global_variance
+from hms.core.gv import match_global_variance, optimize_global_variance
 from hms.core.model import HMSModel
 from hms.core.pitch_condition import effective_note, is_pitch_tier
 from hms.vocoder.base import render_length
@@ -147,6 +154,15 @@ class SynthesisConfig:
     #: replaces and this only tilts that.  1.0 leaves the acoustic model's
     #: loudness (envelope + aperiodicity) exactly as it is.
     source_gain: float = 1.0
+    #: Experimental closed-form Global Variance *Matching*, off by default.  A
+    #: single deterministic rescale of the normalized static trajectory so its
+    #: per-feature variance approaches the same training targets GV uses; it is
+    #: not the iterative GV optimizer and not stochastic sampling.  Mutually
+    #: exclusive with ``gv_enabled``.  Appended last so positional construction
+    #: of this dataclass keeps working for existing callers.
+    gm_enabled: bool = False
+    #: 0 leaves the MLPG trajectory unchanged, 1 matches each eligible feature.
+    gm_strength: float = 1.0
 
     def __post_init__(self) -> None:
         if self.f0_source not in ("score", "acoustic", "state_means"):
@@ -178,6 +194,15 @@ class SynthesisConfig:
                 or isinstance(self.gv_iterations, (bool, np.bool_)) \
                 or self.gv_iterations < 0:
             raise ValueError("gv_iterations must be a non-negative integer")
+        if not isinstance(self.gm_enabled, (bool, np.bool_)):
+            raise ValueError("gm_enabled must be a boolean")
+        try:
+            valid_strength = bool(np.isfinite(self.gm_strength)
+                                  and 0.0 <= self.gm_strength <= 1.0)
+        except TypeError as exc:
+            raise ValueError("gm_strength must be numeric") from exc
+        if not valid_strength:
+            raise ValueError("gm_strength must be finite and within [0, 1]")
         if self.pitch_variation < 0:
             raise ValueError("pitch_variation must be non-negative")
         if self.vibrato_depth is not None and self.vibrato_depth < 0:
@@ -871,6 +896,14 @@ class Synthesizer:
         rng = np.random.default_rng(config.seed)
         diagnostics: List[str] = []
 
+        # Reject contradictory or unsatisfiable variance settings before any work.
+        if config.gv_enabled and config.gm_enabled:
+            raise ValueError("GM and GV are mutually exclusive; enable only one of "
+                             "gv_enabled/gm_enabled")
+        if config.gm_enabled and self.model.gv_stats is None:
+            raise ValueError("GM requested but this model has no global_variance "
+                             "training statistics; retrain it or disable GM")
+
         (frame_phones, state_ids, segment_ids, notes, _segments,
          plan_diagnostics) = self.plan(score, default_note=default_note,
                                        check_pitch_range=f0 is None)
@@ -883,6 +916,10 @@ class Synthesizer:
                           window=spec.delta_window,
                           variance_scale=config.variance_scale,
                           smooth=config.smooth)
+        if config.gm_enabled:
+            trajectory = match_global_variance(
+                trajectory, self.model.gv_stats.target_variance,
+                config.gm_strength)
         if config.gv_enabled:
             if self.model.gv_stats is None:
                 raise ValueError("GV requested but this model has no global_variance "
