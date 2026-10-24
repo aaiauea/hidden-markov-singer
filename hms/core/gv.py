@@ -318,3 +318,56 @@ def optimize_global_variance(
         # other features continue to improve.
         active &= accepted
     return finish(c, steps_done)
+
+
+def match_global_variance(trajectory: np.ndarray, target_variance: np.ndarray,
+                          strength: float) -> np.ndarray:
+    """Match the per-feature variance of a static trajectory to training targets.
+
+    Lightweight closed-form Global Variance Matching (GM).  For each static
+    feature ``d``::
+
+        ratio      = sqrt(target_variance[d] / generated_variance[d])
+        factor     = (1 - strength) + strength * ratio
+        output[:, d] = mean + factor * (trajectory[:, d] - mean)
+
+    ``strength = 0`` returns the MLPG trajectory unchanged; ``strength = 1``
+    sets each *eligible* feature's variance exactly to its training target;
+    values in between interpolate the scaling factor.  Features whose
+    generated variance is at or below :data:`GV_ACTIVE_VARIANCE` (constant or
+    near-constant dimensions) are left untouched rather than scaled by a
+    degenerate ratio.
+
+    This is deliberately not the iterative, likelihood-aware GV optimizer in
+    :func:`optimize_global_variance`: it is a single variance rescaling with
+    no dynamic windows, no Cholesky solve, no line search and no iterations.
+
+    Inputs are not mutated.  Returns a new (T, D) array in normalized feature
+    space.
+    """
+    c = np.asarray(trajectory, dtype=np.float64)
+    if c.ndim != 2 or not np.isfinite(c).all():
+        raise ValueError("GM trajectory must have shape (T, D) and be finite")
+    n_frames, dim = c.shape
+    target = np.asarray(target_variance, dtype=np.float64)
+    if target.shape != (dim,) or not np.isfinite(target).all() \
+            or (target < 0).any():
+        raise ValueError("GM target variance must have one finite, non-negative "
+                         "value per static feature")
+    if not np.isfinite(strength) or not (0.0 <= strength <= 1.0):
+        raise ValueError("GM strength must be finite and within [0, 1]")
+
+    if strength == 0.0 or n_frames < 2:
+        return c.copy()
+
+    mean = c.mean(axis=0)
+    centered = c - mean
+    generated = trajectory_variance(c)
+
+    factor = np.ones(dim, dtype=np.float64)
+    eligible = generated > GV_ACTIVE_VARIANCE
+    if eligible.any():
+        ratio = np.sqrt(target[eligible]
+                        / np.maximum(generated[eligible], GV_ACTIVE_VARIANCE))
+        factor[eligible] = (1.0 - strength) + strength * ratio
+    return mean + factor[None, :] * centered

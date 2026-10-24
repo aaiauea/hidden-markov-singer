@@ -293,6 +293,44 @@ the requested note/F0 is still taken from the score; GV of the note-relative F0
 feature only affects the optional acoustic-deviation mode. For a synthetic
 performance/variance check, run `python tools/bench_gv.py --frames 1000 --dim 30`.
 
+### Global Variance Matching (GM) — lightweight closed-form alternative
+
+GM (`hms.core.gv.match_global_variance`) is a lighter-weight, closed-form
+post-MLPG variance match that reuses the same training targets stored by GV.
+For each eligible static feature it computes::
+
+    ratio = sqrt(target_variance / generated_variance)
+    factor = (1 - strength) + strength * ratio
+    output = mean + factor * (trajectory - mean)
+
+`strength = 0` returns the MLPG trajectory unchanged; `strength = 1` matches
+each eligible feature's variance exactly to its training target. Constant or
+near-constant dimensions are skipped, inputs are never mutated, and there are
+no iterations, dynamic windows or line searches — GM is a single deterministic
+rescaling rather than an optimization.
+
+GM and GV are **mutually exclusive**: enabling both raises an error. GM is
+opt-in and off by default, requires a model with `global_variance` training
+statistics, raises a clear error otherwise, and changes nothing about duration
+generation, model serialization or the vocoder.
+
+```bash
+hms synth --model model --score score.tsv --out gm.wav \
+    --gm --gm-strength 1
+```
+
+```python
+from hms.core.synthesizer import SynthesisConfig, Synthesizer
+
+matched = Synthesizer(model, SynthesisConfig(
+    gm_enabled=True, gm_strength=1.0)).synthesize(score)
+```
+
+Set `synthesis.gm_enabled: true` and `synthesis.gm_strength` (within [0, 1])
+in `parameters.yaml`; `--no-gm` overrides the YAML setting. GM shares the
+`global_variance` section of `model.yaml` with GV — no model format bump is
+needed, and models without GV statistics cannot enable GM.
+
 ## Source models (Phase 1 representation, Phase 2 predictor, Phase 3 synthesis)
 
 HMS models the **filter** with the acoustic HMM/GMM. The **source** has its own

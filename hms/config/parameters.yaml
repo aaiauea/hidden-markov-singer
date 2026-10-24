@@ -112,6 +112,8 @@ synthesis:
   gv_enabled: false
   gv_weight: 1.0           # GV penalty relative to the MLPG likelihood (0 = off)
   gv_iterations: 20        # maximum optimizer steps (0 = off)
+  gm_enabled: false        # EXPERIMENTAL GM: closed-form variance matching after MLPG
+  gm_strength: 1.0         # 0 = MLPG unchanged, 1 = match each GV training target
   pitch_variation: 1.0      # scale of the learned deviation from the note
   # Target F0 comes from score notes by default; learned pitch deviations are optional.
   f0_source: score          # score | acoustic | state_means

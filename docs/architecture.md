@@ -405,6 +405,35 @@ is learned, not the distribution/covariance of GV found in classic GV-MLPG,
 and the weight is a tuning choice rather than a trained parameter. Listen and
 compare on your own corpus; more variance need not mean better audio.
 
+### Global Variance Matching (GM) — closed-form lightweight alternative
+
+GM (`hms.core.gv.match_global_variance`) is a single-pass, closed-form
+post-MLPG variance match that reuses the exact same training targets GV
+stores (`model.gv_stats.target_variance`, estimated by
+`hms.core.trainer.estimate_global_variance`). For each eligible static feature
+it computes::
+
+    ratio      = sqrt(target_variance / generated_variance)
+    factor     = (1 - strength) + strength * ratio
+    output[:, d] = mean + factor * (trajectory[:, d] - mean)
+
+`strength = 0` returns the MLPG trajectory unchanged; `strength = 1` sets each
+eligible feature's variance exactly to its training target. Constant or
+near-constant dimensions (variance at or below `GV_ACTIVE_VARIANCE`) are left
+untouched, inputs are never mutated, and there are no iterations, dynamic
+windows, Cholesky solves or line searches — GM is a deterministic variance
+rescaling, not an optimization, and it is deliberately distinct from stochastic
+acoustic sampling.
+
+GM runs after `mlpg` and before `model.denormalize`, on the normalized static
+trajectory only. `SynthesisConfig.gm_enabled` defaults to `False` and
+`SynthesisConfig.gm_strength` defaults to `1.0`, validated to `[0, 1]` (CLI:
+`--gm` / `--no-gm`, `--gm-strength`; YAML: `synthesis.gm_enabled`,
+`synthesis.gm_strength`). GM and GV are **mutually exclusive**: enabling both
+raises a `ValueError`. GM requires a model with stored `global_variance`
+statistics and raises a clear error otherwise; it changes nothing about
+duration generation, model serialization (no format bump) or the vocoder.
+
 ## 7. Training pipeline (`hms/core/trainer.py`)
 
 ```
