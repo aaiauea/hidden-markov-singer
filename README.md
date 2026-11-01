@@ -150,6 +150,16 @@ training method, seed, training corpus paths, or any other non-context
 training setting are reported as warnings. (Context settings are expected to
 differ — that is usually what you are comparing.)
 
+## Optional HARE acoustic memory
+
+`hms.hare` can store individual, caller-aligned static mel-cepstral and
+aperiodicity observations together with phoneme, HMM state, context and unique
+IDs. It uses HMS's existing `FeatureSpec` and a standalone, versioned,
+pickle-free NumPy archive. It is not connected to training or synthesis and
+does not alter voicebank files. There is no nearest-neighbour search or blending
+in this milestone. See [docs/hare_memory.md](docs/hare_memory.md) for the API,
+archive schema, validation rules and an insertion/serialization benchmark.
+
 ## Optional phoneme-context modelling
 
 By default HMS models *phonemes*. Optionally — `context.enabled: true` in
@@ -511,7 +521,7 @@ model/
 
 ```bash
 HMS_NO_AUTO_BUILD=1 python -m pytest
-# 536 passed, 9 optional skips without WORLD (at the time of this change)
+# 879 passed, 9 optional skips without WORLD (at the time of this change)
 ```
 
 The suite covers the numerical core (banded Cholesky, MLPG against a dense
@@ -532,7 +542,9 @@ bucket separation, the resolution ladder and its fallbacks, serialisation,
 older model formats, determinism, coexistence with contexts, evaluation
 reporting and the CLI), optional GV (variance/gradient numerics, independent
 static features, optimizer behavior, legacy models and end-to-end generation),
-model evaluation, the CLI, out-of-training-range F0 (in
+the optional HARE acoustic memory (validation, atomic insertion, filtering,
+standalone pickle-free serialization and deterministic round trips), model
+evaluation, the CLI, out-of-training-range F0 (in
 both directions, from the score and from an external trajectory, asserted on
 the parameters handed to the vocoder), the external F0 override (trajectory
 preservation, independence from learned deviation and vibrato, and its
